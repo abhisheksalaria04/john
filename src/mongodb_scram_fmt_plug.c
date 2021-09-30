@@ -12,8 +12,12 @@ extern struct fmt_main fmt_mongodb_scram;
 john_register_one(&fmt_mongodb_scram);
 #else
 
-#include <openssl/sha.h>
 #include <string.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "arch.h"
 #include "misc.h"
 #include "memory.h"
@@ -21,20 +25,11 @@ john_register_one(&fmt_mongodb_scram);
 #include "formats.h"
 #include "johnswap.h"
 #include "sha.h"
-#include "base64.h"
 #include "base64_convert.h"
 #include "hmac_sha.h"
 #include "simd-intrinsics.h"
-//#undef SIMD_COEF_32
 #include "pbkdf2_hmac_sha1.h"
 #include "md5.h"
-#ifdef _OPENMP
-#include <omp.h>
-#ifndef OMP_SCALE
-#define OMP_SCALE               1
-#endif
-#endif
-#include "memdbg.h"
 
 #if defined SIMD_COEF_32
 #define SIMD_KEYS		(SIMD_COEF_32 * SIMD_PARA_SHA1)
@@ -46,21 +41,26 @@ john_register_one(&fmt_mongodb_scram);
 #define PLAINTEXT_LENGTH        125
 #define HASH_LENGTH             28
 #define SALT_SIZE               sizeof(struct custom_salt)
-#define SALT_ALIGN              sizeof(ARCH_WORD_32)
+#define SALT_ALIGN              sizeof(uint32_t)
 #define BINARY_SIZE             20
-#define BINARY_ALIGN            sizeof(ARCH_WORD_32)
+#define BINARY_ALIGN            sizeof(uint32_t)
 #define BENCHMARK_COMMENT       ""
-#define BENCHMARK_LENGTH        -1
-#if !defined(SIMD_COEF_32)
-#define MIN_KEYS_PER_CRYPT      1
-#define MAX_KEYS_PER_CRYPT      1
-#else
-#define MIN_KEYS_PER_CRYPT	SIMD_KEYS
-#define MAX_KEYS_PER_CRYPT	SIMD_KEYS
-#endif
+#define BENCHMARK_LENGTH        0x107
 #define FORMAT_TAG              "$scram$"
 #define FORMAT_TAG_LENGTH       (sizeof(FORMAT_TAG) - 1)
 #define MAX_USERNAME_LENGTH     128
+
+#ifndef OMP_SCALE
+#define OMP_SCALE               1 // MKPC and scale tuned for i7
+#endif
+
+#if !defined(SIMD_COEF_32)
+#define MIN_KEYS_PER_CRYPT      1
+#define MAX_KEYS_PER_CRYPT      64
+#else
+#define MIN_KEYS_PER_CRYPT      SIMD_KEYS
+#define MAX_KEYS_PER_CRYPT      (64 * SIMD_KEYS)
+#endif
 
 static struct fmt_tests tests[] = {
 	{"$scram$someadmin$10000$wf42AF7JaU1NSeBaSmkKzw==$H6A5RF0qz6DrcWNNX4xe+wIeVEw=", "secret"},
@@ -76,17 +76,12 @@ static struct custom_salt {
 } *cur_salt;
 
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
-static ARCH_WORD_32 (*crypt_out)[BINARY_SIZE / sizeof(ARCH_WORD_32)];
+static uint32_t (*crypt_out)[BINARY_SIZE / sizeof(uint32_t)];
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	static int omp_t = 1;
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
+	omp_autotune(self, OMP_SCALE);
+
 	saved_key = mem_calloc(self->params.max_keys_per_crypt,
 			sizeof(*saved_key));
 	crypt_out = mem_calloc(self->params.max_keys_per_crypt,
@@ -146,7 +141,7 @@ static void *get_salt(char *ciphertext)
 	p = strtokm(NULL, "$");
 	cs.iterations = atoi(p);
 	p = strtokm(NULL, "$");
-	base64_decode(p, strlen(p), (char*)cs.salt);
+	base64_convert(p, e_b64_mime, strlen(p), (char*)cs.salt, e_b64_raw, sizeof(cs.salt), flg_Base64_NO_FLAGS, 0);
 	MEM_FREE(keeptr);
 
 	return (void *)&cs;
@@ -155,14 +150,14 @@ static void *get_salt(char *ciphertext)
 static void *get_binary(char *ciphertext)
 {
 	static union {
-		unsigned char c[BINARY_SIZE + 1];
+		unsigned char c[BINARY_SIZE];
 		ARCH_WORD dummy;
 	} buf;
 	unsigned char *out = buf.c;
 	char *p;
 
 	p = strrchr(ciphertext, '$') + 1;
-	base64_decode(p, strlen(p), (char*)out);
+	base64_convert(p, e_b64_mime, strlen(p), (char*)out, e_b64_raw, sizeof(buf.c), flg_Base64_DONOT_NULL_TERMINATE, 0);
 
 	return out;
 }
@@ -172,15 +167,10 @@ static void set_salt(void *salt)
 	cur_salt = (struct custom_salt *)salt;
 }
 
-static int get_hash_0(int index) { return crypt_out[index][0] & PH_MASK_0; }
-static int get_hash_1(int index) { return crypt_out[index][0] & PH_MASK_1; }
-static int get_hash_2(int index) { return crypt_out[index][0] & PH_MASK_2; }
-static int get_hash_3(int index) { return crypt_out[index][0] & PH_MASK_3; }
-static int get_hash_4(int index) { return crypt_out[index][0] & PH_MASK_4; }
-static int get_hash_5(int index) { return crypt_out[index][0] & PH_MASK_5; }
-static int get_hash_6(int index) { return crypt_out[index][0] & PH_MASK_6; }
+#define COMMON_GET_HASH_VAR crypt_out
+#include "common-get-hash.h"
 
-static inline void hex_encode(unsigned char *str, int len, unsigned char *out)
+inline static void hex_encode(unsigned char *str, int len, unsigned char *out)
 {
 	int i;
 	for (i = 0; i < len; ++i) {
@@ -198,10 +188,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-#if defined(_OPENMP) || MAX_KEYS_PER_CRYPT > 1
-#endif
-	for (index = 0; index < count; index += MAX_KEYS_PER_CRYPT)
-	{
+	for (index = 0; index < count; index += MIN_KEYS_PER_CRYPT) {
 #if !defined (SIMD_COEF_32)
 		SHA_CTX ctx;
 		MD5_CTX mctx;
@@ -260,10 +247,9 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 static int cmp_all(void *binary, int count)
 {
-	int index = 0;
-#if defined(_OPENMP) || MAX_KEYS_PER_CRYPT > 1
-	for (; index < count; index++)
-#endif
+	int index;
+
+	for (index = 0; index < count; index++)
 		if (!memcmp(binary, crypt_out[index], ARCH_SIZE))
 			return 1;
 	return 0;
@@ -281,11 +267,7 @@ static int cmp_exact(char *source, int index)
 
 static void set_key(char *key, int index)
 {
-	int saved_len = strlen(key);
-	if (saved_len > PLAINTEXT_LENGTH)
-		saved_len = PLAINTEXT_LENGTH;
-	memcpy(saved_key[index], key, saved_len);
-	saved_key[index][saved_len] = 0;
+	strnzcpy(saved_key[index], key, sizeof(*saved_key));
 }
 
 static char *get_key(int index)
@@ -340,13 +322,8 @@ struct fmt_main fmt_mongodb_scram = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,

@@ -1,6 +1,6 @@
 /*
  * This file is part of John the Ripper password cracker,
- * Copyright (c) 1996-2001,2005,2006,2011 by Solar Designer
+ * Copyright (c) 1996-2001,2005,2006,2011,2021 by Solar Designer
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted.
@@ -14,7 +14,6 @@
 #include "misc.h"
 #include "params.h"
 #include "memory.h"
-#include "memdbg.h"
 
 struct shadow_entry {
 	struct shadow_entry *next;
@@ -50,9 +49,10 @@ static unsigned int login_hash(char *login)
 #endif
 
 	while (*p) {
-		hash <<= 3; extra <<= 2;
+		hash <<= 5;
 		hash += (unsigned char)p[0];
 		if (!p[1]) break;
+		extra *= hash | 1812433253;
 		extra += (unsigned char)p[1];
 		p += 2;
 		if (hash & 0xe0000000) {
@@ -103,11 +103,20 @@ static void process_shadow_line(char *line)
 	struct shadow_entry *last;
 	char *login, *passwd, *tail;
 
+	/* AIX "password = " */
 	if (!(passwd = strchr(line, ':'))) {
-		while (*line == ' ' || *line == '\t') line++;
-		/* AIX */
-		if (!strncmp(line, "password = ", 11) && entry)
-			(*entry)->passwd = str_alloc_copy(line + 11);
+		/* skip spaces and tabs */
+		line += strspn(line, " \t");
+		if (!strncmp(line, "password", 8)) {
+			line += 8;
+			line += strspn(line, " \t");
+			if (*line == '=') {
+				line++;
+				line += strspn(line, " \t");
+				if (entry)
+					(*entry)->passwd = str_alloc_copy(line);
+			}
+		}
 		return;
 	}
 

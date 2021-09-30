@@ -14,31 +14,43 @@ Jumbo/autoconf-specific README-DISTROS.)
 You may have obtained the source code or a "binary" (pre-compiled)
 distribution of John the Ripper.  On Unix-like systems, it is typical
 to get the source code and compile it into "binary" executables right
-on the system you intend to run John on.  On DOS and Windows, however,
-it is typical to get a binary distribution which is ready for use.
+on the system you intend to run John on.  On Windows, however, it is
+typical to get a binary distribution which is ready for use.
 
 The following instructions apply to the source code distribution of
 John only.  If you have a binary distribution, then there's nothing
 for you to compile and you can start using John right away.
 
+Also, the instructions here are mostly generic (not very OS specific).
+Please refer to INSTALL-FEDORA, INSTALL-UBUNTU, or INSTALL-WINDOWS for
+instructions specific to those systems.
 
-	Requirements
 
-The Jumbo versions requires OpenSSL 0.9.7 or later. To get all functionality
-you need 1.0.1. For building, not only the run-time libs are needed but also
-"devel" stuff like header files. This is often a separate package, so eg.
-for Ubuntu you need "libssl-dev" as well as "libssl".
+	Requirements.
 
-A few helper tools need C++. Some helper tools are written in Python. A couple
-helper tools (vncpcap2john and SIPdump) need libpcap. A couple of formats need
-extra libraries in order to get included:
+Much functionality of JtR jumbo requires OpenSSL.  To get all of the related
+functionality, you need OpenSSL 1.0.1 or later.  With slightly older OpenSSL,
+you'll receive partial functionality.  You can also build without OpenSSL at
+all by passing the "--without-openssl" option to "./configure" (see below),
+but the functionality of such build will be greatly reduced.
+
+For building with OpenSSL, not only the runtime libraries are needed but also
+"development" stuff like header files.  This is often a separate package, so,
+e.g., for Ubuntu you need "libssl-dev" as well as "libssl".
+
+Some helper tools are written in Python.  A couple helper tools (vncpcap2john
+and SIPdump) need libpcap.  A couple of formats need extra libraries in order
+to get included:
 
 	mozilla		libnss
 	krb5-18/23	libkrb5
 	wowsrp		libgmp (will build without it, but is slower then)
 
-Again, you also need eg. libnss-dev, libkrb5-dev and libgmp-dev in order to
+Again, you also need e.g. libnss-dev, libkrb5-dev and libgmp-dev in order to
 build.
+
+Some formats also need libz and libbz2 (and their "development" components) for
+full functionality.
 
 
 	Compiling the sources on a Unix-like system.
@@ -53,18 +65,17 @@ chain of:
 
 Pass a CFLAGS variable in case you need to enable/disable compiler options
 different than default. For example, here's how to configure for just AVX
-on a host that is AVX2-capable (default is -march=native if your compiler
-supports it, that will enable all CPU features you've got):
-
+on a host that is AVX2-capable (default is to find all SIMD features you've
+got and enable them):
 	./configure CFLAGS="-g -O2 -mno-avx2"
 
 Note that whenever you pass CFLAGS like this, the default "-g -O2" will go
 away, so add that too (like was done above).
 
 You might want to add "-s" to make, for suppressing normal output and just
-print warnings and errors. For a multi-core host you can also add eg. "-j4"
-for using 4 cores in parallel when building. This can be written together,
-as in:
+print warnings and errors. For a multi-core host you can also add e.g. "-j4"
+for using 4 processes (hopefully on different cores) in parallel when building.
+This can be written together, as in:
 	./configure && make -sj4
 
 That -j option does not work well with the "clean" target so if you want to
@@ -72,22 +83,22 @@ use that, do it separately:
 	./configure && make -s clean && make -sj4
 
 ./configure should find and enable any extra stuff you have, including OMP,
-OpenCL, CUDA and extra libraries mentioned above. The only exception is MPI
-which needs the "--enable-mpi" option to be supplied to configure. If something
-is missing, it's likely installed in a non-standard location so you'd need to
-pass parameters:
-	./configure LDFLAGS=-L/opt/lib CFLAGS="-O2 -I/opt/include" && make
+OpenCL, and extra libraries mentioned above. The only exception is MPI
+which needs the "--enable-mpi" option to be supplied to configure (nearly
+all users should use the --fork option instead of MPI so wont need this). If
+something is missing, it's likely installed in a non-standard location so
+you'd need to pass parameters:
+	./configure LDFLAGS=-L/opt/lib CPPFLAGS=-I/opt/include && make -sj4
 
-NOTE! If you pass CFLAGS like above, you probably also want to add "-O2"
-since it (and "-g") will only be added automatically provided CFLAGS start
-out empty. This is a feature of the autoconf macros, not specific to JtR.
+Note that it's important to use CPPFLAGS and not CFLAGS in the example above,
+so that you don't override our compiler optimization flags in CFLAGS.
 
 If you have a broken pkg-config (eg. claiming there is no OpenSSL even though
 there is one) you can disable its use within configure:
 	./configure --disable-pkg-config
 
 You can also disable certain features you don't want, eg:
-	./configure --disable-openmp && make
+	./configure --disable-openmp && make -sj4
 
 If everything goes well, this will create the executables for John and
 its related utilities under "../run/".  You can change directory to
@@ -117,7 +128,7 @@ targets other than "generic" and since they typically use gcc, they are
 usually not affected by this potential problem.
 
 
-	OMP fallback build
+	OMP fallback build.
 
 Even a non-distro "native" build can gain from having OMP fallback. This
 means you will have a "john" binary that has OpenMP support, but that it
@@ -126,14 +137,14 @@ binary when applicable. This gains performance and has some other benfits
 too. Here's how to do it for your "home build":
 
 	./configure --disable-openmp &&
-	make -s clean && make -sj8 && mv ../run/john ../run/john-non-omp &&
+	make -s clean && make -sj4 && mv ../run/john ../run/john-non-omp &&
 	./configure CPPFLAGS='-DOMP_FALLBACK -DOMP_FALLBACK_BINARY="\"john-non-omp\""' &&
-	make -s clean && make -sj8 && echo All Done
+	make -s clean && make -sj4 && echo All Done
 
-Then you just run "john" as usual.
+Then you just run "./john" (from run directory) as usual.
 
 
-	Optimal interleaving factors (intrinsics builds)
+	Optimal interleaving factors (intrinsics builds).
 
 There is a script "testparas.pl" in the src directory, that can be used
 to test for optimal performance. Run it on an idle system. It will finish
@@ -141,27 +152,39 @@ with printing a full "./configure" command line to use. For most people,
 it's actually overkill. Spend the time learning tricks instead!
 
 
-	Optimal build on OS X
+	Optimal build on OS X.
 
-Using OS X, you can install Xcode (free) and then its "command line tools"
-and after that a normal build should work fine. However, using native
-gcc (which is really clang) results in suboptimal performance and some
-formats are disabled due to ancient OpenSSL.
+Using OS X, you can install Xcode (free in App Store) and then its "command
+line tools" and after that a normal build should work fine.  However, using
+native gcc (which is really clang) results in suboptimal performance and some
+formats are disabled due to ancient OpenSSL.  Also, clang doesn't have any
+OpenMP support.
 
-Here's how to make the best possible of your hardware. There are alternatives
+Here's how to make the best possible of your hardware.  There are alternatives
 that probably work fine but these instructions are for "Homebrew":
 
-  1. Install Homebrew:
-	http://mxcl.github.io/homebrew/
-  2. Install Homebrew's gcc and openssl:
+  1. Install Xcode (free in App Store).
+  2. Install Xcode's command-line tools:
+	xcode-select --install
+     You'll need to re-run that command after any little update of macOS,
+     because the command-line tools silently disappeared and you'll get a silly
+     "error: C compiler cannot create executables" when trying to build John.
+  3. Install Homebrew, by following the instructions given here:
+	https://brew.sh
+  4. Install Homebrew's gcc and OpenSSL:
 	brew install gcc openssl
-  3. Make sure /usr/local/bin precedes /usr/bin in your $PATH
-  4. Provide the path to GCC and the OpenSSL libraries to the configure script:
-        ./configure CC="gcc-6" CPPFLAGS="-I/usr/local/opt/openssl/include" LDFLAGS="-L/usr/local/opt/openssl/lib"
-  5. Clean old files and make:
-        make clean && make
+  5. Consider adding homebrew directories such as /usr/local/bin and/or
+     /opt/homebrew/bin to your $PATH.
+  6. Configure, possibly adding a CC option for pointing to a specific gcc and
+     using whatever LDFLAGS and CPPFLAGS was recommended when you installed
+     Homebrew's OpenSSL:
+        ./configure CC="/opt/homebrew/bin/gcc-10" \
+          LDFLAGS="-L/opt/homebrew/opt/openssl/lib" \
+          CPPFLAGS="-I/opt/homebrew/opt/openssl/include"
+  7. Clean old files and make:
+        make -s clean && make -sj4
 
-After the above, you should be able to get an optimal build with AVX and/or
+After the above, you should have a fairly optimal build with AVX/ASIMD or
 whatever extra features your CPU has got.
 
 If you get weird problems including things like "error: unknown type name
@@ -171,7 +194,7 @@ From John's "src" directory:
 
   sudo patch -b -N -p0 < unused/Yosemite.patch
 
-The patch is not needed for 10.11 "El Capitan".
+The patch is not needed for 10.11 "El Capitan" or later!
 
 NOTE: The above command will create backup files. If you ever want to restore
 everything as it were originally:
@@ -180,14 +203,3 @@ everything as it were originally:
   sudo mv -vi object.h.orig object.h
   sudo mv -vi queue.h.orig queue.h
   cd -
-
-
-	CUDA on OS X
-
-Download CUDA from Nvidia and install it. If build errors out complaining
-about llvm-gcc not found, try this (Homebrew example):
-
-  brew install llvm-gcc-28
-  sudo ln -s /usr/local/Cellar/llvm-gcc28/2.8/bin/llvm-gcc /usr/bin/llvm-gcc-4.2
-
-After that you should be able to build with the default Makefile.

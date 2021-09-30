@@ -16,9 +16,9 @@
 #define BINARY_ALIGN                    sizeof(uint64_t)
 
 #define BENCHMARK_COMMENT               ""
-#define BENCHMARK_LENGTH	        -1
-#define XSHA512_BENCHMARK_LENGTH	0
-#define NSLDAP_BENCHMARK_LENGTH	        -1
+#define BENCHMARK_LENGTH            7
+#define XSHA512_BENCHMARK_LENGTH    7
+#define NSLDAP_BENCHMARK_LENGTH     7
 
 #define FORMAT_TAG			"$SHA512$"
 #define XSHA512_FORMAT_TAG              "$LION$"
@@ -43,8 +43,10 @@ int sha512_common_valid_xsha512(char *ciphertext, struct fmt_main *self);
 int sha512_common_valid_nsldap(char *ciphertext, struct fmt_main *self);
 
 void * sha512_common_binary(char *ciphertext);
+void * sha512_common_binary_BE(char *ciphertext);
 void * sha512_common_binary_rev(char *ciphertext);
 void * sha512_common_binary_xsha512(char *ciphertext);
+void * sha512_common_binary_xsha512_BE(char *ciphertext);
 void * sha512_common_binary_xsha512_rev(char *ciphertext);
 void * sha512_common_binary_nsldap(char *ciphertext);
 

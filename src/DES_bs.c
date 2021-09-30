@@ -1,17 +1,17 @@
 /*
  * This file is part of John the Ripper password cracker,
- * Copyright (c) 1996-2002,2005,2010-2012 by Solar Designer
+ * Copyright (c) 1996-2002,2005,2010-2012,2017,2020 by Solar Designer
  *
  * Addition of single DES encryption with no salt by
  * Deepika Dutta Mishra <dipikadutta at gmail.com> in
  * 2012, no rights reserved.
- *
  */
 
 #ifdef _MSC_VER
 #undef _OPENMP
 #endif
 
+#include <stdint.h>
 #include <string.h>
 
 #include "arch.h"
@@ -23,7 +23,6 @@
 #include <omp.h>
 #include <assert.h>
 #endif
-#include "memdbg.h"
 
 #if DES_BS_VECTOR
 #define DEPTH				[depth]
@@ -89,13 +88,14 @@ void DES_bs_init(int LM, int cpt)
  * We allocate one extra entry (will be at "thread number" -1) to hold "ones"
  * and "salt" fields that are shared between threads.
  */
+retry:
 	n = omp_get_max_threads();
 	if (n < 1)
 		n = 1;
 	if (n > DES_bs_mt_max)
 		n = DES_bs_mt_max;
 	DES_bs_min_kpc = n * DES_BS_DEPTH;
-	{
+	if (n > 1) {
 		int max = n * cpt;
 		while (max > DES_bs_mt_max)
 			max -= n;
@@ -106,8 +106,13 @@ void DES_bs_init(int LM, int cpt)
 	DES_bs_nt = n;
 	if (!DES_bs_all_p) {
 		DES_bs_n_alloc = n;
-		DES_bs_all_p = mem_alloc_tiny(
-		    ++n * DES_bs_all_size, MEM_ALIGN_PAGE);
+		uint64_t size = (uint64_t)++n * DES_bs_all_size;
+		if (size >= (1U << 31) - MEM_ALIGN_PAGE) {
+			cpt--;
+			assert(cpt > 0);
+			goto retry;
+		}
+		DES_bs_all_p = mem_alloc_tiny(size, MEM_ALIGN_PAGE);
 	}
 #endif
 
@@ -288,9 +293,9 @@ fill2:
 	dst[sizeof(DES_bs_vector) * 8 * 6] = 0;
 }
 
-static ARCH_WORD_32 *DES_bs_get_binary_raw(ARCH_WORD *raw, int count)
+static uint32_t *DES_bs_get_binary_raw(ARCH_WORD *raw, int count)
 {
-	static ARCH_WORD_32 out[2];
+	static uint32_t out[2];
 
 /* For odd iteration counts, swap L and R here instead of doing it one
  * more time in DES_bs_crypt(). */
@@ -301,14 +306,14 @@ static ARCH_WORD_32 *DES_bs_get_binary_raw(ARCH_WORD *raw, int count)
 	return out;
 }
 
-ARCH_WORD_32 *DES_bs_get_binary(char *ciphertext)
+uint32_t *DES_bs_get_binary(char *ciphertext)
 {
 	return DES_bs_get_binary_raw(
 		DES_raw_get_binary(ciphertext),
 		DES_raw_get_count(ciphertext));
 }
 
-ARCH_WORD_32 *DES_bs_get_binary_LM(char *ciphertext)
+uint32_t *DES_bs_get_binary_LM(char *ciphertext)
 {
 	ARCH_WORD block[2], value;
 	int l, h;
@@ -325,7 +330,7 @@ ARCH_WORD_32 *DES_bs_get_binary_LM(char *ciphertext)
 	return DES_bs_get_binary_raw(DES_do_IP(block), 1);
 }
 
-char *DES_bs_get_source_LM(ARCH_WORD_32 *raw)
+char *DES_bs_get_source_LM(uint32_t *raw)
 {
 	static char out[17];
 	char *p;
@@ -384,8 +389,6 @@ static MAYBE_INLINE int DES_bs_get_hash(int index, int count, int trip)
 	result |= MOVE_BIT(1);
 	result |= MOVE_BIT(2);
 	result |= MOVE_BIT(3);
-	if (count == 4) return result;
-
 	result |= MOVE_BIT(4);
 	result |= MOVE_BIT(5);
 	result |= MOVE_BIT(6);
@@ -422,6 +425,11 @@ static MAYBE_INLINE int DES_bs_get_hash(int index, int count, int trip)
 	result |= MOVE_BIT(24);
 	result |= MOVE_BIT(25);
 	result |= MOVE_BIT(26);
+	if (count == 27) return result;
+
+	result |= MOVE_BIT(27);
+	result |= MOVE_BIT(28);
+	result |= MOVE_BIT(29);
 
 #undef GET_BIT
 #undef MOVE_BIT
@@ -431,37 +439,37 @@ static MAYBE_INLINE int DES_bs_get_hash(int index, int count, int trip)
 
 int DES_bs_get_hash_0(int index)
 {
-	return DES_bs_get_hash(index, 4, 0);
+	return DES_bs_get_hash(index, 8, 0);
 }
 
 int DES_bs_get_hash_1(int index)
 {
-	return DES_bs_get_hash(index, 8, 0);
+	return DES_bs_get_hash(index, 12, 0);
 }
 
 int DES_bs_get_hash_2(int index)
 {
-	return DES_bs_get_hash(index, 12, 0);
+	return DES_bs_get_hash(index, 16, 0);
 }
 
 int DES_bs_get_hash_3(int index)
 {
-	return DES_bs_get_hash(index, 16, 0);
+	return DES_bs_get_hash(index, 20, 0);
 }
 
 int DES_bs_get_hash_4(int index)
 {
-	return DES_bs_get_hash(index, 20, 0);
+	return DES_bs_get_hash(index, 24, 0);
 }
 
 int DES_bs_get_hash_5(int index)
 {
-	return DES_bs_get_hash(index, 24, 0);
+	return DES_bs_get_hash(index, 27, 0);
 }
 
 int DES_bs_get_hash_6(int index)
 {
-	return DES_bs_get_hash(index, 27, 0);
+	return DES_bs_get_hash(index, 30, 0);
 }
 
 /*
@@ -469,7 +477,7 @@ int DES_bs_get_hash_6(int index)
  * DES_bs_crypt*() outputs in just O(log2(ARCH_BITS)) operations, assuming
  * that DES_BS_VECTOR is 0 or 1. This routine isn't vectorized yet.
  */
-int DES_bs_cmp_all(ARCH_WORD_32 *binary, int count)
+int DES_bs_cmp_all(uint32_t *binary, int count)
 {
 	ARCH_WORD value, mask;
 	int bit;
@@ -480,7 +488,13 @@ int DES_bs_cmp_all(ARCH_WORD_32 *binary, int count)
 #if DES_bs_mt
 	int t, n = (count + (DES_BS_DEPTH - 1)) / DES_BS_DEPTH;
 #endif
+	int retval = 0;
 
+#if defined(_OPENMP) && DES_BS_VECTOR
+#pragma omp parallel for if(n >= 96) default(none) private(value, mask, bit, b, depth, t) shared(n, DES_bs_all_p, retval, binary)
+#elif defined(_OPENMP)
+#pragma omp parallel for if(n >= 96) default(none) private(value, mask, bit, b, t) shared(n, DES_bs_all_p, retval, binary)
+#endif
 	for_each_t(n)
 	for_each_depth() {
 		value = binary[0];
@@ -488,7 +502,6 @@ int DES_bs_cmp_all(ARCH_WORD_32 *binary, int count)
 
 		mask = b[0] START ^ -(value & 1);
 		mask |= b[1] START ^ -((value >> 1) & 1);
-		if (mask == ~(ARCH_WORD)0) goto next_depth;
 		mask |= b[2] START ^ -((value >> 2) & 1);
 		mask |= b[3] START ^ -((value >> 3) & 1);
 		if (mask == ~(ARCH_WORD)0) goto next_depth;
@@ -505,15 +518,19 @@ int DES_bs_cmp_all(ARCH_WORD_32 *binary, int count)
 			b += 2;
 		}
 
+#ifdef _OPENMP
+		retval = 1;
+#else
 		return 1;
+#endif
 next_depth:
 		;
 	}
 
-	return 0;
+	return retval;
 }
 
-int DES_bs_cmp_one(ARCH_WORD_32 *binary, int count, int index)
+int DES_bs_cmp_one(uint32_t *binary, int count, int index)
 {
 	DES_bs_vector *b;
 	int depth;
@@ -534,7 +551,7 @@ int DES_bs_cmp_one(ARCH_WORD_32 *binary, int count, int index)
 /* Start by comparing bits that are not part of get_hash*() return value */
 	CMP_BIT(30);
 	CMP_BIT(31);
-/* These three overlap with DES_bs_get_hash_6t() return value, unfortunately */
+/* These three overlap with DES_bs_get_hash_6() return value, unfortunately */
 	CMP_BIT(27);
 	CMP_BIT(28);
 	CMP_BIT(29);
@@ -555,32 +572,47 @@ int DES_bs_cmp_one(ARCH_WORD_32 *binary, int count, int index)
 	return 1;
 }
 
-int DES_bs_get_hash_1t(int index)
+int DES_bs_get_hash_0t(int index)
 {
 	return DES_bs_get_hash(index, 8, 1);
 }
 
-int DES_bs_get_hash_2t(int index)
+int DES_bs_get_hash_1t(int index)
 {
 	return DES_bs_get_hash(index, 12, 1);
 }
 
-int DES_bs_get_hash_3t(int index)
+int DES_bs_get_hash_2t(int index)
 {
 	return DES_bs_get_hash(index, 16, 1);
 }
 
-int DES_bs_get_hash_4t(int index)
+int DES_bs_get_hash_3t(int index)
 {
 	return DES_bs_get_hash(index, 20, 1);
 }
 
-int DES_bs_get_hash_5t(int index)
+int DES_bs_get_hash_4t(int index)
 {
 	return DES_bs_get_hash(index, 24, 1);
 }
 
-int DES_bs_get_hash_6t(int index)
+int DES_bs_get_hash_5t(int index)
 {
 	return DES_bs_get_hash(index, 27, 1);
+}
+
+void DES_bs_generate_plaintext(unsigned char *plaintext)
+{
+	int i;
+#if DES_BS_VECTOR
+	int depth;
+#endif
+
+	/* Set same plaintext for all bit layers */
+	for (i = 0; i < 64; i++) {
+		ARCH_WORD value = -(ARCH_WORD)((plaintext[i >> 3] >> (7 - (i & 7))) & 1);
+		for_each_depth()
+			DES_bs_P[i] DEPTH = value;
+	}
 }

@@ -1,4 +1,5 @@
-/* GPG cracker patch for JtR. Hacked together during Monsoon of 2012 by
+/*
+ * GPG cracker patch for JtR. Hacked together during Monsoon of 2012 by
  * Dhiru Kholia <dhiru.kholia at gmail.com> .
  *
  * This software is Copyright (c) 2012, Dhiru Kholia <dhiru.kholia at gmail.com>
@@ -20,8 +21,14 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>
  *
- * converted to use 'common' code, Feb29-Mar1 2016, JimF.
+ * Converted to use 'common' code, Feb29-Mar1 2016, JimF.
  */
+
+#if AC_BUILT
+#include "autoconfig.h"
+#endif
+
+#if HAVE_LIBCRYPTO
 
 #if FMT_EXTERNS_H
 extern struct fmt_main fmt_gpg;
@@ -30,14 +37,10 @@ john_register_one(&fmt_gpg);
 #else
 
 #include <string.h>
-#include <assert.h>
-#include "twofish.h"
+#include <stdint.h>
 
 #ifdef _OPENMP
 #include <omp.h>
-#ifndef OMP_SCALE
-#define OMP_SCALE               64
-#endif
 #endif
 
 #include "arch.h"
@@ -45,26 +48,26 @@ john_register_one(&fmt_gpg);
 #include "common.h"
 #include "formats.h"
 #include "misc.h"
+#include "twofish.h"
 #include "md5.h"
 #include "rc4.h"
 #include "pdfcrack_md5.h"
 #include "sha.h"
 #include "sha2.h"
-#include "stdint.h"
 #include "gpg_common.h"
-#include "memdbg.h"
 
 #define FORMAT_LABEL        "gpg"
 #define FORMAT_NAME         "OpenPGP / GnuPG Secret Key"
 #define ALGORITHM_NAME      "32/" ARCH_BITS_STR
+#define BENCHMARK_LENGTH    0x107
 #define SALT_SIZE           sizeof(struct gpg_common_custom_salt*)
+
+#ifndef OMP_SCALE
+#define OMP_SCALE           1 // MKPC and scale tuned for i7
+#endif
 
 #define MIN_KEYS_PER_CRYPT  1
 #define MAX_KEYS_PER_CRYPT  1
-
-#if defined (_OPENMP)
-static int omp_t = 1;
-#endif
 
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
 static int *cracked;
@@ -73,12 +76,8 @@ static size_t cracked_size;
 
 static void init(struct fmt_main *self)
 {
-#if defined (_OPENMP)
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
+	omp_autotune(self, OMP_SCALE);
+
 	saved_key = mem_calloc_align(sizeof(*saved_key),
 			self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
 	any_cracked = 0;
@@ -93,6 +92,11 @@ static void done(void)
 	MEM_FREE(saved_key);
 }
 
+static int valid(char *ciphertext, struct fmt_main *self)
+{
+	return gpg_common_valid(ciphertext, self, 1);
+}
+
 static void set_salt(void *salt)
 {
 	gpg_common_cur_salt = *(struct gpg_common_custom_salt **)salt;
@@ -100,11 +104,7 @@ static void set_salt(void *salt)
 
 static void gpg_set_key(char *key, int index)
 {
-	int saved_len = strlen(key);
-	if (saved_len > PLAINTEXT_LENGTH)
-		saved_len = PLAINTEXT_LENGTH;
-	memcpy(saved_key[index], key, saved_len);
-	saved_key[index][saved_len] = 0;
+	strnzcpy(saved_key[index], key, sizeof(*saved_key));
 }
 
 static char *get_key(int index)
@@ -125,9 +125,8 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 #ifdef _OPENMP
 #pragma omp parallel for
-	for (index = 0; index < count; index++)
 #endif
-	{
+	for (index = 0; index < count; index++) {
 		int res;
 		unsigned char keydata[64];
 
@@ -175,7 +174,7 @@ struct fmt_main fmt_gpg = {
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_CASE | FMT_8_BIT | FMT_OMP | FMT_DYNA_SALT,
+		FMT_CASE | FMT_8_BIT | FMT_OMP | FMT_DYNA_SALT | FMT_HUGE_INPUT,
 		{
 			"s2k-count", /* only for gpg --s2k-mode 3, see man gpg, option --s2k-count n */
 			"hash algorithm [1:MD5 2:SHA1 3:RIPEMD160 8:SHA256 9:SHA384 10:SHA512 11:SHA224]",
@@ -189,7 +188,7 @@ struct fmt_main fmt_gpg = {
 		done,
 		fmt_default_reset,
 		fmt_default_prepare,
-		gpg_common_valid,
+		valid,
 		fmt_default_split,
 		fmt_default_binary,
 		gpg_common_get_salt,
@@ -200,7 +199,7 @@ struct fmt_main fmt_gpg = {
 		},
 		fmt_default_source,
 		{
-			fmt_default_binary_hash /* Not usable with $SOURCE_HASH$ */
+			fmt_default_binary_hash
 		},
 		fmt_default_salt_hash,
 		NULL,
@@ -210,7 +209,7 @@ struct fmt_main fmt_gpg = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			fmt_default_get_hash /* Not usable with $SOURCE_HASH$ */
+			fmt_default_get_hash
 		},
 		cmp_all,
 		cmp_one,
@@ -219,3 +218,4 @@ struct fmt_main fmt_gpg = {
 };
 
 #endif /* plugin stanza */
+#endif /* HAVE_LIBCRYPTO */

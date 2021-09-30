@@ -17,10 +17,11 @@ def process_file(filename):
                 data.insert(7, '')
             sys.stderr.write("%s-%s:$sip$*%s\n" % (data[0], data[1], '*'.join(data)))
 
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         sys.stderr.write("Usage: %s <sipdump dump files>\n" % sys.argv[0])
-        sys.exit(-1)
+        sys.exit(1)
 
     for i in range(1, len(sys.argv)):
         process_file(sys.argv[i])

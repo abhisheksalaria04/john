@@ -1,9 +1,12 @@
-/* SIP cracker patch for JtR. Hacked together during March of 2012 by
+/*
+ * SIP cracker patch for JtR. Hacked together during March of 2012 by
  * Dhiru Kholia <dhiru.kholia at gmail.com> .
  *
- * Copyright (C) 2007  Martin J. Muench <mjm@codito.de>
- * SIP digest authentication password (hash) cracker
- * See doc/SIPcrack-LICENSE */
+ * This code is based on SIPcrack (SIP digest authentication password hash
+ * cracker) which is Copyright (C) 2007 Martin J. Muench <mjm@codito.de>.
+ *
+ * See doc/SIPcrack-LICENSE for licensing details.
+ */
 
 #if FMT_EXTERNS_H
 extern struct fmt_main fmt_sip;
@@ -11,13 +14,16 @@ extern struct fmt_main fmt_sip;
 john_register_one(&fmt_sip);
 #else
 
-#include "md5.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <assert.h>
-#include <errno.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "arch.h"
+#include "md5.h"
 #include "crc32.h"
 #include "misc.h"
 #include "common.h"
@@ -25,20 +31,6 @@ john_register_one(&fmt_sip);
 #include "params.h"
 #include "options.h"
 #include "sip_fmt_plug.h"
-#ifdef _OPENMP
-static int omp_t = 1;
-#include <omp.h>
-// Tuned on core i7 quad HT
-//   1   4963K
-//  16   8486K
-//  32   8730K  ** this was chosen.
-//  64   8791k
-// 128   8908k
-#ifndef OMP_SCALE
-#define OMP_SCALE   32
-#endif
-#endif
-#include "memdbg.h"
 
 typedef struct sip_salt_t {
 	int static_hash_data_len;
@@ -48,45 +40,47 @@ typedef struct sip_salt_t {
 
 static sip_salt *pSalt;
 
+#define FORMAT_LABEL            "SIP"
+#define FORMAT_NAME             ""
+#define FORMAT_TAG              "$sip$*"
+#define FORMAT_TAG_LEN          (sizeof(FORMAT_TAG)-1)
+#define ALGORITHM_NAME          "MD5 32/" ARCH_BITS_STR
+#define BENCHMARK_COMMENT       ""
+#define BENCHMARK_LENGTH        7
+#define PLAINTEXT_LENGTH        32
+#define BINARY_SIZE             16
+#define SALT_SIZE               sizeof(sip_salt)
+#define BINARY_ALIGN            4
+#define SALT_ALIGN              sizeof(int)
+#define MIN_KEYS_PER_CRYPT      1
+#define MAX_KEYS_PER_CRYPT      64
 
-#define FORMAT_LABEL		"SIP"
-#define FORMAT_NAME		""
-#define FORMAT_TAG           "$sip$*"
-#define FORMAT_TAG_LEN       (sizeof(FORMAT_TAG)-1)
-#define ALGORITHM_NAME		"MD5 32/" ARCH_BITS_STR
-#define BENCHMARK_COMMENT	""
-#define BENCHMARK_LENGTH	0
-#define PLAINTEXT_LENGTH	32
-#define BINARY_SIZE		16
-#define SALT_SIZE		sizeof(sip_salt)
-#define BINARY_ALIGN	4
-#define SALT_ALIGN		sizeof(int)
-#define MIN_KEYS_PER_CRYPT	1
-#define MAX_KEYS_PER_CRYPT	64
+#ifndef OMP_SCALE
+#define OMP_SCALE   512 // MKPC & scale tuned for i7
+#endif
 
 static struct fmt_tests sip_tests[] = {
 	{"$sip$*192.168.1.111*192.168.1.104*200*asterisk*REGISTER*sip*192.168.1.104**46cce857****MD5*4dfc7515936a667565228dbaa0293dfc", "123456"},
 	{"$sip$*10.0.1.20*10.0.1.10*1001*asterisk*REGISTER*sips*10.0.1.20*5061*0ef95b07****MD5*576e39e9de6a9ed053eb218f65fe470e", "q1XCLF0KaBObo797"},
+	// https://sites.google.com/site/httpbrute/tutorial
+	{"$sip$*192.168.1.110*192.168.1.110*user151*Apple*REGISTER*sip*192.168.1.110*5060*b57aa7088ae5cac88d298d66f2c809cd****MD5*77795e92300dcc3c2fd974b2b47e5f0c", "pass151"},
 	// generated with pass_gen.pl
 	{"$sip$*192.168.163.238*192.168.163.239*50894*asterisk*REGISTER*sip*192.168.163.239**303535c9****MD5*e32c95d6ad0fecbc3967b7534d7b5b3b", "123456"},
 	{"$sip$*192.168.196.105*192.168.196.192*81670*asterisk*REGISTER*sip*192.168.196.192**747f072a****MD5*d15c84b1bdc2155db12b721d7fb9445b", "password"},
 	{"$sip$*192.168.119.6*192.168.119.154*65790*asterisk*REGISTER*sip*192.168.119.154**8d4e1a4b****MD5*dcc0d8a4c105dbf3ecf5b281f4c57356", "happy123"},
 	{"$sip$*192.168.113.63*192.168.113.78*59810*asterisk*REGISTER*sip*192.168.113.78**b778256e****MD5*cb13933a5986df471265231d08206509", "aobdataeteag"},
+	{"$sip$*192.168.44.162*192.168.44.11*12315*asterisk*REGISTER*sip*192.168.44.11**825f321ad9886ef434788ebfb8dbf150*b78b5a31*00000001*auth*MD5*23802bb930873797f0c7a1f0e595a94e", "abc"},
 	{NULL}
 };
 
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
-static ARCH_WORD_32 (*crypt_key)[BINARY_SIZE/sizeof(ARCH_WORD_32)];
+static uint32_t (*crypt_key)[BINARY_SIZE/sizeof(uint32_t)];
 static char bin2hex_table[256][2]; /* table for bin<->hex mapping */
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
+	omp_autotune(self, OMP_SCALE);
+
 	/* Init bin 2 hex table for faster conversions later */
 	init_bin2hex(bin2hex_table);
 	saved_key = mem_calloc(self->params.max_keys_per_crypt,
@@ -104,15 +98,16 @@ static void done(void)
 static int valid(char *ciphertext, struct fmt_main *self)
 {
 	char *p = ciphertext, *q;
-	int i,res = 0;
+	int i, res = 0;
+
 	if (strncmp(ciphertext, FORMAT_TAG, FORMAT_TAG_LEN))
 		return 0;
 	if (strlen(ciphertext) > 2048) // sizeof(saltBuf) in get_salt
 		return 0;
-	for(i = 0; i < strlen(ciphertext); i++)
-		if(ciphertext[i] == '*')
+	for (i = 0; i < strlen(ciphertext); i++)
+		if (ciphertext[i] == '*')
 			res++;
-	if(res != 14)
+	if (res != 14)
 		goto err;
 	res = 0;
 	p += FORMAT_TAG_LEN;
@@ -198,19 +193,23 @@ static void *get_salt(char *ciphertext)
 	char saltBuf[2048];
 	char *lines[16];
 	login_t login;
-	int num_lines;
 	MD5_CTX md5_ctx;
 	unsigned char md5_bin_hash[MD5_LEN];
 	char static_hash[MD5_LEN_HEX+1];
 	char *saltcopy = saltBuf;
 
+/*
+ * Zeroize both structs so that any padding gaps have defined values and thus
+ * salt comparisons work reliably.  Note that we memcpy() md5_ctx into
+ * salt.ctx_dyna_data, which copies md5_ctx's padding gaps too.
+ */
 	memset(&salt, 0, sizeof(salt));
+	memset(&md5_ctx, 0, sizeof(md5_ctx));
 
 	strcpy(saltBuf, ciphertext);
 	saltcopy += FORMAT_TAG_LEN;	/* skip over "$sip$*" */
 	memset(&login, 0, sizeof(login_t));
-	num_lines = stringtoarray(lines, saltcopy, '*');
-	assert(num_lines == 14);
+	stringtoarray(lines, saltcopy, '*');
 	strncpy(login.server,      lines[0], sizeof(login.server)      - 1 );
 	strncpy(login.client,      lines[1], sizeof(login.client)      - 1 );
 	strncpy(login.user,        lines[2], sizeof(login.user)        - 1 );
@@ -228,7 +227,7 @@ static void *get_salt(char *ciphertext)
 	strncpy(login.qop,         lines[11], sizeof(login.qop)        - 1 );
 	strncpy(login.algorithm,   lines[12], sizeof(login.algorithm)  - 1 );
 	strncpy(login.hash,        lines[13], sizeof(login.hash)       - 1 );
-	if(strncmp(login.algorithm, "MD5", strlen(login.algorithm))) {
+	if (strncmp(login.algorithm, "MD5", strlen(login.algorithm))) {
 		printf("\n* Cannot crack '%s' hash, only MD5 supported so far...\n", login.algorithm);
 		error();
 	}
@@ -252,9 +251,9 @@ static void *get_salt(char *ciphertext)
 	//snprintf(salt.dynamic_hash_data, DYNAMIC_HASH_SIZE, "%s:%s:", login.user, login.realm);
 	//salt.dynamic_hash_data_len = strlen(salt.dynamic_hash_data);
 
-	/* Construct last part of final hash data: ':NONCE(:CNONCE:NONCE_COUNT:QOP):<static_hash>' */
+	/* Construct last part of final hash data: ':NONCE(:NONCE_COUNT:CNONCE:QOP):<static_hash>' */
 	/* no qop */
-	if(!strlen(login.qop))
+	if (!strlen(login.qop))
 		snprintf(salt.static_hash_data, STATIC_HASH_SIZE, ":%s:%s", login.nonce, static_hash);
 	/* qop/conce/cnonce_count */
 	else
@@ -264,7 +263,6 @@ static void *get_salt(char *ciphertext)
 	/* Get lens of static buffers */
 	salt.static_hash_data_len  = strlen(salt.static_hash_data);
 
-	/* Begin brute force attack */
 #ifdef SIP_DEBUG
 	printf("Starting bruteforce against user '%s' (%s: '%s')\n",
 			login.user, login.algorithm, login.hash);
@@ -297,13 +295,12 @@ static void * get_binary(char *ciphertext) {
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
 	const int count = *pcount;
-	int index = 0;
+	int index;
 
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-	for (index = 0; index < count; index++)
-	{
+	for (index = 0; index < count; index++) {
 		/* password */
 		MD5_CTX md5_ctx;
 		unsigned char md5_bin_hash[MD5_LEN];
@@ -325,6 +322,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 		MD5_Update(&md5_ctx, (unsigned char*)pSalt->static_hash_data, pSalt->static_hash_data_len);
 		MD5_Final((unsigned char*)crypt_key[index], &md5_ctx);
 	}
+
 	return count;
 }
 
@@ -332,7 +330,7 @@ static int cmp_all(void *binary, int count)
 {
 	int index;
 	for (index = 0; index < count; index++)
-		if ( ((ARCH_WORD_32*)binary)[0] == ((ARCH_WORD_32*)&(crypt_key[index][0]))[0] )
+		if ( ((uint32_t*)binary)[0] == ((uint32_t*)&(crypt_key[index][0]))[0] )
 			return 1;
 	return 0;
 
@@ -345,14 +343,12 @@ static int cmp_one(void *binary, int index)
 
 static int cmp_exact(char *source, int index)
 {
-    return 1;
+	return 1;
 }
 
 static void sip_set_key(char *key, int index)
 {
-	int saved_len = strlen(key);
-	memcpy(saved_key[index], key, saved_len);
-	saved_key[index][saved_len] = 0;
+	strnzcpy(saved_key[index], key, sizeof(*saved_key));
 }
 
 static char *get_key(int index)
@@ -375,7 +371,7 @@ struct fmt_main fmt_sip = {
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_CASE | FMT_8_BIT | FMT_OMP,
+		FMT_CASE | FMT_8_BIT | FMT_OMP | FMT_HUGE_INPUT,
 		{ NULL },
 		{ FORMAT_TAG },
 		sip_tests
@@ -391,7 +387,7 @@ struct fmt_main fmt_sip = {
 		{ NULL },
 		fmt_default_source,
 		{
-			fmt_default_binary_hash /* Not usable with $SOURCE_HASH$ */
+			fmt_default_binary_hash
 		},
 		fmt_default_salt_hash,
 		NULL,
@@ -401,7 +397,7 @@ struct fmt_main fmt_sip = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			fmt_default_get_hash /* Not usable with $SOURCE_HASH$ */
+			fmt_default_get_hash
 		},
 		cmp_all,
 		cmp_one,

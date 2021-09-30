@@ -23,10 +23,10 @@ john_register_one(&fmt_ocl_cryptsha1);
 #include "formats.h"
 #include "options.h"
 #include "base64_convert.h"
-#include "common-opencl.h"
+#include "opencl_common.h"
 #include "sha1crypt_common.h"
 #define OUTLEN 20
-#include "opencl_pbkdf1_hmac_sha1.h"
+#include "../run/opencl/opencl_pbkdf1_hmac_sha1.h"
 
 #define SHA1_SIZE 20
 
@@ -62,7 +62,7 @@ john_register_one(&fmt_ocl_cryptsha1);
 #define STEP			0
 #define SEED			128
 
-#define ITERATIONS		(64000*2+2)
+#define ITERATIONS		(20000*2+2)
 
 /* This handles all widths */
 #define GETPOS(i, index)	(((index) % ocl_v_width) * 4 + ((i) & ~3U) * ocl_v_width + (((i) & 3) ^ 3) + ((index) / ocl_v_width) * 64 * ocl_v_width)
@@ -83,13 +83,16 @@ static const char * warn[] = {
 
 static int split_events[] = { 2, -1, -1 };
 
-//This file contains auto-tuning routine(s). Has to be included after formats definitions.
-#include "opencl-autotune.h"
-#include "memdbg.h"
+// This file contains auto-tuning routine(s). Has to be included after formats definitions.
+#include "opencl_autotune.h"
+
+static void release_clobj(void);
 
 static void create_clobj(size_t gws, struct fmt_main *self)
 {
 	size_t kpc = gws * ocl_v_width;
+
+	release_clobj();
 
 #define CL_RO CL_MEM_READ_ONLY
 #define CL_WO CL_MEM_WRITE_ONLY
@@ -153,15 +156,11 @@ static void release_clobj(void)
 
 static void init(struct fmt_main *_self)
 {
-	static char valgo[sizeof(ALGORITHM_NAME) + 8] = "";
+	static char valgo[sizeof(ALGORITHM_NAME) + 12] = "";
 
 	self = _self;
 
 	opencl_prepare_dev(gpu_id);
-	/* Nvidia Kepler benefits from 2x interleaved code */
-	if (!options.v_width && nvidia_sm_3x(device_info[gpu_id]))
-		ocl_v_width = 2;
-	else
 	/* VLIW5 does better with just 2x vectors due to GPR pressure */
 	if (!options.v_width && amd_vliw5(device_info[gpu_id]))
 		ocl_v_width = 2;
@@ -178,14 +177,14 @@ static void init(struct fmt_main *_self)
 
 static void reset(struct db_main *db)
 {
-	if (!autotuned) {
+	if (!program[gpu_id]) {
 		char build_opts[64];
 
 		snprintf(build_opts, sizeof(build_opts),
 		         "-DHASH_LOOPS=%u -DOUTLEN=%u "
 		         "-DPLAINTEXT_LENGTH=%u -DV_WIDTH=%u",
 		         HASH_LOOPS, OUTLEN, PLAINTEXT_LENGTH, ocl_v_width);
-		opencl_init("$JOHN/kernels/pbkdf1_hmac_sha1_kernel.cl",
+		opencl_init("$JOHN/opencl/pbkdf1_hmac_sha1_kernel.cl",
 		            gpu_id, build_opts);
 
 		pbkdf1_init = clCreateKernel(program[gpu_id], "pbkdf1_init", &ret_code);
@@ -194,24 +193,22 @@ static void reset(struct db_main *db)
 		HANDLE_CLERROR(ret_code, "Error creating kernel");
 		pbkdf1_final = clCreateKernel(program[gpu_id], "pbkdf1_final", &ret_code);
 		HANDLE_CLERROR(ret_code, "Error creating kernel");
-
-		//Initialize openCL tuning (library) for this format.
-		opencl_init_auto_setup(SEED, HASH_LOOPS, split_events, warn,
-		                       2, self, create_clobj, release_clobj,
-		                       ocl_v_width *
-		                       (PLAINTEXT_LENGTH + sizeof(pbkdf1_out)),
-		                       0, db);
-
-		//Auto tune execution from shared/included code.
-		autotune_run(self, ITERATIONS, 0,
-		             (cpu(device_info[gpu_id]) ?
-		              1000000000 : 10000000000ULL));
 	}
+
+	//Initialize openCL tuning (library) for this format.
+	opencl_init_auto_setup(SEED, HASH_LOOPS, split_events, warn,
+	                       2, self, create_clobj, release_clobj,
+	                       ocl_v_width *
+	                       (PLAINTEXT_LENGTH + sizeof(pbkdf1_out)),
+	                       0, db);
+
+	//Auto tune execution from shared/included code.
+	autotune_run(self, ITERATIONS, 0, 200);
 }
 
 static void done(void)
 {
-	if (autotuned) {
+	if (program[gpu_id]) {
 		release_clobj();
 
 		HANDLE_CLERROR(clReleaseKernel(pbkdf1_init), "Release kernel");
@@ -220,14 +217,15 @@ static void done(void)
 		HANDLE_CLERROR(clReleaseProgram(program[gpu_id]),
 		               "Release Program");
 
-		autotuned--;
+		program[gpu_id] = NULL;
 	}
 }
 
 static void set_salt(void *salt)
 {
 	host_salt = (pbkdf1_salt*)salt;
-	HANDLE_CLERROR(clEnqueueWriteBuffer(queue[gpu_id], mem_salt, CL_FALSE, 0, sizeof(pbkdf1_salt), host_salt, 0, NULL, NULL), "Copy salt to gpu");
+	HANDLE_CLERROR(clEnqueueWriteBuffer(queue[gpu_id], mem_salt, CL_FALSE, 0, sizeof(pbkdf1_salt), host_salt, 0, NULL, NULL), "Salt transfer");
+	HANDLE_CLERROR(clFlush(queue[gpu_id]), "clFlush failed in set_salt()");
 }
 
 static int binary_hash_0(void *binary)
@@ -259,19 +257,19 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 	size_t scalar_gws;
 	size_t *lws = local_work_size ? &local_work_size : NULL;
 
-	global_work_size = GET_MULTIPLE_OR_BIGGER_VW(count, local_work_size);
+	global_work_size = GET_KPC_MULTIPLE(count, local_work_size);
 	scalar_gws = global_work_size * ocl_v_width;
 #if 0
 	fprintf(stderr, "%s(%d) lws "Zu" gws "Zu" sgws "Zu"\n", __FUNCTION__,
 	        count, local_work_size, global_work_size, scalar_gws);
 #endif
-	/// Copy data to gpu
+	// Copy data to gpu
 	if (ocl_autotune_running || new_keys) {
 		BENCH_CLERROR(clEnqueueWriteBuffer(queue[gpu_id], mem_in, CL_FALSE, 0, key_buf_size, inbuffer, 0, NULL, multi_profilingEvent[0]), "Copy data to gpu");
 		new_keys = 0;
 	}
 
-	/// Run kernels
+	// Run kernels
 	BENCH_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], pbkdf1_init, 1, NULL, &global_work_size, lws, 0, NULL, multi_profilingEvent[1]), "Run initial kernel");
 
 	for (i = 0; i < (ocl_autotune_running ? 1 : LOOP_COUNT); i++) {
@@ -282,7 +280,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 	BENCH_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], pbkdf1_final, 1, NULL, &global_work_size, lws, 0, NULL, multi_profilingEvent[3]), "Run intermediate kernel");
 
-	/// Read the result back
+	// Read the result back
 	BENCH_CLERROR(clEnqueueReadBuffer(queue[gpu_id], mem_out, CL_TRUE, 0, sizeof(pbkdf1_out) * scalar_gws, host_crack, 0, NULL, multi_profilingEvent[4]), "Copy result back");
 
 	return count;

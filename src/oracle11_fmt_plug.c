@@ -67,18 +67,20 @@ john_register_one(&fmt_oracle11);
 #include "misc.h"
 #include "common.h"
 #include "formats.h"
+#include "unicode.h"
 #include "sha.h"
 #include "johnswap.h"
 #include <ctype.h>
-#include "memdbg.h"
 
 #define FORMAT_LABEL			"oracle11"
 #define FORMAT_NAME			"Oracle 11g"
+#define FORMAT_TAG			"$oracle11$"
+#define FORMAT_TAG_LENGTH		(sizeof(FORMAT_TAG) - 1)
 
 #define ALGORITHM_NAME			"SHA1 " SHA1_ALGORITHM_NAME
 
 #define BENCHMARK_COMMENT		""
-#define BENCHMARK_LENGTH		0
+#define BENCHMARK_LENGTH		7
 
 /* Maximum length of password in characters. Oracle supports identifiers of 30
  * characters max. (ALTER USER user IDENTIFIED BY 30lettersPassword) */
@@ -102,7 +104,8 @@ john_register_one(&fmt_oracle11);
 #ifdef SIMD_COEF_32
 #define MIN_KEYS_PER_CRYPT		NBKEYS
 #define MAX_KEYS_PER_CRYPT		NBKEYS
-#define GETPOS(i, index)		( (index&(SIMD_COEF_32-1))*4 + ((i)&(0xffffffff-3))*SIMD_COEF_32 + (3-((i)&3)) + (unsigned int)index/SIMD_COEF_32*SHA_BUF_SIZ*SIMD_COEF_32*4 ) //for endianity conversion
+#define FMT_IS_BE
+#include "common-simd-getpos.h"
 #define GETPOS_WORD(i, index)		( (index&(SIMD_COEF_32-1))*4 + ((i)&(0xffffffff-3))*SIMD_COEF_32 +               (unsigned int)index/SIMD_COEF_32*SHA_BUF_SIZ*SIMD_COEF_32*4)
 #else
 #define MIN_KEYS_PER_CRYPT		1
@@ -116,6 +119,11 @@ static struct fmt_tests tests[] = {
 	{"3437FF72BD69E3FB4D10C750B92B8FB90B155E26227B9AB62D94F54E5951", "oracle"},
 	{"61CE616647A4F7980AFD7C7245261AF25E0AFE9C9763FCF0D54DA667D4E6", "11g"},
 	{"B9E7556F53500C8C78A58F50F24439D79962DE68117654B6700CE7CC71CF", "11g"},
+
+	/* with FORMAT_TAG */
+	{"$oracle11$7233E3B91B45F6B813BCFFB5D8669167CB4F498D0642558A8A3BB39948C0", "testpwd"},
+	{"$oracle11$f013fe236e70f5b47e933d84eac5ef2b1ab6e8b2b90bd9536750cad2998c", "TOTO1234#"},
+
 	{NULL}
 };
 
@@ -123,15 +131,15 @@ static unsigned char *saved_salt;
 
 #ifdef SIMD_COEF_32
 
-unsigned char *saved_key;
-unsigned char *crypt_key;
-
+static unsigned char *saved_key;
+static unsigned char *crypt_key;
+static int *saved_len;
 #else
 
 static char saved_key[PLAINTEXT_LENGTH + 1];
 static int saved_len;
 static SHA_CTX ctx;
-static ARCH_WORD_32 crypt_key[BINARY_SIZE / 4];
+static uint32_t crypt_key[BINARY_SIZE / 4];
 
 #endif
 
@@ -142,6 +150,7 @@ static void init(struct fmt_main *self)
 
 	saved_key = mem_calloc_align(SHA_BUF_SIZ * 4, NBKEYS, MEM_ALIGN_SIMD);
 	crypt_key = mem_calloc_align(BINARY_SIZE, NBKEYS, MEM_ALIGN_SIMD);
+	saved_len = mem_calloc(sizeof(int), NBKEYS);
 	/* Set lengths to SALT_LEN to avoid strange things in crypt_all()
 	   if called without setting all keys (in benchmarking). Unset
 	   keys would otherwise get a length of -10 and a salt appended
@@ -156,6 +165,7 @@ static void done(void)
 {
 	MEM_FREE(saved_salt);
 #ifdef SIMD_COEF_32
+	MEM_FREE(saved_len);
 	MEM_FREE(crypt_key);
 	MEM_FREE(saved_key);
 #endif
@@ -163,20 +173,49 @@ static void done(void)
 
 static int valid(char *ciphertext, struct fmt_main *self)
 {
-	int extra;
-	return hexlenu(ciphertext, &extra)==CIPHERTEXT_LENGTH && !extra;
+	char *p = ciphertext;
+
+	if (!strncmp(ciphertext, FORMAT_TAG, FORMAT_TAG_LENGTH))
+		p += FORMAT_TAG_LENGTH;
+
+	if (strlen(p) != CIPHERTEXT_LENGTH)
+		return 0;
+
+	if (!ishex(p))
+		return 0;
+
+	return 1;
+}
+
+static char *split(char *ciphertext, int index, struct fmt_main *self)
+{
+	static char out[FORMAT_TAG_LENGTH + CIPHERTEXT_LENGTH + 1];
+
+	if (!strncmp(ciphertext, FORMAT_TAG, FORMAT_TAG_LENGTH))
+		snprintf(out, sizeof(out), "%s", ciphertext);
+	else
+		snprintf(out, sizeof(out), "%s%s", FORMAT_TAG, ciphertext);
+
+	strupr(out + FORMAT_TAG_LENGTH);
+
+	return out;
 }
 
 static void *get_salt(char *ciphertext)
 {
 	static unsigned char *salt;
+	char *p = ciphertext;
 	int i;
 
 	if (!salt) salt = mem_alloc_tiny(SALT_SIZE, MEM_ALIGN_WORD);
 
+	if (!memcmp(ciphertext, FORMAT_TAG, FORMAT_TAG_LENGTH))
+		p += FORMAT_TAG_LENGTH;
+
+	p += 2 * BINARY_SIZE;
 	for (i = 0; i < SALT_SIZE; i++) {
-		salt[i] = atoi16[ARCH_INDEX(ciphertext[BINARY_SIZE*2+i*2+0])]*16 +
-			atoi16[ARCH_INDEX(ciphertext[BINARY_SIZE*2+i*2+1])];
+		salt[i] = atoi16[ARCH_INDEX(p[i*2+0])]*16 +
+			atoi16[ARCH_INDEX(p[i*2+1])];
 	}
 
 	return (void *)salt;
@@ -201,79 +240,21 @@ static void clear_keys(void)
 #endif
 }
 
-static void set_key(char *key, int index)
-{
-#ifdef SIMD_COEF_32
-#if ARCH_ALLOWS_UNALIGNED
-	const ARCH_WORD_32 *wkey = (ARCH_WORD_32*)key;
-#else
-	char buf_aligned[PLAINTEXT_LENGTH + 1] JTR_ALIGN(sizeof(uint32_t));
-	const ARCH_WORD_32 *wkey = (uint32_t*)(is_aligned(key, sizeof(uint32_t)) ?
-	                                       key : strcpy(buf_aligned, key));
-#endif
-	ARCH_WORD_32 *keybuf_word = (unsigned int*)&saved_key[GETPOS_WORD(0, index)];
-	unsigned int len;
-
-	len = SALT_SIZE;
-	while((*keybuf_word = JOHNSWAP(*wkey++)) & 0xff000000) {
-		if (!(*keybuf_word & 0xff0000))
-		{
-			len++;
-			break;
-		}
-		if (!(*keybuf_word & 0xff00))
-		{
-			len+=2;
-			break;
-		}
-		if (!(*keybuf_word & 0xff))
-		{
-			len+=3;
-			break;
-		}
-		len += 4;
-		keybuf_word += SIMD_COEF_32;
-	}
-	saved_key[GETPOS(len, index)] = 0x80;
-	((unsigned int *)saved_key)[15*SIMD_COEF_32 + (index&(SIMD_COEF_32-1)) + (unsigned int)index/SIMD_COEF_32*SHA_BUF_SIZ*SIMD_COEF_32] = len << 3;
-#else
-	saved_len = strlen(key);
-	if (saved_len > PLAINTEXT_LENGTH)
-		saved_len = PLAINTEXT_LENGTH;
-	memcpy(saved_key, key, saved_len);
-	saved_key[saved_len] = 0;
-#endif
-}
-
-static char *get_key(int index)
-{
-#ifdef SIMD_COEF_32
-	unsigned int i,s;
-	static char out[PLAINTEXT_LENGTH + 1];
-
-	s = (((unsigned int *)saved_key)[15*SIMD_COEF_32 + (index&(SIMD_COEF_32-1)) + (unsigned int)index/SIMD_COEF_32*SHA_BUF_SIZ*SIMD_COEF_32] >> 3) - SALT_SIZE;
-
-	for(i = 0; i < s; i++)
-		out[i] = ((char*)saved_key)[ GETPOS(i, index) ];
-	out[i] = 0;
-
-	return (char *) out;
-#else
-	saved_key[saved_len] = 0;
-	return saved_key;
-#endif
-}
+#define SALT_APPENDED SALT_SIZE
+#define NON_SIMD_SINGLE_SAVED_KEY
+#define NON_SIMD_SET_SAVED_LEN
+#include "common-simd-setkey32.h"
 
 static int cmp_all(void *binary, int count)
 {
 #ifdef SIMD_COEF_32
-	unsigned int x,y=0;
+	unsigned int x, y;
 
-	for(;y<SIMD_PARA_SHA1;y++)
-	for(x=0;x<SIMD_COEF_32;x++)
-	{
-		if( ((unsigned int *)binary)[0] == ((unsigned int *)crypt_key)[x+y*SIMD_COEF_32*5] )
-			return 1;
+	for (y = 0; y < SIMD_PARA_SHA1; y++) {
+		for (x = 0; x < SIMD_COEF_32; x++) {
+			if ( ((unsigned int *)binary)[0] == ((unsigned int *)crypt_key)[x+y*SIMD_COEF_32*5] )
+				return 1;
+		}
 	}
 	return 0;
 #else
@@ -288,7 +269,7 @@ static int cmp_one(void * binary, int index)
 	x = index&(SIMD_COEF_32-1);
 	y = (unsigned int)index/SIMD_COEF_32;
 
-	if( (((unsigned int *)binary)[0] != ((unsigned int *)crypt_key)[x+y*SIMD_COEF_32*5])   |
+	if ( (((unsigned int *)binary)[0] != ((unsigned int *)crypt_key)[x+y*SIMD_COEF_32*5])   |
 	    (((unsigned int *)binary)[1] != ((unsigned int *)crypt_key)[x+y*SIMD_COEF_32*5+SIMD_COEF_32]) |
 	    (((unsigned int *)binary)[2] != ((unsigned int *)crypt_key)[x+y*SIMD_COEF_32*5+2*SIMD_COEF_32]) |
 	    (((unsigned int *)binary)[3] != ((unsigned int *)crypt_key)[x+y*SIMD_COEF_32*5+3*SIMD_COEF_32])|
@@ -319,14 +300,18 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 		// 1. Copy a byte at a time until we're aligned in buffer
 		// 2. Copy a whole word, or two!
 		// 3. Copy the stray bytes
+#if !ARCH_ALLOWS_UNALIGNED || !ARCH_LITTLE_ENDIAN
+		for ( ; i < SALT_SIZE; ++i)
+			saved_key[GETPOS(i+len, index)] = saved_salt[i];
+#else
 		switch (len & 3)
 		{
 		case 0:
-			*(ARCH_WORD_32*)&saved_key[GETPOS_WORD((len+i),index)] =
-				JOHNSWAP(*(ARCH_WORD_32*)&saved_salt[i]);
+			*(uint32_t*)&saved_key[GETPOS_WORD((len+i),index)] =
+				JOHNSWAP(*(uint32_t*)&saved_salt[i]);
 			i += 4;
-			*(ARCH_WORD_32*)&saved_key[GETPOS_WORD((len+i),index)] =
-				JOHNSWAP(*(ARCH_WORD_32*)&saved_salt[i]);
+			*(uint32_t*)&saved_key[GETPOS_WORD((len+i),index)] =
+				JOHNSWAP(*(uint32_t*)&saved_salt[i]);
 			i += 4;
 			saved_key[GETPOS((len+i), index)] = saved_salt[i];
 			i++;
@@ -339,8 +324,8 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 			i++;
 			saved_key[GETPOS((len+i), index)] = saved_salt[i];
 			i++;
-			*(ARCH_WORD_32*)&saved_key[GETPOS_WORD((len+i),index)] =
-				JOHNSWAP(*(ARCH_WORD_32*)&saved_salt[i]);
+			*(uint32_t*)&saved_key[GETPOS_WORD((len+i),index)] =
+				JOHNSWAP(*(uint32_t*)&saved_salt[i]);
 			i += 4;
 			saved_key[GETPOS((len+i), index)] = saved_salt[i];
 			i++;
@@ -353,24 +338,25 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 			i++;
 			saved_key[GETPOS((len+i), index)] = saved_salt[i];
 			i++;
-			*(ARCH_WORD_32*)&saved_key[GETPOS_WORD((len+i),index)] =
-				JOHNSWAP(*(ARCH_WORD_32*)&saved_salt[i]);
+			*(uint32_t*)&saved_key[GETPOS_WORD((len+i),index)] =
+				JOHNSWAP(*(uint32_t*)&saved_salt[i]);
 			i += 4;
-			*(ARCH_WORD_32*)&saved_key[GETPOS_WORD((len+i),index)] =
-				JOHNSWAP(*(ARCH_WORD_32*)&saved_salt[i]);
+			*(uint32_t*)&saved_key[GETPOS_WORD((len+i),index)] =
+				JOHNSWAP(*(uint32_t*)&saved_salt[i]);
 			break;
 		case 3:
 			saved_key[GETPOS((len+i), index)] = saved_salt[i];
 			i++;
-			*(ARCH_WORD_32*)&saved_key[GETPOS_WORD((len+i),index)] =
-				JOHNSWAP(*(ARCH_WORD_32*)&saved_salt[i]);
+			*(uint32_t*)&saved_key[GETPOS_WORD((len+i),index)] =
+				JOHNSWAP(*(uint32_t*)&saved_salt[i]);
 			i += 4;
-			*(ARCH_WORD_32*)&saved_key[GETPOS_WORD((len+i),index)] =
-				JOHNSWAP(*(ARCH_WORD_32*)&saved_salt[i]);
+			*(uint32_t*)&saved_key[GETPOS_WORD((len+i),index)] =
+				JOHNSWAP(*(uint32_t*)&saved_salt[i]);
 			i += 4;
 			saved_key[GETPOS((len+i), index)] = saved_salt[i];
 			break;
 		}
+#endif
 	}
 	SIMDSHA1body(saved_key, (unsigned int *)crypt_key, NULL, SSEi_MIXED_IN);
 #else
@@ -390,39 +376,29 @@ static void * get_binary(char *ciphertext)
 		long dummy;
 	} realcipher;
 
+	char *p = ciphertext;
 	int i;
-	for(i=0;i<BINARY_SIZE;i++)
-		realcipher.c[i] = atoi16[ARCH_INDEX(ciphertext[i*2])]*16 +
-						atoi16[ARCH_INDEX(ciphertext[i*2+1])];
 
-#ifdef SIMD_COEF_32
+	if (!memcmp(ciphertext, FORMAT_TAG, FORMAT_TAG_LENGTH))
+		p += FORMAT_TAG_LENGTH;
+
+	for (i=0;i<BINARY_SIZE;i++)
+		realcipher.c[i] = atoi16[ARCH_INDEX(p[i*2])]*16 +
+						atoi16[ARCH_INDEX(p[i*2+1])];
+
+#if defined(SIMD_COEF_32) && ARCH_LITTLE_ENDIAN==1
 	alter_endianity((unsigned char *)realcipher.c, BINARY_SIZE);
 #endif
 	return (void *)realcipher.c;
 }
 
-#ifdef SIMD_COEF_32
-#define KEY_OFF (((unsigned int)index/SIMD_COEF_32)*SIMD_COEF_32*5+(index&(SIMD_COEF_32-1)))
-static int get_hash_0(int index) { return ((ARCH_WORD_32 *)crypt_key)[KEY_OFF] & PH_MASK_0; }
-static int get_hash_1(int index) { return ((ARCH_WORD_32 *)crypt_key)[KEY_OFF] & PH_MASK_1; }
-static int get_hash_2(int index) { return ((ARCH_WORD_32 *)crypt_key)[KEY_OFF] & PH_MASK_2; }
-static int get_hash_3(int index) { return ((ARCH_WORD_32 *)crypt_key)[KEY_OFF] & PH_MASK_3; }
-static int get_hash_4(int index) { return ((ARCH_WORD_32 *)crypt_key)[KEY_OFF] & PH_MASK_4; }
-static int get_hash_5(int index) { return ((ARCH_WORD_32 *)crypt_key)[KEY_OFF] & PH_MASK_5; }
-static int get_hash_6(int index) { return ((ARCH_WORD_32 *)crypt_key)[KEY_OFF] & PH_MASK_6; }
-#else
-static int get_hash_0(int index) { return ((ARCH_WORD_32 *)crypt_key)[index] & PH_MASK_0; }
-static int get_hash_1(int index) { return ((ARCH_WORD_32 *)crypt_key)[index] & PH_MASK_1; }
-static int get_hash_2(int index) { return ((ARCH_WORD_32 *)crypt_key)[index] & PH_MASK_2; }
-static int get_hash_3(int index) { return ((ARCH_WORD_32 *)crypt_key)[index] & PH_MASK_3; }
-static int get_hash_4(int index) { return ((ARCH_WORD_32 *)crypt_key)[index] & PH_MASK_4; }
-static int get_hash_5(int index) { return ((ARCH_WORD_32 *)crypt_key)[index] & PH_MASK_5; }
-static int get_hash_6(int index) { return ((ARCH_WORD_32 *)crypt_key)[index] & PH_MASK_6; }
-#endif
+#define COMMON_GET_HASH_SIMD32 5
+#define COMMON_GET_HASH_VAR crypt_key
+#include "common-get-hash.h"
 
 static int salt_hash(void *salt)
 {
-	return *(ARCH_WORD_32*)salt & (SALT_HASH_SIZE - 1);
+	return *(uint32_t*)salt & (SALT_HASH_SIZE - 1);
 }
 
 struct fmt_main fmt_oracle11 = {
@@ -440,9 +416,9 @@ struct fmt_main fmt_oracle11 = {
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_CASE | FMT_8_BIT,
+		FMT_CASE | FMT_8_BIT | FMT_SPLIT_UNIFIES_CASE,
 		{ NULL },
-		{ NULL },
+		{ FORMAT_TAG },
 		tests
 	}, {
 		init,
@@ -450,7 +426,7 @@ struct fmt_main fmt_oracle11 = {
 		fmt_default_reset,
 		fmt_default_prepare,
 		valid,
-		fmt_default_split,
+		split,
 		get_binary,
 		get_salt,
 		{ NULL },
@@ -472,13 +448,8 @@ struct fmt_main fmt_oracle11 = {
 		clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,

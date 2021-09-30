@@ -21,13 +21,12 @@ john_register_one(&fmt_asaMD5);
 #include "common.h"
 #include "formats.h"
 #include "dynamic.h"
-#include "memdbg.h"
 
 #define FORMAT_LABEL            "asa-md5"
 #define FORMAT_NAME             "Cisco ASA"
 #define ALGORITHM_NAME          "?" /* filled in by md5-gen */
 #define BENCHMARK_COMMENT       ""
-#define BENCHMARK_LENGTH        0
+#define BENCHMARK_LENGTH        7
 
 // set PLAINTEXT_LENGTH to 0, so dyna will set this
 #define PLAINTEXT_LENGTH        0
@@ -85,7 +84,7 @@ static int valid(char *ciphertext, struct fmt_main *self) {
 	if (!ciphertext)
 		return 0;
 	get_ptr();
-	i = strlen(ciphertext);
+	i = strnlen(ciphertext, CIPHERTEXT_LENGTH + 1);
 	if (i > CIPHERTEXT_LENGTH)
 		return pDynamic_20->methods.valid(ciphertext, pDynamic_20);
 	if (i == CIPHERTEXT_LENGTH)
@@ -98,6 +97,10 @@ static int valid(char *ciphertext, struct fmt_main *self) {
 static char *prepare(char *split_fields[10], struct fmt_main *self)
 {
 	static char out[11+1+16+1+4+1];
+
+	/* Quick cancel of huge lines (eg. zip archives) */
+	if (strnlen(split_fields[1], CIPHERTEXT_LENGTH + 1) > CIPHERTEXT_LENGTH)
+		return split_fields[1];
 
 	if (!valid(split_fields[1], self)) {
 		if (split_fields[1] && strlen(split_fields[1]) == 16) {

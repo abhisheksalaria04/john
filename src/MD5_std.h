@@ -17,10 +17,11 @@
 #ifndef _JOHN_MD5_STD_H
 #define _JOHN_MD5_STD_H
 
-#include "arch.h"
-#include "common.h"
+#include <stdint.h>
 
-typedef ARCH_WORD_32 MD5_word;
+#include "arch.h"
+
+typedef uint32_t MD5_word;
 
 /*
  * Binary ciphertext type.
@@ -64,19 +65,19 @@ typedef struct {
 #endif
 
 #ifdef SIMD_PARA_MD5
-# ifndef SIMD_COEF_32
-#  define SIMD_COEF_32			4
-# endif
-# define MD5_N				(SIMD_PARA_MD5*SIMD_COEF_32)
+ #ifndef SIMD_COEF_32
+  #define SIMD_COEF_32			4
+ #endif
+ #define MD5_N				(SIMD_PARA_MD5*SIMD_COEF_32)
 #else
-# undef MD5_ALGORITHM_NAME
-# if MD5_X2
-#  define MD5_N				2
-#  define MD5_ALGORITHM_NAME		"32/" ARCH_BITS_STR " X2"
-# else
-#  define MD5_N				1
-#  define MD5_ALGORITHM_NAME		"32/" ARCH_BITS_STR
-# endif
+ #undef MD5_ALGORITHM_NAME
+ #if MD5_X2
+  #define MD5_N				2
+  #define MD5_ALGORITHM_NAME		"32/" ARCH_BITS_STR " X2"
+ #else
+  #define MD5_N				1
+  #define MD5_ALGORITHM_NAME		"32/" ARCH_BITS_STR
+ #endif
 #endif
 
 typedef struct {
@@ -96,7 +97,7 @@ typedef struct {
 #if defined(_OPENMP) && !MD5_ASM
 #define MD5_std_mt			1
 #define MD5_std_cpt			128
-#define MD5_std_mt_max			(MD5_std_cpt * 576)
+#define MD5_std_mt_max			(MD5_std_cpt * 1024)
 extern MD5_std_combined *MD5_std_all_p;
 extern int MD5_std_min_kpc, MD5_std_max_kpc;
 extern int MD5_std_nt;

@@ -3,6 +3,9 @@
  * and it is hereby released to the general public under the following terms:
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted.
+ *
+ * salt length increase. HAS to match pbkdf2_hmac_sha256_kernel.cl code
+ *  Now uses a common header file.  Dec 2017, JimF.
  */
 #ifdef HAVE_OPENCL
 
@@ -12,56 +15,31 @@ extern struct fmt_main fmt_opencl_pbkdf2_hmac_sha256;
 john_register_one(&fmt_opencl_pbkdf2_hmac_sha256);
 #else
 
+#include <stdint.h>
 #include <ctype.h>
 #include <string.h>
 #include <assert.h>
+
 #include "misc.h"
 #include "arch.h"
 #include "base64_convert.h"
 #include "common.h"
-#include "stdint.h"
 #include "formats.h"
 #include "options.h"
-#include "common-opencl.h"
+#include "opencl_common.h"
 #include "pbkdf2_hmac_common.h"
 
 #define FORMAT_LABEL		"PBKDF2-HMAC-SHA256-opencl"
 #define FORMAT_NAME		""
 #define ALGORITHM_NAME		"PBKDF2-SHA256 OpenCL"
 
-#define SALT_ALIGN		1
-
-#define PLAINTEXT_LENGTH	55
 #define SALT_SIZE		sizeof(salt_t)
-
-#define KERNEL_NAME		"pbkdf2_sha256_kernel"
-#define SPLIT_KERNEL_NAME	"pbkdf2_sha256_loop"
+#define SALT_ALIGN		1
 
 #define HASH_LOOPS		(13*71) // factors 13, 13, 71
 #define ITERATIONS		12000
 
-typedef struct {
-	uint8_t length;
-	uint8_t v[PLAINTEXT_LENGTH];
-} pass_t;
-
-typedef struct {
-	uint32_t hash[8];
-} crack_t;
-
-typedef struct {
-	uint8_t length;
-	uint8_t salt[PBKDF2_32_MAX_SALT_SIZE];
-	uint32_t rounds;
-} salt_t;
-
-typedef struct {
-	uint32_t ipad[8];
-	uint32_t opad[8];
-	uint32_t hash[8];
-	uint32_t W[8];
-	uint32_t rounds;
-} state_t;
+#include "../run/opencl/opencl_pbkdf2_hmac_sha256.h"
 
 //#define DEBUG
 static pass_t *host_pass;			      /** plain ciphertexts **/
@@ -69,24 +47,27 @@ static salt_t *host_salt;			      /** salt **/
 static crack_t *host_crack;			      /** hash**/
 static cl_int cl_error;
 static cl_mem mem_in, mem_out, mem_salt, mem_state;
-static cl_kernel split_kernel;
+static cl_kernel split_kernel, final_kernel;
 static struct fmt_main *self;
 
 #define STEP			0
 #define SEED			1024
 
 static const char * warn[] = {
-        "xfer: ",  ", init: " , ", crypt: ", ", res xfer: "
+        "xfer: ",  ", init: ", ", crypt: ", ", final: ", ", res xfer: "
 };
 
 static int split_events[] = { 2, -1, -1 };
 
 // This file contains auto-tuning routine(s). Has to be included after formats definitions.
-#include "opencl-autotune.h"
-#include "memdbg.h"
+#include "opencl_autotune.h"
+
+static void release_clobj(void);
 
 static void create_clobj(size_t kpc, struct fmt_main *self)
 {
+	release_clobj();
+
 #define CL_RO CL_MEM_READ_ONLY
 #define CL_WO CL_MEM_WRITE_ONLY
 #define CL_RW CL_MEM_READ_WRITE
@@ -116,7 +97,10 @@ static void create_clobj(size_t kpc, struct fmt_main *self)
 	CLKERNELARG(crypt_kernel, 2, mem_state, "Error while setting mem_state");
 
 	CLKERNELARG(split_kernel, 0, mem_state, "Error while setting mem_state");
-	CLKERNELARG(split_kernel, 1 ,mem_out, "Error while setting mem_out");
+
+	CLKERNELARG(final_kernel, 0, mem_out, "Error while setting mem_out");
+	CLKERNELARG(final_kernel, 1, mem_salt, "Error while setting mem_salt");
+	CLKERNELARG(final_kernel, 2, mem_state, "Error while setting mem_state");
 }
 
 /* ------- Helper functions ------- */
@@ -126,6 +110,7 @@ static size_t get_task_max_work_group_size()
 
 	s = autotune_get_task_max_work_group_size(FALSE, 0, crypt_kernel);
 	s = MIN(s, autotune_get_task_max_work_group_size(FALSE, 0, split_kernel));
+	s = MIN(s, autotune_get_task_max_work_group_size(FALSE, 0, final_kernel));
 	return s;
 }
 
@@ -151,45 +136,48 @@ static void init(struct fmt_main *_self)
 
 static void reset(struct db_main *db)
 {
-	if (!autotuned) {
+	if (!program[gpu_id]) {
 		char build_opts[64];
 
 		snprintf(build_opts, sizeof(build_opts),
 		         "-DHASH_LOOPS=%u -DPLAINTEXT_LENGTH=%u",
 		         HASH_LOOPS, PLAINTEXT_LENGTH);
-		opencl_init("$JOHN/kernels/pbkdf2_hmac_sha256_kernel.cl",
+		opencl_init("$JOHN/opencl/pbkdf2_hmac_sha256_kernel.cl",
 		            gpu_id, build_opts);
 
 		crypt_kernel =
-			clCreateKernel(program[gpu_id], KERNEL_NAME, &cl_error);
+			clCreateKernel(program[gpu_id], "pbkdf2_sha256_init", &cl_error);
 		HANDLE_CLERROR(cl_error, "Error creating crypt kernel");
 
 		split_kernel =
-			clCreateKernel(program[gpu_id], SPLIT_KERNEL_NAME, &cl_error);
+			clCreateKernel(program[gpu_id], "pbkdf2_sha256_loop", &cl_error);
 		HANDLE_CLERROR(cl_error, "Error creating split kernel");
 
-		// Initialize openCL tuning (library) for this format.
-		opencl_init_auto_setup(SEED, HASH_LOOPS, split_events, warn,
-		                       2, self, create_clobj, release_clobj,
-		                       sizeof(state_t), 0, db);
-
-		// Auto tune execution from shared/included code.
-		autotune_run(self, ITERATIONS, 0,
-		             (cpu(device_info[gpu_id]) ?
-		              1000000000 : 10000000000ULL));
+		final_kernel =
+			clCreateKernel(program[gpu_id], "pbkdf2_sha256_final", &cl_error);
+		HANDLE_CLERROR(cl_error, "Error creating final kernel");
 	}
+
+	// Initialize openCL tuning (library) for this format.
+	opencl_init_auto_setup(SEED, HASH_LOOPS, split_events, warn,
+	                       2, self, create_clobj, release_clobj,
+	                       sizeof(state_t), 0, db);
+
+	// Auto tune execution from shared/included code.
+	autotune_run(self, ITERATIONS, 0, 200);
 }
 
 static void done(void)
 {
-	if (autotuned) {
+	if (program[gpu_id]) {
 		release_clobj();
 		HANDLE_CLERROR(clReleaseKernel(crypt_kernel), "Release kernel 1");
 		HANDLE_CLERROR(clReleaseKernel(split_kernel), "Release kernel 2");
+		HANDLE_CLERROR(clReleaseKernel(final_kernel), "Release kernel 3");
 		HANDLE_CLERROR(clReleaseProgram(program[gpu_id]),
 		               "Release Program");
 
-		autotuned--;
+		program[gpu_id] = NULL;
 	}
 }
 
@@ -221,7 +209,8 @@ static void set_salt(void *salt)
 	memcpy(host_salt, salt, SALT_SIZE);
 	HANDLE_CLERROR(clEnqueueWriteBuffer(queue[gpu_id], mem_salt,
 		CL_FALSE, 0, sizeof(salt_t), host_salt, 0, NULL, NULL),
-	    "Copy salt to gpu");
+	    "Salt transfer");
+	HANDLE_CLERROR(clFlush(queue[gpu_id]), "clFlush failed in set_salt()");
 }
 
 static int crypt_all(int *pcount, struct db_salt *salt)
@@ -231,7 +220,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 	int loops = (host_salt->rounds + HASH_LOOPS - 1) / HASH_LOOPS;
 	size_t *lws = local_work_size ? &local_work_size : NULL;
 
-	global_work_size = GET_MULTIPLE_OR_BIGGER(count, local_work_size);
+	global_work_size = GET_NEXT_MULTIPLE(count, local_work_size);
 
 #if 0
 	printf("crypt_all(%d)\n", count);
@@ -247,17 +236,20 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 	BENCH_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], crypt_kernel,
 		1, NULL, &global_work_size, lws, 0, NULL, multi_profilingEvent[1]), "Run kernel");
 
-	for(i = 0; i < (ocl_autotune_running ? 1 : loops); i++) {
+	for (i = 0; i < (ocl_autotune_running ? 1 : loops); i++) {
 		BENCH_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], split_kernel,
 			1, NULL, &global_work_size, lws, 0, NULL, multi_profilingEvent[2]), "Run split kernel");
 		BENCH_CLERROR(clFinish(queue[gpu_id]), "clFinish");
 		opencl_process_event();
 	}
+	BENCH_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], final_kernel,
+		1, NULL, &global_work_size, lws, 0, NULL,
+		multi_profilingEvent[3]), "Run final kernel");
 
 	// Read the result back
 	BENCH_CLERROR(clEnqueueReadBuffer(queue[gpu_id], mem_out,
 		CL_TRUE, 0, global_work_size * sizeof(crack_t), host_crack, 0,
-		NULL, multi_profilingEvent[3]), "Copy result back");
+		NULL, multi_profilingEvent[4]), "Copy result back");
 
 	return count;
 }

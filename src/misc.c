@@ -16,7 +16,9 @@
 #if (!AC_BUILT || HAVE_UNISTD_H) && !_MSC_VER
 #include <unistd.h>
 #endif
-#ifdef _MSC_VER
+#ifdef __APPLE__
+#include <mach/mach.h>
+#elif _MSC_VER
 #include <io.h>
 #pragma warning ( disable : 4996 )
 #endif
@@ -24,6 +26,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <errno.h>
+#include <assert.h>
 
 #include "memory.h"
 #include "logger.h"
@@ -31,22 +34,21 @@
 #include "misc.h"
 #include "options.h"
 
-#ifdef HAVE_MPI
-#include "john-mpi.h"
-#endif
-#include "memdbg.h"
+#include "john_mpi.h"
 
-void real_error(char *file, int line)
+void real_error(const char *file, int line)
 {
 #ifndef _JOHN_MISC_NO_LOG
 	log_event("Terminating on error, %s:%d", file, line);
 	log_done();
+#else
+	fprintf(stderr, "Terminating on error, %s:%d\n", file, line);
 #endif
 
 	exit(1);
 }
 
-void real_error_msg(char *file, int line,  char *format, ...)
+void real_error_msg(const char *file, int line,  const char *format, ...)
 {
 	va_list args;
 
@@ -65,7 +67,7 @@ void real_error_msg(char *file, int line,  char *format, ...)
 	real_error(file, line);
 }
 
-void real_pexit(char *file, int line, char *format, ...)
+void real_pexit(const char *file, int line, const char *format, ...)
 {
 	va_list args;
 
@@ -128,22 +130,34 @@ char *fgetl(char *s, int size, FILE *stream)
 			*pos = 0;
 			if (pos > res)
 			if (*--pos == '\r') *pos = 0;
-		} else
+			return res;
+		}
+		if ((pos-res) + 1 < size) {
+			/* There was a NULL byte in this line.
+			   Look for \n past the 'read' null byte */
+			while ((++pos - res) + 1 < size)
+				if (*pos == '\n')
+					return res; /* found it read no more */
+		}
 		if ((c = getc(stream)) == '\n') {
 			if (*pos == '\r') *pos = 0;
 		} else
 		while (c != EOF && c != '\n')
+			/* Line was longer than our buffer. discard extra */
 			c = getc(stream);
 	}
 
 	return res;
 }
 
-#ifndef _JOHN_MISC_NO_LOG
 char *fgetll(char *s, size_t size, FILE *stream)
 {
 	size_t len;
+	int c;
 	char *cp;
+
+	/* fgets' size arg is a signed int! */
+	assert(size <= INT32_MAX);
 
 	if (!fgets(s, size, stream))
 		return NULL;
@@ -159,8 +173,7 @@ char *fgetll(char *s, size_t size, FILE *stream)
 			s[--len] = 0;
 		return s;
 	}
-	if (s[len-1] == '\r') {
-		int c;
+	else if (s[len-1] == '\r') {
 		s[--len] = 0;
 		while (len && (s[len-1] == '\n' || s[len-1] == '\r'))
 			s[--len] = 0;
@@ -172,10 +185,23 @@ char *fgetll(char *s, size_t size, FILE *stream)
 			ungetc(c, stream);
 		return s;
 	}
+	else if ((len + 1) < size) { /* We read a null byte */
+		/* first check past the null byte, looking for the \n */
+		while (++len < size)
+			if (s[len] == '\n')
+				return s; /* found it. Read no more. */
+		/* did not find the \n, so read and discard rest of line */
+		do {
+			c = getc(stream);
+		} while (c != EOF && c != '\n');
+		return s;
+	}
+
 	cp = strdup(s);
 
 	while (1) {
-		size_t increase = MAX(len, 0x8000000);
+		int increase = MIN((((len >> 12) + 1) << 12), 0x40000000);
+		size_t chunk_len;
 		void *new_cp;
 
 		new_cp = realloc(cp, len + increase);
@@ -193,7 +219,8 @@ char *fgetll(char *s, size_t size, FILE *stream)
 		if (!fgets(&cp[len], increase, stream))
 			return cp;
 
-		len += strlen(&cp[len]);
+		chunk_len = strlen(&cp[len]);
+		len += chunk_len;
 
 		if (cp[len-1] == '\n') {
 			cp[--len] = 0;
@@ -201,8 +228,7 @@ char *fgetll(char *s, size_t size, FILE *stream)
 				cp[--len] = 0;
 			return cp;
 		}
-		if (cp[len-1] == '\r') {
-			int c;
+		else if (cp[len-1] == '\r') {
 			cp[--len] = 0;
 			while (len && (cp[len-1] == '\n' || cp[len-1] == '\r'))
 				cp[--len] = 0;
@@ -214,27 +240,89 @@ char *fgetll(char *s, size_t size, FILE *stream)
 				ungetc(c, stream);
 			return cp;
 		}
+		else if ((chunk_len + 1) < increase) { /* We read a null byte */
+			/* first check past the null byte, looking for the \n */
+			while (++chunk_len < increase)
+				if (cp[++len] == '\n')
+					return cp; /* found it. read no more*/
+			/* did not find the \n, so read and discard rest of line */
+			do {
+				c = getc(stream);
+			} while (c != EOF && c != '\n');
+			return cp;
+		}
 	}
 }
-#endif
+
+void *strncpy_pad(void *dst, const void *src, size_t size, uint8_t pad)
+{
+	uint8_t *d = dst;
+	const uint8_t *s = src;
+
+	// logically the same as:  if (size < 1) IF size were signed.
+	if (!size || size > (((size_t)-1) >> 1))
+		return dst;
+
+	while (*s && size) {
+		*d++ = *s++;
+		--size;
+	}
+	while (size--)
+		*d++ = pad;
+
+	return dst;
+}
 
 char *strnfcpy(char *dst, const char *src, int size)
 {
-	char *dptr = dst;
+	char *dptr;
+
+	if (size < 1)
+		return dst;
+	dptr = dst;
 
 	while (size--)
-		if (!(*dptr++ = *src++)) break;
+		if (!(*dptr++ = *src++))
+			break;
 
 	return dst;
 }
 
 char *strnzcpy(char *dst, const char *src, int size)
 {
-	char *dptr = dst;
+	char *dptr;
 
-	if (size)
-		while (--size)
-			if (!(*dptr++ = *src++)) return dst;
+	if (size < 1)
+		return dst;
+	dptr = dst;
+
+	while (--size)
+		if (!(*dptr++ = *src++))
+			return dst;
+	*dptr = 0;
+
+	return dst;
+}
+
+char *strnzcpylwr(char *dst, const char *src, int size)
+{
+	char *dptr;
+
+	if (size < 1)
+		return dst;
+	dptr = dst;
+
+	while (--size) {
+		if (*src >= 'A' && *src <= 'Z') {
+			*dptr = *src | 0x20;
+		} else {
+			*dptr = *src;
+			if (!*src)
+				return dst;
+		}
+		dptr++;
+		src++;
+	}
 	*dptr = 0;
 
 	return dst;
@@ -243,33 +331,86 @@ char *strnzcpy(char *dst, const char *src, int size)
 int strnzcpyn(char *dst, const char *src, int size)
 {
 	char *dptr;
-	if (!size) return 0;
 
+	if (size < 1)
+		return 0;
 	dptr = dst;
 
 	while (--size)
-		if (!(*dptr++ = *src++)) return (dptr-dst)-1;
+		if (!(*dptr++ = *src++))
+			return (dptr-dst)-1;
 	*dptr = 0;
 
 	return (dptr-dst);
 }
 
+int strnzcpylwrn(char *dst, const char *src, int size)
+{
+	char *dptr;
+
+	if (size < 1)
+		return 0;
+	dptr = dst;
+
+	while (--size) {
+		if (*src >= 'A' && *src <= 'Z') {
+			*dptr = *src | 0x20;
+		} else {
+			*dptr = *src;
+			if (!*src)
+				return (dptr-dst);
+		}
+		dptr++;
+		src++;
+	}
+	*dptr = 0;
+
+	return (dptr-dst);
+
+}
+
 char *strnzcat(char *dst, const char *src, int size)
 {
-	char *dptr = dst;
+	char *dptr;
 
-	if (size) {
-		while (size && *dptr) {
-			size--; dptr++;
-		}
-		if (size)
-			while (--size)
-				if (!(*dptr++ = *src++)) break;
+	if (size < 1)
+		return dst;
+	dptr = dst;
+
+	while (size && *dptr) {
+		size--; dptr++;
 	}
+	if (size)
+	while (--size)
+		if (!(*dptr++ = *src++))
+			break;
 	*dptr = 0;
 
 	return dst;
 }
+
+/*
+ * similar to strncat, but this one protects the dst buffer, AND it
+ * assures that dst is properly NULL terminated upon completion.
+ */
+char *strnzcatn(char *dst, int size, const char *src, int src_max)
+{
+	char *dptr;
+
+	if (size < 1)
+		return dst;
+	dptr = dst;
+
+	while (size && *dptr)
+		size--, dptr++;
+	if (size)
+	while (--size && src_max--)
+		if (!(*dptr++ = *src++))
+			break;
+	*dptr = 0;
+	return dst;
+}
+
 
 /*
  * strtok code, BUT returns empty token "" for adjacent delimiters. It also
@@ -306,20 +447,34 @@ char *strtokm(char *s1, const char *delims)
 	return s1;
 }
 
-unsigned atou(const char *src) {
+unsigned int atou(const char *src)
+{
 	unsigned val;
+
 	sscanf(src, "%u", &val);
 	return val;
 }
 
 /*
- * atoi replacement(s) but smarter/safer/better. atoi is super useful, BUT
- * not a standard C function.  I have added atoi
+ * _itoa replacement(s) but smarter/safer/better. _itoa is super useful, BUT
+ * not a standard C function, and it does not protect buffer, and also has
+ * what I deem strange behavior for negative numbers in non-base10 radix,
+ * however, that output does 'mimic' what is often seen in some programming
+ * type calculators.
+ *
+ * NOTE, differences between this function, and the _itoa found in visual C:
+ *       1. we pass in buffer size, and protect the buffer (not in the VC interface of itoa)
+ *       2. we handle all integers up to 63 bits
+ *       3. vc only - signs return on base 10.  So _ltoa -666 base 16 return -29a, while
+ *          vc's _itoa -666 base 16 returns fffffd66 (only 32 bit number for vc). I find
+ *          our return much more in line, since the VC return is really forcing _itoa to
+ *          return unsigned extension of the signed value, and not overly helpful. Both
+ *          versions would return -666 for num of -666 if base was 10.
  */
-MAYBE_INLINE const char *_lltoa(long long num, char *ret, int ret_sz, int base)
+MAYBE_INLINE const char *_lltoa(int64_t num, char *ret, int ret_sz, int base)
 {
 	char *p = ret, *p1 = ret;
-	long long t;
+	int64_t t;
 	// first 35 bytes handle neg digits. byte 36 handles 0, and last 35 handle positive digits.
 	const char bc[] = "zyxwvutsrqponmlkjihgfedcba987654321"
 	                  "0"
@@ -338,32 +493,28 @@ MAYBE_INLINE const char *_lltoa(long long num, char *ret, int ret_sz, int base)
 		t = num;
 		num /= base;
 		*p++ = bc[35 + (t - num * base)];
-		if (num && p-ret == ret_sz) {
-			// truncated but 'safe' of buffer overflow.
-			if (t < 0) *p++ = '-'; // Apply negative sign
-			*p-- = 0;
-			for (; p > p1; ++p1, --p) { // strrev
-				*p1 ^= *p; *p ^= *p1; *p1 ^= *p;
-			}
-			return ret;
-		}
+		if (num && p - ret == ret_sz)
+			break; // truncated MSB's but safe of buffer overflow.
 	} while (num);
 
 	if (t < 0) *p++ = '-'; // Apply negative sign
 	*p-- = 0;
-	for (; p > p1; ++p1, --p) { // strrev
+	// fast string-rev
+	for (; p > p1; ++p1, --p) {
 		*p1 ^= *p; *p ^= *p1; *p1 ^= *p;
 	}
 	return ret;
 }
 
-// almost same, but for unsigned types. there were enough changes that I did not
-// want to make a single 'common' function.  Would have added many more if's to
-// and already semi-complex function.
-MAYBE_INLINE const char *_ulltoa(unsigned long long num, char *ret, int ret_sz, int base)
+/*
+ * similar to _lltoa, but for unsigned types. there were enough changes that I did not
+ * want to make a single 'common' function.  Would have added many more if's to
+ * and already semi-complex function.
+ */
+MAYBE_INLINE const char *_ulltoa(uint64_t num, char *ret, int ret_sz, int base)
 {
 	char *p = ret, *p1 = ret;
-	unsigned long long t;
+	uint64_t t;
 	const char bc[] = "0123456789abcdefghijklmnopqrstuvwxyz";
 
 	if (--ret_sz < 1)
@@ -373,35 +524,263 @@ MAYBE_INLINE const char *_ulltoa(unsigned long long num, char *ret, int ret_sz, 
 	do {
 		t = num;
 		num /= base;
-		*p++ = bc[35 + (t - num * base)];
-		if (num && p-ret == ret_sz) {
-			*p-- = 0;
-			for (; p > p1; ++p1, --p) {
-				*p1 ^= *p; *p ^= *p1; *p1 ^= *p;
-			}
-			return ret;
-		}
+		*p++ = bc[t - num * base];
+		if (num && p - ret == ret_sz)
+			break; // truncated MSB's but safe of buffer overflow.
 	} while (num);
 
 	*p-- = 0;
+	// fast string-rev
 	for (; p > p1; ++p1, --p) {
 		*p1 ^= *p; *p ^= *p1; *p1 ^= *p;
 	}
 	return ret;
 }
+
 /*
  * these are the functions 'external' that other code in JtR can use. These
  * just call the 'common' code in the 2 inline functions.
  */
-const char *jtr_itoa(int val, char *result, int rlen, int base) {
-	return _lltoa((long long)val, result, rlen, base);
+const char *jtr_itoa(int val, char *result, int rlen, int base)
+{
+	return _lltoa(val, result, rlen, base);
 }
-const char *jtr_utoa(unsigned int val, char *result, int rlen, int base) {
-	return _ulltoa((long long)val, result, rlen, base);
+
+const char *jtr_utoa(unsigned int val, char *result, int rlen, int base)
+{
+	return _ulltoa((uint64_t)val, result, rlen, base);
 }
-const char *jtr_lltoa(long long val, char *result, int rlen, int base) {
-	return _lltoa((long long)val, result, rlen, base);
+
+const char *jtr_lltoa(int64_t val, char *result, int rlen, int base)
+{
+	return _lltoa(val, result, rlen, base);
 }
-const char *jtr_ulltoa(unsigned long long val, char *result, int rlen, int base) {
-	return _ulltoa((long long)val, result, rlen, base);
+
+const char *jtr_ulltoa(uint64_t val, char *result, int rlen, int base)
+{
+	return _ulltoa(val, result, rlen, base);
 }
+
+char *human_prefix(uint64_t num)
+{
+	char *out = mem_alloc_tiny(16, MEM_ALIGN_NONE);
+	char prefixes[] = "\0KMGTPEZY";
+	char *p = prefixes;
+
+	while (p[1] && (num >= (100 << 10) || (!(num & 1023) && num >= (1 << 10)))) {
+		num >>= 10;
+		p++;
+	}
+
+	if (*p)
+		snprintf(out, 16, "%u %ci", (uint32_t)num, *p);
+	else
+		snprintf(out, 16, "%u ", (uint32_t)num);
+
+	return out;
+}
+
+char *human_speed(uint64_t speed)
+{
+	char *out = mem_alloc_tiny(16, MEM_ALIGN_NONE);
+	char prefixes[] = "\0KMGTPEZY";
+	char *p = prefixes;
+
+	while (p[1] && speed >= 1000000) {
+		speed /= 1000;
+		p++;
+	}
+
+	if (*p)
+		snprintf(out, 16, "%u%c c/s", (uint32_t)speed, *p);
+	else
+		snprintf(out, 16, "%u c/s", (uint32_t)speed);
+
+	return out;
+}
+
+char *human_prefix_small(double num)
+{
+	char *out = mem_alloc_tiny(16, MEM_ALIGN_NONE);
+	uint64_t number = num * 1E9;
+	int whole, milli, micro, nano;
+
+	nano = number % 1000;
+	number /= 1000;
+	micro = number % 1000;
+	number /= 1000;
+	milli = number % 1000;
+	whole = number / 1000;
+
+	if (whole) {
+		if (milli)
+			snprintf(out, 16, "%d.%03d ", whole, milli);
+		else
+			snprintf(out, 16, "%d ", whole);
+	} else if (milli) {
+		if (micro)
+			snprintf(out, 16, "%d.%03d m", milli, micro);
+		else
+			snprintf(out, 16, "%d m", milli);
+	} else if (micro) {
+		if (nano)
+			snprintf(out, 16, "%d.%03d u", micro, nano);
+		else
+			snprintf(out, 16, "%d u", micro);
+	} else
+		snprintf(out, 16, "%d n", nano);
+
+	return out;
+}
+
+unsigned int lcm(unsigned int x, unsigned int y)
+{
+	unsigned int tmp, a, b;
+
+	a = MAX(x, y);
+	b = MIN(x, y);
+
+	while (b) {
+		tmp = b;
+		b = a % b;
+		a = tmp;
+	}
+	return x / a * y;
+}
+
+char *ltrim(char *str)
+{
+	char *out = str;
+
+	while (*out == ' ' || *out == '\t')
+		out++;
+
+	return out;
+}
+
+char *rtrim(char *str)
+{
+	char *out = str + strlen(str) - 1;
+
+	while (out >= str && (*out == ' ' || *out == '\t'))
+		out--;
+
+	*(out+1) = '\0';
+	return str;
+}
+
+#ifndef _JOHN_MISC_NO_LOG
+int64_t host_total_mem(void)
+{
+	int64_t tot_mem = -1;
+
+#if (!AC_BUILT || HAVE_UNISTD_H) && !_MSC_VER && defined _SC_PAGESIZE && defined _SC_PHYS_PAGES
+
+	long pagesize = sysconf(_SC_PAGESIZE);
+	if (pagesize < 0)
+		return -1;
+
+	long totmem = sysconf(_SC_PHYS_PAGES);
+	if (totmem < 0)
+		return -1;
+
+	tot_mem = (int64_t)totmem * pagesize;
+
+#endif
+
+	return tot_mem;
+}
+
+int64_t host_avail_mem(void)
+{
+	int64_t avail_mem = -1;
+
+#if __linux__
+
+	FILE *fp;
+	char buf[LINE_BUFFER_SIZE];
+
+	if ((fp = fopen("/proc/meminfo", "r"))) {
+		while (fgets(buf, LINE_BUFFER_SIZE, fp)) {
+			if (strstr(buf, "MemAvailable")) {
+				char *p = strchr(buf, ':');
+				if (p++)
+					avail_mem = strtoull(p, NULL, 10) << 10;
+				break;
+			}
+		}
+		if (avail_mem < 0) {
+			fseek(fp, 0, SEEK_SET);
+			while (fgets(buf, LINE_BUFFER_SIZE, fp)) {
+				if (strstr(buf, "MemFree")) {
+					char *p = strchr(buf, ':');
+					if (p++)
+						avail_mem = strtoull(p, NULL, 10) << 10;
+					continue;
+				}
+				if (strstr(buf, "Buffers")) {
+					char *p = strchr(buf, ':');
+					if (p++)
+						avail_mem += strtoull(p, NULL, 10) << 10;
+					continue;
+				}
+				if (strstr(buf, "Cached")) {
+					char *p = strchr(buf, ':');
+					if (p++)
+						avail_mem += strtoull(p, NULL, 10) << 10;
+					break;
+				}
+			}
+		}
+		fclose(fp);
+	}
+
+#elif __APPLE__
+
+	vm_statistics64_data_t vm_stat;
+	unsigned int count = HOST_VM_INFO64_COUNT;
+	kern_return_t ret;
+	mach_port_t myHost = mach_host_self();
+	vm_size_t pageSize;
+
+	if (host_page_size(mach_host_self(), &pageSize) != KERN_SUCCESS)
+		return -1;
+
+	if ((ret = host_statistics64(myHost, HOST_VM_INFO64, (host_info64_t)&vm_stat, &count) != KERN_SUCCESS))
+		return -1;
+
+	avail_mem = (vm_stat.free_count + vm_stat.inactive_count + vm_stat.purgeable_count) * pageSize;
+
+#elif (!AC_BUILT || HAVE_UNISTD_H) && !_MSC_VER && defined _SC_PAGESIZE && defined _SC_AVPHYS_PAGES
+
+	long pagesize = sysconf(_SC_PAGESIZE);
+	if (pagesize < 0)
+		return -1;
+
+	long availmem = sysconf(_SC_AVPHYS_PAGES);
+	if (availmem < 0)
+		return -1;
+
+	avail_mem = (int64_t)availmem * pagesize;
+
+#endif
+
+	return avail_mem;
+}
+
+int parse_bool(char *string)
+{
+	if (string) {
+		if (string == OPT_TRISTATE_NO_PARAM || !strcasecmp(string, "y") ||
+		    !strcasecmp(string, "yes") || !strcasecmp(string, "t") ||
+		    !strcasecmp(string, "true") || !strcasecmp(string, "1"))
+			return 1;
+		if (string == OPT_TRISTATE_NEGATED || !strcasecmp(string, "n") ||
+		    !strcasecmp(string, "no") || !strcasecmp(string, "f") ||
+		    !strcasecmp(string, "false") || !strcasecmp(string, "0"))
+			return 0;
+	}
+	return -1;
+}
+
+#endif

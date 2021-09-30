@@ -22,7 +22,7 @@ SQL> @dump-apex-hashes.sql
 
 $ python apex2john.py apex-hashes.txt > apex-hashes-JtR
 
-$ john pex-hashes-JtR # use JtR-jumbo from https://github.com/magnumripper/JohnTheRipper/
+$ john pex-hashes-JtR # use JtR-jumbo from https://github.com/openwall/john/
 Loaded 1 password hash (dynamic_1: md5($p.$s) (joomla) [128/128 SSE2 intrinsics 10x4x3])
 password         (?)
 guesses: 1  time: 0:00:00:00 DONE (Thu Feb 21 17:33:43 2013)  c/s: 375  trying: 123456 - boomer
@@ -45,7 +45,22 @@ ADMIN
 F96D32CBB2FBE17732C3BBAB91C14F3A
 10
 
-NOTE: dump-apex-hashes.sql script is in src/unused directory
+...
+
+$ cat dump-apex-hashes.sql
+set colsep ','
+set echo off
+set feedback off
+set linesize 1000
+set pagesize 0
+set sqlprompt ''
+set trimspool on
+set headsep off
+set termout off
+alter session set current_schema = APEX_040200;
+spool "apex-hashes.txt"
+select user_name,web_password2,security_group_id from wwv_flow_fnd_user;
+spool off
 
 """
 

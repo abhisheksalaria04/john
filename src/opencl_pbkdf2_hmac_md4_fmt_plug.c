@@ -13,26 +13,26 @@ extern struct fmt_main fmt_ocl_pbkdf2_md4;
 john_register_one(&fmt_ocl_pbkdf2_md4);
 #else
 
+#include <stdint.h>
 #include <ctype.h>
 #include <string.h>
 
-#include "common-opencl.h"
+#include "opencl_common.h"
 #include "arch.h"
 #include "misc.h"
 #include "common.h"
-#include "stdint.h"
 #include "formats.h"
 #include "base64_convert.h"
-#include "stdint.h"
 #include "options.h"
 #define OUTLEN 16
-#include "opencl_pbkdf2_hmac_md4.h"
+#include "../run/opencl/opencl_pbkdf2_hmac_md4.h"
 #include "pbkdf2_hmac_common.h"
 
 //#define DEBUG
 #define dump_stuff_msg(a, b, c)	dump_stuff_msg((void*)a, b, c)
 
 #define FORMAT_LABEL		"PBKDF2-HMAC-MD4-opencl"
+#define FORMAT_NAME			""
 #define ALGORITHM_NAME		"PBKDF2-MD4 OpenCL"
 #define MIN_KEYS_PER_CRYPT	1
 #define MAX_KEYS_PER_CRYPT	1
@@ -63,8 +63,7 @@ static int split_events[] = { 2, -1, -1 };
 static cl_kernel pbkdf2_init, pbkdf2_loop, pbkdf2_final;
 
 //This file contains auto-tuning routine(s). Has to be included after formats definitions.
-#include "opencl-autotune.h"
-#include "memdbg.h"
+#include "opencl_autotune.h"
 
 /* ------- Helper functions ------- */
 static size_t get_task_max_work_group_size()
@@ -85,8 +84,12 @@ static cl_mem mem_in, mem_out, mem_salt, mem_state;
 static int new_keys;
 static struct fmt_main *self;
 
+static void release_clobj(void);
+
 static void create_clobj(size_t gws, struct fmt_main *self)
 {
+	release_clobj();
+
 	gws *= ocl_v_width;
 	key_buf_size = PLAINTEXT_LENGTH * gws;
 
@@ -129,7 +132,7 @@ static void release_clobj(void)
 
 static void done(void)
 {
-	if (autotuned) {
+	if (program[gpu_id]) {
 		release_clobj();
 
 		HANDLE_CLERROR(clReleaseKernel(pbkdf2_init), "Release kernel");
@@ -137,13 +140,13 @@ static void done(void)
 		HANDLE_CLERROR(clReleaseKernel(pbkdf2_final), "Release kernel");
 		HANDLE_CLERROR(clReleaseProgram(program[gpu_id]), "Release Program");
 
-		autotuned--;
+		program[gpu_id] = NULL;
 	}
 }
 
 static void init(struct fmt_main *_self)
 {
-	static char valgo[sizeof(ALGORITHM_NAME) + 8] = "";
+	static char valgo[sizeof(ALGORITHM_NAME) + 12] = "";
 
 	self = _self;
 
@@ -164,14 +167,14 @@ static void init(struct fmt_main *_self)
 
 static void reset(struct db_main *db)
 {
-	if (!autotuned) {
+	if (!program[gpu_id]) {
 		char build_opts[64];
 
 		snprintf(build_opts, sizeof(build_opts),
 		         "-DHASH_LOOPS=%u -DOUTLEN=%u "
 		         "-DPLAINTEXT_LENGTH=%u -DV_WIDTH=%u",
 		         HASH_LOOPS, OUTLEN, PLAINTEXT_LENGTH, ocl_v_width);
-		opencl_init("$JOHN/kernels/pbkdf2_hmac_md4_kernel.cl", gpu_id, build_opts);
+		opencl_init("$JOHN/opencl/pbkdf2_hmac_md4_kernel.cl", gpu_id, build_opts);
 
 		pbkdf2_init = clCreateKernel(program[gpu_id], "pbkdf2_init", &ret_code);
 		HANDLE_CLERROR(ret_code, "Error creating kernel");
@@ -179,17 +182,15 @@ static void reset(struct db_main *db)
 		HANDLE_CLERROR(ret_code, "Error creating kernel");
 		pbkdf2_final = clCreateKernel(program[gpu_id], "pbkdf2_final", &ret_code);
 		HANDLE_CLERROR(ret_code, "Error creating kernel");
-
-		//Initialize openCL tuning (library) for this format.
-		opencl_init_auto_setup(SEED, 2*HASH_LOOPS, split_events, warn,
-		                       2, self, create_clobj, release_clobj,
-		                       ocl_v_width * sizeof(pbkdf2_state), 0, db);
-
-		//Auto tune execution from shared/included code.
-		autotune_run(self, 2*999+4, 0,
-		             (cpu(device_info[gpu_id]) ?
-		              1000000000 : 5000000000ULL));
 	}
+
+	//Initialize openCL tuning (library) for this format.
+	opencl_init_auto_setup(SEED, 2*HASH_LOOPS, split_events, warn,
+	                       2, self, create_clobj, release_clobj,
+	                       ocl_v_width * sizeof(pbkdf2_state), 0, db);
+
+	//Auto tune execution from shared/included code.
+	autotune_run(self, 2*999+4, 0, 200);
 }
 
 static void *get_salt(char *ciphertext)
@@ -223,11 +224,8 @@ static void *get_salt(char *ciphertext)
 static void set_salt(void *salt)
 {
 	cur_salt = (pbkdf2_salt*)salt;
-	HANDLE_CLERROR(clEnqueueWriteBuffer(queue[gpu_id], mem_salt, CL_FALSE, 0, sizeof(pbkdf2_salt), cur_salt, 0, NULL, NULL), "Copy salt to gpu");
-#if 0
-	fprintf(stderr, "\n%s(%.*s) len %u iter %u\n", __FUNCTION__, cur_salt->length, cur_salt->salt, cur_salt->length, cur_salt->iterations);
-	dump_stuff_msg("salt", cur_salt->salt, cur_salt->length);
-#endif
+	HANDLE_CLERROR(clEnqueueWriteBuffer(queue[gpu_id], mem_salt, CL_FALSE, 0, sizeof(pbkdf2_salt), cur_salt, 0, NULL, NULL), "Salt transfer");
+	HANDLE_CLERROR(clFlush(queue[gpu_id]), "clFlush failed in set_salt()");
 }
 
 static void clear_keys(void)
@@ -268,7 +266,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 	size_t scalar_gws;
 	size_t *lws = local_work_size ? &local_work_size : NULL;
 
-	global_work_size = GET_MULTIPLE_OR_BIGGER_VW(count, local_work_size);
+	global_work_size = GET_KPC_MULTIPLE(count, local_work_size);
 	scalar_gws = global_work_size * ocl_v_width;
 
 	/// Copy data to gpu

@@ -11,44 +11,42 @@ extern struct fmt_main fmt_pbkdf2_hmac_md4;
 john_register_one(&fmt_pbkdf2_hmac_md4);
 #else
 
-#include <ctype.h>
 #include <string.h>
-#include <assert.h>
+#include <stdint.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "arch.h"
-
-//#undef SIMD_COEF_32
-
 #include "misc.h"
 #include "common.h"
 #include "formats.h"
-#include "stdint.h"
 #include "pbkdf2_hmac_md4.h"
 #include "pbkdf2_hmac_common.h"
-#ifdef _OPENMP
-#include <omp.h>
-#ifndef OMP_SCALE
-#define OMP_SCALE               256
-#endif
-#endif
-#include "memdbg.h"
 
 #define FORMAT_LABEL            "PBKDF2-HMAC-MD4"
+#define FORMAT_NAME             ""
 #ifdef SIMD_COEF_32
 #define ALGORITHM_NAME          "PBKDF2-MD4 " MD4_ALGORITHM_NAME
 #else
 #define ALGORITHM_NAME          "PBKDF2-MD4 32/" ARCH_BITS_STR
 #endif
 #define SALT_SIZE               sizeof(struct custom_salt)
-#define SALT_ALIGN              sizeof(ARCH_WORD_32)
+#define SALT_ALIGN              sizeof(uint32_t)
+#define PLAINTEXT_LENGTH        125
+
 #if SIMD_COEF_32
 #define MIN_KEYS_PER_CRYPT      (SIMD_COEF_32 * SIMD_PARA_MD4)
-#define MAX_KEYS_PER_CRYPT      (SIMD_COEF_32 * SIMD_PARA_MD4)
+#define MAX_KEYS_PER_CRYPT      (64 * SIMD_COEF_32 * SIMD_PARA_MD4)
 #else
 #define MIN_KEYS_PER_CRYPT      1
-#define MAX_KEYS_PER_CRYPT      1
+#define MAX_KEYS_PER_CRYPT      64
 #endif
-#define PLAINTEXT_LENGTH        125
+
+#ifndef OMP_SCALE
+#define OMP_SCALE               1 // MKPC and scale tuned for i7
+#endif
 
 static struct custom_salt {
 	unsigned int length;
@@ -57,16 +55,12 @@ static struct custom_salt {
 } *cur_salt;
 
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
-static ARCH_WORD_32 (*crypt_out)[PBKDF2_MDx_BINARY_SIZE / sizeof(ARCH_WORD_32)];
+static uint32_t (*crypt_out)[PBKDF2_MDx_BINARY_SIZE / sizeof(uint32_t)];
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	int omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
+	omp_autotune(self, OMP_SCALE);
+
 	saved_key = mem_calloc(self->params.max_keys_per_crypt, sizeof(*saved_key));
 	crypt_out = mem_calloc(self->params.max_keys_per_crypt, sizeof(*crypt_out));
 }
@@ -109,29 +103,23 @@ static void set_salt(void *salt)
 	cur_salt = (struct custom_salt *)salt;
 }
 
-static int get_hash_0(int index) { return crypt_out[index][0] & PH_MASK_0; }
-static int get_hash_1(int index) { return crypt_out[index][0] & PH_MASK_1; }
-static int get_hash_2(int index) { return crypt_out[index][0] & PH_MASK_2; }
-static int get_hash_3(int index) { return crypt_out[index][0] & PH_MASK_3; }
-static int get_hash_4(int index) { return crypt_out[index][0] & PH_MASK_4; }
-static int get_hash_5(int index) { return crypt_out[index][0] & PH_MASK_5; }
-static int get_hash_6(int index) { return crypt_out[index][0] & PH_MASK_6; }
+#define COMMON_GET_HASH_VAR crypt_out
+#include "common-get-hash.h"
 
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
 	const int count = *pcount;
-	int index = 0;
+	int index;
 
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-	for (index = 0; index < count; index += MAX_KEYS_PER_CRYPT)
-	{
+	for (index = 0; index < count; index += MIN_KEYS_PER_CRYPT) {
 #if SIMD_COEF_32
 		int lens[SSE_GROUP_SZ_MD4], i;
 		unsigned char *pin[SSE_GROUP_SZ_MD4];
 		union {
-			ARCH_WORD_32 *pout[SSE_GROUP_SZ_MD4];
+			uint32_t *pout[SSE_GROUP_SZ_MD4];
 			unsigned char *poutc;
 		} x;
 		for (i = 0; i < SSE_GROUP_SZ_MD4; ++i) {
@@ -151,18 +139,18 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 		           PBKDF2_MDx_BINARY_SIZE, 0);
 #endif
 	}
+
 	return count;
 }
 
 static int cmp_all(void *binary, int count)
 {
-	int index = 0;
-#if defined(_OPENMP) || MAX_KEYS_PER_CRYPT > 1
-	for (; index < count; index++)
-#endif
+	int index;
+
+	for (index = 0; index < count; index++)
 		if (!memcmp(binary, crypt_out[index], ARCH_SIZE))
 			return 1;
-	//dump_stuff_msg("\nbinary", crypt_out[count - 1], 16);
+
 	return 0;
 }
 
@@ -173,11 +161,7 @@ static int cmp_one(void *binary, int index)
 
 static void set_key(char *key, int index)
 {
-	int saved_len = strlen(key);
-	if (saved_len > PLAINTEXT_LENGTH)
-		saved_len = PLAINTEXT_LENGTH;
-	memcpy(saved_key[index], key, saved_len);
-	saved_key[index][saved_len] = 0;
+	strnzcpy(saved_key[index], key, sizeof(*saved_key));
 }
 
 static char *get_key(int index)
@@ -250,13 +234,8 @@ struct fmt_main fmt_pbkdf2_hmac_md4 = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,

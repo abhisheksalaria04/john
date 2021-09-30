@@ -68,6 +68,12 @@
  *
  */
 
+#if AC_BUILT
+#include "autoconfig.h"
+#endif
+
+#if HAVE_LIBCRYPTO
+
 #if FMT_EXTERNS_H
 extern struct fmt_main fmt_MSCHAPv2_new;
 extern struct fmt_main fmt_NETNTLM_new;
@@ -97,14 +103,12 @@ john_register_one(&fmt_NETNTLM_new);
 #include "formats.h"
 #include "options.h"
 #include "memory.h"
+#include "johnswap.h"
 #include "sha.h"
 #include "md4.h"
 #include "md5.h"
 #include "unicode.h"
 #include "john.h"
-#include "memdbg.h"
-
-extern volatile int bench_running;
 
 #ifndef uchar
 #define uchar unsigned char
@@ -126,7 +130,7 @@ extern volatile int bench_running;
 
 #define ALGORITHM_NAME          "MD4 DES (ESS MD5) " MD4_ALGORITHM_NAME
 #define BENCHMARK_COMMENT       ""
-#define BENCHMARK_LENGTH        -1000
+#define BENCHMARK_LENGTH        7
 #define FULL_BINARY_SIZE        (2 + 8 * 3)
 #define BINARY_SIZE             (2 + 8)
 #define BINARY_ALIGN            2
@@ -144,8 +148,19 @@ extern volatile int bench_running;
 #endif
 #define MIN_KEYS_PER_CRYPT      (NBKEYS * BLOCK_LOOPS)
 #define MAX_KEYS_PER_CRYPT      (NBKEYS * BLOCK_LOOPS)
+
+// These 2 get the proper uint32_t limb from the SIMD mixed set. They both
+// work properly for both BE and LE machines :) These SHOULD be used whenever
+// the full uint32_t item is wanted, usually RHS of an assignment to uint32_t*
+// NOTE, i is number is based on uint32_t[] and not uint8_t[] offsets.
+#define GETOUTPOS_W32(i, index) ( (index&(SIMD_COEF_32-1))*4 + ((i<<2)&(0xffffffff-3))*SIMD_COEF_32 + (unsigned int)index/SIMD_COEF_32*4*SIMD_COEF_32*4 )
+#define GETPOS_W32(i, index)    ( (index&(SIMD_COEF_32-1))*4 + ((i<<2)&(0xffffffff-3))*SIMD_COEF_32 + (unsigned int)index/SIMD_COEF_32*16*SIMD_COEF_32*4 )
+// GETPOS HAS to be BE/LE specific
+#if ARCH_LITTLE_ENDIAN==1
 #define GETPOS(i, index)        ( (index&(SIMD_COEF_32-1))*4 + ((i)&(0xffffffff-3))*SIMD_COEF_32 + ((i)&3) + (unsigned int)index/SIMD_COEF_32*16*SIMD_COEF_32*4 )
-#define GETOUTPOS(i, index)     ( (index&(SIMD_COEF_32-1))*4 + ((i)&(0xffffffff-3))*SIMD_COEF_32 + ((i)&3) + (unsigned int)index/SIMD_COEF_32*4*SIMD_COEF_32*4 )
+#else
+#define GETPOS(i, index)        ( (index&(SIMD_COEF_32-1))*4 + ((i)&(0xffffffff-3))*SIMD_COEF_32 + (3-((i)&3)) + (unsigned int)index/SIMD_COEF_32*16*SIMD_COEF_32*4 )
+#endif
 #else
 #define PLAINTEXT_LENGTH        64
 #define MIN_KEYS_PER_CRYPT      1
@@ -161,7 +176,7 @@ static int (*saved_len);
 
 static unsigned short (*crypt_key);
 static unsigned char *nthash;
-static ARCH_WORD_32 *bitmap;
+static uint32_t *bitmap;
 static int cmps_per_crypt, use_bitmap;
 static int valid_i, valid_j;
 
@@ -216,7 +231,7 @@ static struct fmt_tests ntlm_tests[] = {
 	{NULL}
 };
 
-static inline void setup_des_key(uchar key_56[], DES_key_schedule *ks)
+inline static void setup_des_key(uchar key_56[], DES_key_schedule *ks)
 {
 	DES_cblock key;
 
@@ -401,7 +416,7 @@ static char *chap_long_to_short(char *ciphertext) {
 	memcpy(&pos[16], &ciphertext[42], CIPHERTEXT_LENGTH+2);
 	pos[16+CIPHERTEXT_LENGTH+2] = '$';
 	pos[16+CIPHERTEXT_LENGTH+3] = 0;
-	//printf ("short=%s  original=%s\n", Buf, ciphertext);
+	//printf("short=%s  original=%s\n", Buf, ciphertext);
 	return Buf;
 }
 
@@ -447,7 +462,7 @@ static int chap_valid(char *ciphertext, struct fmt_main *pFmt)
 			}
 		}
 #ifdef DEBUG
-		if (!bench_running)
+		if (!bench_or_test_running)
 			fprintf(stderr, "Rejected MSCHAPv2 hash with "
 			        "invalid 3rd block\n");
 #endif
@@ -512,7 +527,7 @@ static char *chap_prepare(char *split_fields[10], struct fmt_main *pFmt)
 				ret = str_alloc_copy(split_fields[1]);
 				ret[(cp3-split_fields[1]) + 1] = '$';
 				ret[(cp3-split_fields[1]) + 2] = 0;
-				//printf ("Here is the cut item: %s\n", ret);
+				//printf("Here is the cut item: %s\n", ret);
 			}
 		}
 	}
@@ -640,7 +655,7 @@ static int ntlm_valid(char *ciphertext, struct fmt_main *self)
 			}
 		}
 #ifdef DEBUG
-		if (!bench_running)
+		if (!bench_or_test_running)
 			fprintf(stderr, "Rejected NetNTLM hash with invalid "
 			        "3rd block\n");
 #endif
@@ -717,7 +732,7 @@ static void set_key_ansi(char *_key, int index)
 {
 #ifdef SIMD_COEF_32
 	const uchar *key = (uchar*)_key;
-	unsigned int *keybuf_word = (unsigned int*)&saved_key[GETPOS(0, index)];
+	unsigned int *keybuf_word = (unsigned int*)&saved_key[GETPOS_W32(0, index)];
 	unsigned int len, temp2;
 
 	len = 0;
@@ -775,7 +790,7 @@ static void set_key_CP(char *_key, int index)
 {
 #ifdef SIMD_COEF_32
 	const uchar *key = (uchar*)_key;
-	unsigned int *keybuf_word = (unsigned int*)&saved_key[GETPOS(0, index)];
+	unsigned int *keybuf_word = (unsigned int*)&saved_key[GETPOS_W32(0, index)];
 	unsigned int len, temp2;
 
 	len = 0;
@@ -822,7 +837,7 @@ static void set_key_utf8(char *_key, int index)
 {
 #ifdef SIMD_COEF_32
 	const UTF8 *source = (UTF8*)_key;
-	unsigned int *keybuf_word = (unsigned int*)&saved_key[GETPOS(0, index)];
+	unsigned int *keybuf_word = (unsigned int*)&saved_key[GETPOS_W32(0, index)];
 	UTF32 chl, chh = 0x80;
 	unsigned int len = 0;
 
@@ -957,18 +972,14 @@ bailout:
 static void init(struct fmt_main *self)
 {
 #if defined (_OPENMP) && !defined(SIMD_COEF_32)
-	int omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
+	omp_autotune(self, OMP_SCALE);
 #endif
 	my = self;
 	if (options.target_enc == UTF_8) {
 		self->methods.set_key = set_key_utf8;
 		self->params.plaintext_length = MIN(125, 3 * PLAINTEXT_LENGTH);
 	} else {
-		if (options.target_enc != ASCII &&
-		    options.target_enc != ISO_8859_1)
+		if (options.target_enc != ENC_RAW && options.target_enc != ISO_8859_1)
 			self->methods.set_key = set_key_CP;
 	}
 	if (!saved_key) {
@@ -1011,13 +1022,14 @@ static void done(void)
 static char *get_key(int index)
 {
 #ifdef SIMD_COEF_32
-	unsigned int *keybuf_word = (unsigned int*)&saved_key[GETPOS(0, index)];
+	unsigned int *keybuf_word = (unsigned int*)&saved_key[GETPOS_W32(0, index)];
 	static UTF16 key[PLAINTEXT_LENGTH + 1];
 	unsigned int md4_size=0;
 	unsigned int i=0;
 
-	for(; md4_size < PLAINTEXT_LENGTH; i += SIMD_COEF_32, md4_size++)
+	for (; md4_size < PLAINTEXT_LENGTH; i += SIMD_COEF_32, md4_size++)
 	{
+#if ARCH_LITTLE_ENDIAN==1
 		key[md4_size] = keybuf_word[i];
 		key[md4_size+1] = keybuf_word[i] >> 16;
 		if (key[md4_size] == 0x80 && key[md4_size+1] == 0) {
@@ -1032,6 +1044,22 @@ static char *get_key(int index)
 			key[md4_size] = 0;
 			break;
 		}
+#else
+		unsigned int INWORD = JOHNSWAP(keybuf_word[i]);
+		key[md4_size] = INWORD >> 16;
+		key[md4_size+1] = INWORD;
+		if (key[md4_size] == 0x8000 && key[md4_size+1] == 0) {
+			key[md4_size] = 0;
+			break;
+		}
+		++md4_size;
+		if (key[md4_size] == 0x8000 && (md4_size == PLAINTEXT_LENGTH ||
+		    (keybuf_word[i+SIMD_COEF_32]&0xFFFF0000) == 0))
+		{
+			key[md4_size] = 0;
+			break;
+		}
+#endif
 	}
 	return (char*)utf16_to_enc(key);
 #else
@@ -1049,7 +1077,7 @@ static void *get_binary(char *ciphertext)
 	if (!binary) binary = mem_alloc_tiny(FULL_BINARY_SIZE, BINARY_ALIGN);
 
 	if (john_main_process)
-	if (!warned && !ldr_in_pot && !bench_running && ++loaded > 100) {
+	if (!warned && !ldr_in_pot && !bench_or_test_running && ++loaded > 100) {
 		warned = 1;
 		fprintf(stderr, "%s: Note: slow loading. For short runs, try "
 		        "--format=%s-naive\ninstead. That version loads "
@@ -1143,24 +1171,24 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 			for (i = 0; i < NBKEYS * BLOCK_LOOPS; i++) {
 				unsigned int value;
 
-				value = *(ARCH_WORD_32*)
-					&nthash[GETOUTPOS(12, i)] >> 16;
+				value = *(uint32_t*)
+					&nthash[GETOUTPOS_W32(3, i)] >> 16;
 				crypt_key[i] = value;
+#if defined(_OPENMP) && defined(SSE_OMP)
+#pragma omp atomic
+#endif
 				bitmap[value >> 5] |= 1U << (value & 0x1f);
 			}
 		else
 			for (i = 0; i < NBKEYS * BLOCK_LOOPS; i++) {
-				crypt_key[i] = *(ARCH_WORD_32*)
-					&nthash[GETOUTPOS(12, i)] >> 16;
+				crypt_key[i] = *(uint32_t*)
+					&nthash[GETOUTPOS_W32(3, i)] >> 16;
 			}
 #else
-#if defined(_OPENMP) || (MAX_KEYS_PER_CRYPT > 1)
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-		for (i = 0; i < count; i++)
-#endif
-		{
+		for (i = 0; i < count; i++) {
 			MD4_CTX ctx;
 
 			MD4_Init( &ctx );
@@ -1170,6 +1198,9 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 			crypt_key[i] = ((unsigned short*)&nthash[i * 16])[7];
 			if (use_bitmap) {
 				unsigned int value = crypt_key[i];
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
 				bitmap[value >> 5] |= 1U << (value & 0x1f);
 			}
 		}
@@ -1181,7 +1212,12 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 static int cmp_one(void *binary, int index)
 {
-	if (crypt_key[index] == *(unsigned short*)binary) {
+#if ARCH_LITTLE_ENDIAN==1 || !defined(SIMD_COEF_32)
+	if (crypt_key[index] == *(unsigned short*)binary)
+#else
+	if ( JOHNSWAP(crypt_key[index])>>16 == *(unsigned short*)binary)
+#endif
+	{
 		DES_key_schedule ks;
 		DES_cblock computed_binary;
 		unsigned int key[2];
@@ -1189,8 +1225,12 @@ static int cmp_one(void *binary, int index)
 		int i;
 
 		for (i = 0; i < 2; i++)
-			key[i] = *(ARCH_WORD_32*)
-				&nthash[GETOUTPOS(4 * i, index)];
+			key[i] =
+#if ARCH_LITTLE_ENDIAN==1
+				*(uint32_t*) &nthash[GETOUTPOS_W32(i, index)];
+#else
+				JOHNSWAP (*(uint32_t*) &nthash[GETOUTPOS_W32(i, index)]);
+#endif
 #else
 		memcpy(key, &nthash[index * 16], 8);
 #endif
@@ -1205,7 +1245,11 @@ static int cmp_one(void *binary, int index)
 
 static int cmp_all(void *binary, int count)
 {
+#if ARCH_LITTLE_ENDIAN==1 || !defined(SIMD_COEF_32)
 	unsigned int value = *(unsigned short*)binary;
+#else
+	unsigned int value = JOHNSWAP(*(unsigned short*)binary)>>16;
+#endif
 	int index;
 
 	cmps_per_crypt++;
@@ -1223,10 +1267,6 @@ static int cmp_all(void *binary, int count)
 		unsigned int a = crypt_key[index];
 		unsigned int b = crypt_key[index + 1];
 
-#if 0
-		if (((a | b) & value) != value)
-			continue;
-#endif
 		if (a == value || b == value)
 			goto thorough;
 	}
@@ -1252,30 +1292,37 @@ static int cmp_exact(char *source, int index)
 {
 	DES_key_schedule ks;
 	uchar binary[24];
-	unsigned char key[21];
+	union {
+		unsigned char key[24];
+		unsigned int Key32[6];
+	}k;
 	char *cp;
 	int i;
 
 #ifdef SIMD_COEF_32
 	for (i = 0; i < 4; i++)
-		((ARCH_WORD_32*)key)[i] = *(ARCH_WORD_32*)
-			&nthash[GETOUTPOS(4 * i, index)];
+		k.Key32[i] =
+#if ARCH_LITTLE_ENDIAN==1
+			*(uint32_t*)&nthash[GETOUTPOS_W32(i, index)];
 #else
-	memcpy(key, &nthash[index * 16], 16);
+			JOHNSWAP(*(uint32_t*)&nthash[GETOUTPOS_W32(i, index)]);
+#endif
+#else
+	memcpy(k.key, &nthash[index * 16], 16);
 #endif
 	/* Hash is NULL padded to 21-bytes */
-	memset(&key[16], 0, 5);
+	memset(&k.key[16], 0, 5);
 
 	/* Split into three 7-byte segments for use as DES keys
 	   Use each key to DES encrypt challenge
 	   Concatenate output to for 24-byte NTLM response */
-	setup_des_key(key, &ks);
+	setup_des_key(k.key, &ks);
 	DES_ecb_encrypt((DES_cblock*)challenge, (DES_cblock*)binary,
 	                &ks, DES_ENCRYPT);
-	setup_des_key(&key[7], &ks);
+	setup_des_key(&k.key[7], &ks);
 	DES_ecb_encrypt((DES_cblock*)challenge, (DES_cblock*)&binary[8],
 	                &ks, DES_ENCRYPT);
-	setup_des_key(&key[14], &ks);
+	setup_des_key(&k.key[14], &ks);
 	DES_ecb_encrypt((DES_cblock*)challenge, (DES_cblock*)&binary[16],
 	                &ks, DES_ENCRYPT);
 
@@ -1295,12 +1342,19 @@ static int cmp_exact(char *source, int index)
 	return 1;
 }
 
-static int salt_hash(void *salt) { return *(ARCH_WORD_32*)salt & (SALT_HASH_SIZE - 1); }
+static int salt_hash(void *salt) { return *(uint32_t*)salt & (SALT_HASH_SIZE - 1); }
 
+#if ARCH_LITTLE_ENDIAN==1 || !defined(SIMD_COEF_32)
 static int binary_hash_0(void *binary) { return *(unsigned short*)binary & PH_MASK_0; }
 static int binary_hash_1(void *binary) { return *(unsigned short*)binary & PH_MASK_1; }
 static int binary_hash_2(void *binary) { return *(unsigned short*)binary & PH_MASK_2; }
 static int binary_hash_3(void *binary) { return *(unsigned short*)binary & PH_MASK_3; }
+#else
+static int binary_hash_0(void *binary) { return (JOHNSWAP(*(unsigned short*)binary)>>16) & PH_MASK_0; }
+static int binary_hash_1(void *binary) { return (JOHNSWAP(*(unsigned short*)binary)>>16) & PH_MASK_1; }
+static int binary_hash_2(void *binary) { return (JOHNSWAP(*(unsigned short*)binary)>>16) & PH_MASK_2; }
+static int binary_hash_3(void *binary) { return (JOHNSWAP(*(unsigned short*)binary)>>16) & PH_MASK_3; }
+#endif
 
 static int get_hash_0(int index) { return crypt_key[index] & PH_MASK_0; }
 static int get_hash_1(int index) { return crypt_key[index] & PH_MASK_1; }
@@ -1325,7 +1379,7 @@ struct fmt_main fmt_MSCHAPv2_new = {
 #if !defined(SIMD_COEF_32) || (defined(SIMD_COEF_32) && defined(SSE_OMP))
 		FMT_OMP |
 #endif
-		FMT_CASE | FMT_8_BIT | FMT_SPLIT_UNIFIES_CASE | FMT_UNICODE | FMT_UTF8,
+		FMT_CASE | FMT_8_BIT | FMT_SPLIT_UNIFIES_CASE | FMT_UNICODE | FMT_ENC,
 		{ NULL },
 		{ FORMAT_TAG },
 		chap_tests
@@ -1389,7 +1443,7 @@ struct fmt_main fmt_NETNTLM_new = {
 #if !defined(SIMD_COEF_32) || (defined(SIMD_PARA_MD4) && defined(SSE_OMP))
 		FMT_OMP |
 #endif
-		FMT_CASE | FMT_8_BIT | FMT_SPLIT_UNIFIES_CASE | FMT_UNICODE | FMT_UTF8,
+		FMT_CASE | FMT_8_BIT | FMT_SPLIT_UNIFIES_CASE | FMT_UNICODE | FMT_ENC,
 		{ NULL },
 		{ FORMAT_TAGN },
 		ntlm_tests
@@ -1436,3 +1490,4 @@ struct fmt_main fmt_NETNTLM_new = {
 };
 
 #endif /* plugin stanza */
+#endif /* HAVE_LIBCRYPTO */

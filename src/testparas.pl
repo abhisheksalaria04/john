@@ -1,4 +1,4 @@
-#!/usr/bin/perl -w
+#!/usr/bin/env perl
 #
 # Final output is a table in GitHub Markdown format
 #
@@ -6,7 +6,8 @@
 #
 # ../run/john will run with -test=seconds or just -test depending
 # upon whether the seconds parameter is provided or not.
-#
+
+use warnings;
 use strict;
 
 my $compiler = `gcc -v 2>&1 | tail -1` or die;
@@ -19,14 +20,14 @@ my $test="-test";
 my $john_build;
 my $default_para = "";
 my $gomp_stuff = "";
-my $num_cpus = 4;
+my $num_cpus = 8;
 
 if (defined($ARGV[0]) && $ARGV[0] > 0) { $test="-test=$ARGV[0]"; }
 if (defined($ARGV[1]) && $ARGV[1] > 0) { $num_cpus = $ARGV[1]; }
 
 print "This will take a while.\n";
 print "Initial configure...\n";
-print `./configure --disable-cuda --disable-opencl >/dev/null` or die;
+print `./configure --disable-opencl >/dev/null` or die;
 print "Initial build...\n";
 print `make -s clean && make -sj${num_cpus}` or die;
 system ("../run/john >JohnUsage.Scr 2>&1");
@@ -49,7 +50,7 @@ print "Here we go...\n";
 foreach $i (1..$MAX_PARA)
 {
 	print `rm -f simd-intrinsics.o pbkdf2*fmt*o dynamic*o ../run/john` or die;
-	my $CPPFLAGS="-DSIMD_PARA_MD4=$i -DSIMD_PARA_MD5=$i -DSIMD_PARA_SHA1=$i -DSIMD_PARA_SHA256=$i -DSIMD_PARA_SHA512=$i -DOMP_SCALE=1";
+	my $CPPFLAGS="-DSIMD_PARA_MD4=$i -DSIMD_PARA_MD5=$i -DSIMD_PARA_SHA1=$i -DSIMD_PARA_SHA256=$i -DSIMD_PARA_SHA512=$i -DOMP_SCALE";
 	print `make -sj${num_cpus} CPPFLAGS="$CPPFLAGS"` or die;
 	print "\n== Speeds for ${i}x interleaving (OMP_SCALE 1): ==\n";
 	foreach $j (qw(md4 md5 sha1 sha256 sha512))

@@ -79,17 +79,14 @@
 #include "formats.h"
 #include "loader.h"
 #include "john.h"
-#ifdef HAVE_MPI
-#include "john-mpi.h"
-#endif
-#include "memdbg.h"
+#include "john_mpi.h"
 
 #define FORMAT_LABEL			"crypt"
 #define FORMAT_NAME			"generic crypt(3)"
 #define ALGORITHM_NAME			"?/" ARCH_BITS_STR
 
-#define BENCHMARK_COMMENT		" DES"
-#define BENCHMARK_LENGTH		0
+#define BENCHMARK_COMMENT		""
+#define BENCHMARK_LENGTH		7
 
 #define PLAINTEXT_LENGTH		72
 
@@ -214,7 +211,7 @@ static void init(struct fmt_main *self)
 			salt = options.subformat;
 			/* turn off many salts test, since we are not updating the */
 			/* params.tests structure data.                            */
-			self->params.benchmark_length = -1;
+			self->params.benchmark_length |= 0x100;
 		}
 		for (i = 0; i < 5; i++)
 		{
@@ -350,7 +347,8 @@ static int valid(char *ciphertext, struct fmt_main *self)
 static void *binary(char *ciphertext)
 {
 	static char out[BINARY_SIZE];
-	strncpy(out, ciphertext, sizeof(out)); /* NUL padding is required */
+
+	strncpy_pad(out, ciphertext, sizeof(out), 0);
 	return out;
 }
 
@@ -402,9 +400,8 @@ static void *salt(char *ciphertext)
 		    !strncmp(ciphertext, "$md5,", 5))) {
 			char *p = strrchr(ciphertext + 4, '$');
 			if (p) {
-				/* NUL padding is required */
-				memset(out, 0, sizeof(out));
-				memcpy(out, ciphertext, ++p - ciphertext);
+				strncpy_pad(out, ciphertext,
+				            ++p - ciphertext, 0);
 /*
  * Workaround what looks like a bug in sunmd5.c: crypt_genhash_impl() where it
  * takes a different substring as salt depending on whether the optional
@@ -675,7 +672,7 @@ static unsigned int  c3_algorithm_specific_cost1(void *salt)
 	c3_salt = salt;
 	algorithm =  c3_subformat_algorithm(salt);
 
-	if(algorithm < 3)
+	if (algorithm < 3)
 		/* no tunable cost parameters */
 		return 1;
 

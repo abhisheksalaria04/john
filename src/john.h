@@ -10,6 +10,8 @@
 #ifndef _JOHN_JOHN_H
 #define _JOHN_JOHN_H
 
+#include "loader.h"
+
 /*
  * Are we the main process?  (The only process or the parent of a group of
  * child processes.)
@@ -37,5 +39,11 @@ extern int *john_child_pids;
 
 /* Terminal locale is read in john_init() and copied to this variable */
 extern char *john_terminal_locale;
+
+/* Current target for options.max_cands */
+extern uint64_t john_max_cands;
+
+/* Print loaded/remaining counts */
+extern char *john_loaded_counts(struct db_main *db, char *prelude);
 
 #endif

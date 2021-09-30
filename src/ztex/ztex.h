@@ -1,5 +1,5 @@
 /*
- * This software is Copyright (c) 2016 Denis Burykin
+ * This software is Copyright (c) 2016,2019 Denis Burykin
  * [denis_burykin yahoo com], [denis-burykin2014 yandex ru]
  * and it is hereby released to the general public under the following terms:
  * Redistribution and use in source and binary forms, with or without
@@ -13,16 +13,25 @@
 // Based on original Ztex SDK written in java.
 //
 //===============================================================
+#ifndef _ZTEX_H_
+#define _ZTEX_H_
+
+#include "../list.h"
+#include "ztex_sn.h"
 
 #define USB_CMD_TIMEOUT 150
 #define USB_RW_TIMEOUT 500
 
-#define ZTEX_SNSTRING_LEN 11 // includes '\0' terminator
-#define ZTEX_SNSTRING_MIN_LEN 5
-#define ZTEX_PRODUCT_STRING_LEN 32 // includes '\0' terminator
+#define ZTEX_OPEN_NUM_RETRIES 3
+#define ZTEX_OPEN_RETRY_WAIT 150
+
+// includes '\0' terminator
+#define ZTEX_PRODUCT_STRING_LEN 32
 
 #define ZTEX_IDVENDOR 0x221A
 #define ZTEX_IDPRODUCT 0x0100
+
+#define ZTEX_ENDPOINT_HS 6
 
 // Capability index for EEPROM support.
 #define CAPABILITY_EEPROM 0,0
@@ -40,6 +49,8 @@
 #define CAPABILITY_MAC_EEPROM 0,6
 // Capability index for multi FPGA support.
 #define CAPABILITY_MULTI_FPGA 0,7
+// Unsure if this works (not tested), looks like the right version
+// would be CAPABILITY_TEMP_SENSOR 1,0 (bit 0 in byte 1)
 // Capability index for Temperature sensor support
 #define CAPABILITY_TEMP_SENSOR 0,8
 // Capability index for 2nd FLASH memory support
@@ -74,9 +85,11 @@ struct ztex_device {
 	int num_of_fpgas;
 	int selected_fpga;
 	int valid;
+	int iface_claimed;
 	struct ztex_device *next;
-	// ZTEX specific stuff from device
 	char snString[ZTEX_SNSTRING_LEN];
+	// ZTEX specific stuff from device
+	char snString_orig[ZTEX_SNSTRING_LEN];
 	unsigned char productId[4];
 	unsigned char fwVersion;
 	unsigned char interfaceVersion;
@@ -108,6 +121,9 @@ int ztex_dev_list_merge(struct ztex_dev_list *dev_list, struct ztex_dev_list *ad
 // Device removed from list and deleted
 void ztex_dev_list_remove(struct ztex_dev_list *dev_list, struct ztex_device *dev_remove);
 
+// Deletes all devices and the list itself
+void ztex_dev_list_delete(struct ztex_dev_list *dev_list);
+
 int ztex_dev_list_count(struct ztex_dev_list *dev_list);
 
 void ztex_dev_list_print(struct ztex_dev_list *dev_list);
@@ -130,14 +146,16 @@ int ztex_get_descriptor(struct ztex_device *dev);
 // ZTEX Capabilities. Capabilities are pre-fetched and stored in 'struct ztex_device'
 int ztex_check_capability(struct ztex_device *dev, int i, int j);
 
-// Scans for devices that aren't already in dev_list, adds them to new_dev_list
-// Devices in question:
-// 1. Got ZTEX Vendor & Product ID, also SN
-// 2. Have ZTEX-specific descriptor
+int ztex_firmware_is_ok(struct ztex_device *dev);
+
+// Scans for devices that aren't already in dev_list, adds to new_dev_list
+// - Performs all checks & closes file descriptor ASAP
 // Returns:
 // >= 0 number of devices added
 // <0 error
-int ztex_scan_new_devices(struct ztex_dev_list *new_dev_list, struct ztex_dev_list *dev_list);
+int ztex_scan_new_devices(struct ztex_dev_list *new_dev_list,
+		struct ztex_dev_list *dev_list, int warn_open,
+		struct list_main *dev_allow);
 
 // upload bitstream on FPGA
 int ztex_configureFpgaHS(struct ztex_device *dev, FILE *fp, int interfaceHS);
@@ -149,14 +167,15 @@ int ztex_upload_bitstream(struct ztex_device *dev, FILE *fp);
 int ztex_reset_cpu(struct ztex_device *dev, int r);
 
 // firmware image loaded from an ihx (Intel Hex format) file.
-const int IHX_SIZE_MAX;
 struct ihx_data {
 	short *data;
 };
 
 // Uploads firmware from .ihx file, device resets.
 // < 0 on error.
-int ztex_firmware_upload(struct ztex_device *dev, const char *filename);
+int ztex_firmware_upload(struct ztex_device *dev, char *filename);
 
 // resets device. firmware is lost.
 void ztex_device_reset(struct ztex_device *dev);
+
+#endif

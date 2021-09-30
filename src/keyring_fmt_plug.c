@@ -1,10 +1,12 @@
-/* GNOME Keyring cracker patch for JtR. Hacked together during Monsoon of
+/*
+ * GNOME Keyring cracker patch for JtR. Hacked together during Monsoon of
  * 2012 by Dhiru Kholia <dhiru.kholia at gmail.com>.
  *
  * This software is Copyright (c) 2012, Dhiru Kholia <dhiru.kholia at gmail.com>,
  * and it is hereby released to the general public under the following terms:
  * Redistribution and use in source and binary forms, with or without modification,
- * are permitted. */
+ * are permitted.
+ */
 
 #if FMT_EXTERNS_H
 extern struct fmt_main fmt_keyring;
@@ -13,24 +15,12 @@ john_register_one(&fmt_keyring);
 #else
 
 #include <string.h>
-#include <assert.h>
-#include <errno.h>
+
 #ifdef _OPENMP
 #include <omp.h>
-#ifndef OMP_SCALE
-#ifdef __MIC__
-#define OMP_SCALE               32
-#else
-#define OMP_SCALE               64
-#endif // __MIC__
-#endif // OMP_SCALE
-#endif // _OPENMP
+#endif
 
 #include "arch.h"
-
-//#undef _OPENMP
-//#undef SIMD_COEF_32
-
 #include "misc.h"
 #include "common.h"
 #include "formats.h"
@@ -41,30 +31,38 @@ john_register_one(&fmt_keyring);
 #include "aes.h"
 #include "johnswap.h"
 #include "simd-intrinsics.h"
-#include "memdbg.h"
 
-#define FORMAT_LABEL		"keyring"
-#define FORMAT_NAME		"GNOME Keyring"
-#define FORMAT_TAG			"$keyring$"
-#define FORMAT_TAG_LEN		(sizeof(FORMAT_TAG)-1)
-#define ALGORITHM_NAME		"SHA256 AES " SHA256_ALGORITHM_NAME
-#define BENCHMARK_COMMENT	""
-#define BENCHMARK_LENGTH	-1
-#define PLAINTEXT_LENGTH	125
-#define BINARY_SIZE		0
-#define SALT_SIZE		sizeof(*cur_salt)
-#define BINARY_ALIGN		1
-#define SALT_ALIGN			sizeof(int)
+#define FORMAT_LABEL            "keyring"
+#define FORMAT_NAME             "GNOME Keyring"
+#define FORMAT_TAG              "$keyring$"
+#define FORMAT_TAG_LEN          (sizeof(FORMAT_TAG)-1)
+#define ALGORITHM_NAME          "SHA256 AES " SHA256_ALGORITHM_NAME
+#define BENCHMARK_COMMENT       ""
+#define BENCHMARK_LENGTH        0x507
+#define PLAINTEXT_LENGTH        125
+#define BINARY_SIZE             0
+#define SALT_SIZE               sizeof(*cur_salt)
+#define BINARY_ALIGN            1
+#define SALT_ALIGN              sizeof(int)
 #ifdef SIMD_COEF_32
-#define MIN_KEYS_PER_CRYPT (SIMD_COEF_32*SIMD_PARA_SHA256)
-#define MAX_KEYS_PER_CRYPT (SIMD_COEF_32*SIMD_PARA_SHA256)
+#if ARCH_LITTLE_ENDIAN==1
 #define GETPOS(i, index)        ( (index&(SIMD_COEF_32-1))*4 + ((i)&(0xffffffff-3))*SIMD_COEF_32 + (3-((i)&3)) + (unsigned int)index/SIMD_COEF_32*SHA_BUF_SIZ*SIMD_COEF_32*4 )
 #else
-#define MIN_KEYS_PER_CRYPT	1
-#define MAX_KEYS_PER_CRYPT	1
+#define GETPOS(i, index)        ( (index&(SIMD_COEF_32-1))*4 + ((i)&(0xffffffff-3))*SIMD_COEF_32 + ((i)&3) + (unsigned int)index/SIMD_COEF_32*SHA_BUF_SIZ*SIMD_COEF_32*4 )
+#endif
+#define MIN_KEYS_PER_CRYPT      (SIMD_COEF_32*SIMD_PARA_SHA256)
+#define MAX_KEYS_PER_CRYPT      (SIMD_COEF_32*SIMD_PARA_SHA256 * 4)
+#else
+#define MIN_KEYS_PER_CRYPT      1
+#define MAX_KEYS_PER_CRYPT      4
 #endif
 
-#define SALTLEN 8
+#ifndef OMP_SCALE
+#define OMP_SCALE               8 // Tuned w/ MKPC for core i7
+#endif
+
+#define SALTLEN                 8
+
 typedef unsigned char guchar;
 typedef unsigned int guint;
 typedef int gint;
@@ -90,14 +88,8 @@ static size_t cracked_size;
 
 static void init(struct fmt_main *self)
 {
+	omp_autotune(self, OMP_SCALE);
 
-#if defined (_OPENMP)
-	int omp_t;
-
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	self->params.max_keys_per_crypt *= omp_t * OMP_SCALE;
-#endif
 	saved_key = mem_calloc(self->params.max_keys_per_crypt,
 	                       sizeof(*saved_key));
 	any_cracked = 0;
@@ -206,20 +198,20 @@ static void set_salt(void *salt)
 
 #ifdef SIMD_COEF_32
 static void symkey_generate_simple(int index, unsigned char *salt, int n_salt, int iterations,
-	                               unsigned char key[MAX_KEYS_PER_CRYPT][32],
-								   unsigned char iv[MAX_KEYS_PER_CRYPT][32])
+	                               unsigned char key[MIN_KEYS_PER_CRYPT][32],
+								   unsigned char iv[MIN_KEYS_PER_CRYPT][32])
 {
 	SHA256_CTX ctx;
-	unsigned char digest[32], _IBuf[64*MAX_KEYS_PER_CRYPT+MEM_ALIGN_SIMD], *keys;
+	unsigned char digest[32], _IBuf[64*MIN_KEYS_PER_CRYPT+MEM_ALIGN_SIMD], *keys;
 	uint32_t *keys32;
 	unsigned int i, j;
 
 	keys = (unsigned char*)mem_align(_IBuf, MEM_ALIGN_SIMD);
-	memset(keys, 0, 64*MAX_KEYS_PER_CRYPT);
+	memset(keys, 0, 64*MIN_KEYS_PER_CRYPT);
 	keys32 = (uint32_t*)keys;
 
 	// use oSSL to do first crypt, and marshal into SIMD buffers.
-	for (i = 0; i < MAX_KEYS_PER_CRYPT; ++i) {
+	for (i = 0; i < MIN_KEYS_PER_CRYPT; ++i) {
 		SHA256_Init(&ctx);
 		SHA256_Update(&ctx, saved_key[index+i], strlen(saved_key[index+i]));
 		SHA256_Update(&ctx, salt, n_salt);
@@ -236,20 +228,28 @@ static void symkey_generate_simple(int index, unsigned char *salt, int n_salt, i
 		SIMDSHA256body(keys, keys32, NULL, SSEi_MIXED_IN|SSEi_OUTPUT_AS_INP_FMT);
 
 	// marshal data back into flat buffers.
-	for (i = 0; i < MAX_KEYS_PER_CRYPT; ++i) {
+	for (i = 0; i < MIN_KEYS_PER_CRYPT; ++i) {
 		uint32_t *Optr32 = (uint32_t*)(key[i]);
 		uint32_t *Iptr32 = &keys32[(i/SIMD_COEF_32)*SIMD_COEF_32*16 + (i%SIMD_COEF_32)];
 		for (j = 0; j < 4; ++j)
+#if ARCH_LITTLE_ENDIAN==1
 			Optr32[j] = JOHNSWAP(Iptr32[j*SIMD_COEF_32]);
+#else
+			Optr32[j] = Iptr32[j*SIMD_COEF_32];
+#endif
 		Optr32 = (uint32_t*)(iv[i]);
 		for (j = 0; j < 4; ++j)
+#if ARCH_LITTLE_ENDIAN==1
 			Optr32[j] = JOHNSWAP(Iptr32[(j+4)*SIMD_COEF_32]);
+#else
+			Optr32[j] = Iptr32[(j+4)*SIMD_COEF_32];
+#endif
 	}
 }
 #else
 static void symkey_generate_simple(int index, unsigned char *salt, int n_salt, int iterations,
-	                               unsigned char key[MAX_KEYS_PER_CRYPT][32],
-								   unsigned char iv[MAX_KEYS_PER_CRYPT][32])
+	                               unsigned char key[MIN_KEYS_PER_CRYPT][32],
+								   unsigned char iv[MIN_KEYS_PER_CRYPT][32])
 {
 	SHA256_CTX ctx;
 	unsigned char digest[32];
@@ -269,10 +269,10 @@ static void symkey_generate_simple(int index, unsigned char *salt, int n_salt, i
 	memcpy(iv[0], &digest[16], 16);
 }
 #endif
-static void decrypt_buffer(unsigned char buffers[MAX_KEYS_PER_CRYPT][sizeof(cur_salt->ct)], int index)
+static void decrypt_buffer(unsigned char buffers[MIN_KEYS_PER_CRYPT][sizeof(cur_salt->ct)], int index)
 {
-	unsigned char key[MAX_KEYS_PER_CRYPT][32];
-	unsigned char iv[MAX_KEYS_PER_CRYPT][32];
+	unsigned char key[MIN_KEYS_PER_CRYPT][32];
+	unsigned char iv[MIN_KEYS_PER_CRYPT][32];
 	AES_KEY akey;
 	unsigned int i, len = cur_salt->crypto_size;
 	unsigned char *salt = cur_salt->salt;
@@ -280,11 +280,8 @@ static void decrypt_buffer(unsigned char buffers[MAX_KEYS_PER_CRYPT][sizeof(cur_
 
 	symkey_generate_simple(index, salt, 8, iterations, key, iv);
 
-	for (i = 0; i < MAX_KEYS_PER_CRYPT; ++i) {
-		memset(&akey, 0, sizeof(AES_KEY));
-		if (AES_set_decrypt_key(key[i], 128, &akey) < 0) {
-			fprintf(stderr, "AES_set_decrypt_key failed!\n");
-		}
+	for (i = 0; i < MIN_KEYS_PER_CRYPT; ++i) {
+		AES_set_decrypt_key(key[i], 128, &akey);
 		AES_cbc_encrypt(cur_salt->ct, buffers[i], len, &akey, iv[i], AES_DECRYPT);
 	}
 }
@@ -312,17 +309,17 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-	for (index = 0; index < count; index+=MAX_KEYS_PER_CRYPT)
+	for (index = 0; index < count; index+=MIN_KEYS_PER_CRYPT)
 	{
 		int i;
 		unsigned char (*buffers)[sizeof(cur_salt->ct)];
 
 		// This is too big to be on stack. See #1292.
-		buffers = mem_alloc(MAX_KEYS_PER_CRYPT * sizeof(*buffers));
+		buffers = mem_alloc(MIN_KEYS_PER_CRYPT * sizeof(*buffers));
 
 		decrypt_buffer(buffers, index);
 
-		for (i = 0; i < MAX_KEYS_PER_CRYPT; ++i) {
+		for (i = 0; i < MIN_KEYS_PER_CRYPT; ++i) {
 			if (verify_decrypted_buffer(buffers[i], cur_salt->crypto_size)) {
 				cracked[index+i] = 1;
 #ifdef _OPENMP
@@ -353,11 +350,7 @@ static int cmp_exact(char *source, int index)
 
 static void keyring_set_key(char *key, int index)
 {
-	int saved_len = strlen(key);
-	if (saved_len > PLAINTEXT_LENGTH)
-		saved_len = PLAINTEXT_LENGTH;
-	memcpy(saved_key[index], key, saved_len);
-	saved_key[index][saved_len] = 0;
+	strnzcpy(saved_key[index], key, sizeof(*saved_key));
 }
 
 static char *get_key(int index)
@@ -388,7 +381,7 @@ struct fmt_main fmt_keyring = {
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_CASE | FMT_8_BIT | FMT_OMP,
+		FMT_CASE | FMT_8_BIT | FMT_OMP | FMT_HUGE_INPUT,
 		{
 			"iteration count",
 		},

@@ -19,22 +19,20 @@ extern struct fmt_main fmt_known_hosts;
 john_register_one(&fmt_known_hosts);
 #else
 
-#include "sha.h"
 #include <string.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "arch.h"
+#include "sha.h"
 #include "misc.h"
 #include "common.h"
 #include "formats.h"
-#include "base64.h"
+#include "base64_convert.h"
 #include "params.h"
 #include "options.h"
-#ifdef _OPENMP
-#include <omp.h>
-#ifndef OMP_SCALE
-#define OMP_SCALE               2048
-#endif
-#endif
-#include "memdbg.h"
 
 #define FORMAT_LABEL            "known_hosts"
 #define FORMAT_TAG              "$known_hosts$"
@@ -42,16 +40,20 @@ john_register_one(&fmt_known_hosts);
 #define FORMAT_NAME             "HashKnownHosts HMAC-SHA1"
 #define ALGORITHM_NAME          "SHA1 32/" ARCH_BITS_STR
 #define BENCHMARK_COMMENT       ""
-#define BENCHMARK_LENGTH        0
+#define BENCHMARK_LENGTH        7
 #define PLAINTEXT_LENGTH        125
 #define BINARY_SIZE             20
 #define BINARY_ENCODED_SIZE     28
 #define PAD_SIZE                64
 #define BINARY_ALIGN            4
 #define SALT_SIZE               sizeof(struct custom_salt)
-#define SALT_ALIGN              1
+#define SALT_ALIGN              sizeof(uint32_t)
 #define MIN_KEYS_PER_CRYPT      1
-#define MAX_KEYS_PER_CRYPT      1
+#define MAX_KEYS_PER_CRYPT      256
+
+#ifndef OMP_SCALE
+#define OMP_SCALE               4 // Tuned w/ MKPC for core i7
+#endif
 
 static struct fmt_tests known_hosts_tests[] = {
 	{"$known_hosts$|1|yivSFSAv9mhGu/GPc14KpaPMSjE=|I9L3FH6RGefWIFb0Po74BVN3Fto=", "213.100.98.219"},
@@ -62,8 +64,9 @@ static struct fmt_tests known_hosts_tests[] = {
 };
 
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
-static ARCH_WORD_32 (*crypt_out)[BINARY_SIZE / sizeof(ARCH_WORD_32)];
+static uint32_t (*crypt_out)[BINARY_SIZE / sizeof(uint32_t)];
 
+// SHA_CTX needs 4 byte salt alignment.
 static struct custom_salt {
 	SHA_CTX ipad_ctx;
 	SHA_CTX opad_ctx;
@@ -71,12 +74,8 @@ static struct custom_salt {
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	int omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
+	omp_autotune(self, OMP_SCALE);
+
 	saved_key = mem_calloc(self->params.max_keys_per_crypt,
 	                       sizeof(*saved_key));
 	crypt_out = mem_calloc(self->params.max_keys_per_crypt,
@@ -122,7 +121,7 @@ static void *get_salt(char *ciphertext)
 	p = ciphertext +  TAG_LENGTH + 3;
 
 	q = strchr(p, '|');
-	base64_decode(p, q - p, (char*)salt);
+	base64_convert(p, e_b64_mime, q-p, salt, e_b64_raw, sizeof(salt), flg_Base64_NO_FLAGS, 0);
 
 	for (i = 0; i < 20; ++i) {
 		ipad[i] = salt[i] ^ 0x36;
@@ -147,18 +146,13 @@ static void *get_binary(char *ciphertext)
 	unsigned char *out = buf.c;
 	char *p;
 	p = strrchr(ciphertext, '|') + 1;
-	base64_decode((char*)p, BINARY_ENCODED_SIZE, (char*)out);
+	base64_convert((char*)p, e_b64_mime, BINARY_ENCODED_SIZE, (char*)out, e_b64_raw, sizeof(buf.c), flg_Base64_NO_FLAGS, 0);
 
 	return out;
 }
 
-static int get_hash_0(int index) { return crypt_out[index][0] & PH_MASK_0; }
-static int get_hash_1(int index) { return crypt_out[index][0] & PH_MASK_1; }
-static int get_hash_2(int index) { return crypt_out[index][0] & PH_MASK_2; }
-static int get_hash_3(int index) { return crypt_out[index][0] & PH_MASK_3; }
-static int get_hash_4(int index) { return crypt_out[index][0] & PH_MASK_4; }
-static int get_hash_5(int index) { return crypt_out[index][0] & PH_MASK_5; }
-static int get_hash_6(int index) { return crypt_out[index][0] & PH_MASK_6; }
+#define COMMON_GET_HASH_VAR crypt_out
+#include "common-get-hash.h"
 
 static void set_salt(void *salt)
 {
@@ -168,12 +162,11 @@ static void set_salt(void *salt)
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
 	const int count = *pcount;
-	int index = 0;
+	int index;
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-	for (index = 0; index < count; index++)
-	{
+	for (index = 0; index < count; index++) {
 		SHA_CTX ctx;
 		memcpy(&ctx, &cur_salt->ipad_ctx, sizeof(ctx));
 		SHA1_Update(&ctx, saved_key[index], strlen(saved_key[index]));
@@ -183,15 +176,15 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 		SHA1_Update(&ctx, crypt_out[index], BINARY_SIZE);
 		SHA1_Final((unsigned char*) crypt_out[index], &ctx);
 	}
+
 	return count;
 }
 
 static int cmp_all(void *binary, int count)
 {
-	int index = 0;
-#ifdef _OPENMP
-	for (; index < count; index++)
-#endif
+	int index;
+
+	for (index = 0; index < count; index++)
 		if (!memcmp(binary, crypt_out[index], ARCH_SIZE))
 			return 1;
 	return 0;
@@ -209,10 +202,7 @@ static int cmp_exact(char *source, int index)
 
 static void known_hosts_set_key(char *key, int index)
 {
-	int len = strlen(key);
-
-	memcpy(saved_key[index], key, len);
-	saved_key[index][len] = 0;
+	strnzcpy(saved_key[index], key, sizeof(*saved_key));
 }
 
 static char *get_key(int index)
@@ -267,13 +257,8 @@ struct fmt_main fmt_known_hosts = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,

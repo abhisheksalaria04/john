@@ -1,23 +1,18 @@
-/* PKZIP patch for john to handle 'old' pkzip passwords (old 'native' format)
+/*
+ * PKZIP patch for john to handle 'old' pkzip passwords (old 'native' format)
  *
- * Written by Jim Fougeron <jfoug at cox.net> in 2011.  No copyright
- * is claimed, and the software is hereby placed in the public domain.
- * In case this attempt to disclaim copyright and place the software in the
- * public domain is deemed null and void, then the software is
- * Copyright (c) 2011 Jim Fougeron and it is hereby released to the
- * general public under the following terms:
- *
+ * This software is Copyright (c) 2011-2018 Jim Fougeron,
+ * Copyright (c) 2013-2021 magnum,
+ * and it is hereby released to the general public under the following terms:
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted.
- *
- * There's ABSOLUTELY NO WARRANTY, express or implied.
- *
  */
 
 #include "arch.h"
-#if !AC_BUILT
+#if !AC_BUILT && !__MIC__
 #define HAVE_LIBZ 1 /* legacy build has -lz in LDFLAGS */
 #endif
+
 #if HAVE_LIBZ
 
 #if FMT_EXTERNS_H
@@ -29,19 +24,17 @@ john_register_one(&fmt_pkzip);
 #include <string.h>
 #include <zlib.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "common.h"
 #include "misc.h"
 #include "formats.h"
 #define USE_PKZIP_MAGIC 1
 #include "pkzip.h"
-
 #include "pkzip_inffixed.h"  // This file is a data file, taken from zlib
 #include "loader.h"
-
-#ifdef _OPENMP
-#include <omp.h>
-#endif
-#include "memdbg.h"
 
 #define FORMAT_LABEL        "PKZIP"
 #define FORMAT_NAME         ""
@@ -52,24 +45,22 @@ john_register_one(&fmt_pkzip);
 #define FORMAT_TAG2_LEN     (sizeof(FORMAT_TAG2)-1)
 
 #define BENCHMARK_COMMENT   ""
-#define BENCHMARK_LENGTH    -1000
+#define BENCHMARK_LENGTH    7
 
-#define PLAINTEXT_LENGTH    31
+#define PLAINTEXT_LENGTH    63
 
 #define BINARY_SIZE         0
 #define BINARY_ALIGN        1
 
 #define SALT_SIZE           (sizeof(PKZ_SALT*))
-#define SALT_ALIGN          (sizeof(ARCH_WORD_32))
+#define SALT_ALIGN          (sizeof(uint64_t))
 
 #define MIN_KEYS_PER_CRYPT  1
 #define MAX_KEYS_PER_CRYPT  64
-#ifndef OMP_SCALE
-#define OMP_SCALE           64
-#endif
 
-//#define ZIP_DEBUG 1
-//#define ZIP_DEBUG 2
+#ifndef OMP_SCALE
+#define OMP_SCALE           32 // Tuned w/ MKPC for core i7
+#endif
 
 /*
  * It is likely that this should be put into the arch.h files for the different systems,
@@ -88,70 +79,26 @@ john_register_one(&fmt_pkzip);
 #endif
 
 /*
- * filename:$pkzip$C*B*[DT*MT{CL*UL*CR*OF*OX}*CT*DL*CS*DA]*$/pkzip$   (deprecated)
- * filename:$pkzip2$C*B*[DT*MT{CL*UL*CR*OF*OX}*CT*DL*CS*TC*DA]*$/pkzip2$   (new format, with 2 checksums)
- *
- * All numeric and 'binary data' fields are stored in hex.
- *
- * C   is the count of hashes present (the array of items, inside the []  C can be 1 to 3.).
- * B   is number of valid bytes in the checksum (1 or 2).  Unix zip is 2 bytes, all others are 1
- * ARRAY of data starts here (there will be C array elements)
- *   DT  is a "Data Type enum".  This will be 1 2 or 3.  1 is 'partial'. 2 and 3 are full file data (2 is inline, 3 is load from file).
- *   MT  Magic Type enum.  0 is no 'type'.  255 is 'text'. Other types (like MS Doc, GIF, etc), see source.
- *     NOTE, CL, DL, CRC, OFF are only present if DT != 1
- *     CL  Compressed length of file blob data (includes 12 byte IV).
- *     UL  Uncompressed length of the file.
- *     CR  CRC32 of the 'final' file.
- *     OF  Offset to the PK\x3\x4 record for this file data. If DT==2, then this will be a 0, as it is not needed, all of the data is already included in the line.
- *     OX  Additional offset (past OF), to get to the zip data within the file.
- *     END OF 'optional' fields.
- *   CT  Compression type  (0 or 8)  0 is stored, 8 is imploded.
- *   DL  Length of the DA data.
- *   CS  Checksum from crc32.
- *   TC  Checksum from timestamp
- *   DA  This is the 'data'.  It will be hex data if DT==1 or 2. If DT==3, then it is a filename (name of the .zip file).
- * END of array items.
- * The format string will end with $/pkzip$
- *
- * NOTE, after some code testing, it has come to show, that the 'magic' may not be needed, or very useful. The problem with it, is IF the file
- * ends up NOT starting with any of the magic values, then we will have a false negative, and NEVER be able to crack the zip's password. For now
- * we have a #define (right before the #include "pkzip.h").  If that define is uncommented, then pkzip format will be built with magic logic.
- * However, right now it is not being built that way.
- *
+ * Format spec., see zip2john.c
  */
 static struct fmt_tests tests[] = {
 	/* compression of a perl file. We have the same password, same file used twice in a row (pkzip, 1 byte checksum).  NOTE, pkzip uses random IV, so both encrypted blobs are different */
-	{"\
-$pkzip$1*1*2*0*e4*1c5*eda7a8de*0*4c*8*e4*eda7*194883130e4c7419bd735c53dec36f0c4b6de6daefea0f507d67ff7256a49b5ea93ccfd9b12f2ee99053ee0b1c9e1c2b88aeaeb6bd4e60094a1ea118785d4ded6dae94\
-cade41199330f4f11b37cba7cda5d69529bdfa43e2700ba517bd2f7ff4a0d4b3d7f2559690ec044deb818c44844d6dd50adbebf02cec663ae8ebb0dde05d2abc31eaf6de36a2fc19fda65dd6a7e449f669d1f8c75e9daa0a3f7b\
-e8feaa43bf84762d6dbcc9424285a93cedfa3a75dadc11e969065f94fe3991bc23c9b09eaa5318aa29fa02e83b6bee26cafec0a5e189242ac9e562c7a5ed673f599cefcd398617*$/pkzip$", "password" },
-	{"\
-$pkzip$1*1*2*0*e4*1c5*eda7a8de*0*4c*8*e4*eda7*581f798527109cbadfca0b3318435a000be84366caf9723f841a2b13e27c2ed8cdb5628705a98c3fbbfb34552ed498c51a172641bf231f9948bca304a6be2138ab718f\
-6a5b1c513a2fb80c49030ff1a404f7bd04dd47c684317adea4107e5d70ce13edc356c60bebd532418e0855428f9dd582265956e39a0b446a10fd8b7ffb2b4af559351bbd549407381c0d2acc270f3bcaffb275cbe2f628cb09e2\
-978e87cd023d4ccb50caaa92b6c952ba779980d65f59f664dde2451cc456d435188be59301a5df1b1b4fed6b7509196334556c44208a9d7e2d9e237f591d6c9fc467b408bf0aaa*$/pkzip$", "password" },
+	{"$pkzip$1*1*2*0*e4*1c5*eda7a8de*0*4c*8*e4*eda7*194883130e4c7419bd735c53dec36f0c4b6de6daefea0f507d67ff7256a49b5ea93ccfd9b12f2ee99053ee0b1c9e1c2b88aeaeb6bd4e60094a1ea118785d4ded6dae94cade41199330f4f11b37cba7cda5d69529bdfa43e2700ba517bd2f7ff4a0d4b3d7f2559690ec044deb818c44844d6dd50adbebf02cec663ae8ebb0dde05d2abc31eaf6de36a2fc19fda65dd6a7e449f669d1f8c75e9daa0a3f7be8feaa43bf84762d6dbcc9424285a93cedfa3a75dadc11e969065f94fe3991bc23c9b09eaa5318aa29fa02e83b6bee26cafec0a5e189242ac9e562c7a5ed673f599cefcd398617*$/pkzip$", "password" },
+	{"$pkzip$1*1*2*0*e4*1c5*eda7a8de*0*4c*8*e4*eda7*581f798527109cbadfca0b3318435a000be84366caf9723f841a2b13e27c2ed8cdb5628705a98c3fbbfb34552ed498c51a172641bf231f9948bca304a6be2138ab718f6a5b1c513a2fb80c49030ff1a404f7bd04dd47c684317adea4107e5d70ce13edc356c60bebd532418e0855428f9dd582265956e39a0b446a10fd8b7ffb2b4af559351bbd549407381c0d2acc270f3bcaffb275cbe2f628cb09e2978e87cd023d4ccb50caaa92b6c952ba779980d65f59f664dde2451cc456d435188be59301a5df1b1b4fed6b7509196334556c44208a9d7e2d9e237f591d6c9fc467b408bf0aaa*$/pkzip$", "password" },
 	/* Now the same file, compressed twice, using unix zip (info-zip), with 2 byte checksums */
-	{"\
-$pkzip$1*2*2*0*e4*1c5*eda7a8de*0*47*8*e4*4bb6*436c9ffa4328870f6272349b591095e1b1126420c3041744650282bc4f575d0d4a5fc5fb34724e6a1cde742192387b9ed749ab5c72cd6bb0206f102e9216538f095fb7\
-73661cfde82c2e2a619332998124648bf4cd0da56279f0c297567d9b5d684125ee92920dd513fd18c27afba2a9633614f75d8f8b9a14095e3fafe8165330871287222e6681dd9c0f830cf5d464457b257d0900eed29107fad8af\
-3ac4f87cf5af5183ff0516ccd9aeac1186006c8d11b18742dfb526aadbf2906772fbfe8fb18798967fd397a724d59f6fcd4c32736550986d227a6b447ef70585c049a1a4d7bf25*$/pkzip$", "password" },
-	{"\
-$pkzip$1*2*2*0*e4*1c5*eda7a8de*0*47*8*e4*4bb6*436c9ffa4328870f6272349b591095e1b1126420c3041744650282bc4f575d0d4a5fc5fb34724e6a1cde742192387b9ed749ab5c72cd6bb0206f102e9216538f095fb7\
-73661cfde82c2e2a619332998124648bf4cd0da56279f0c297567d9b5d684125ee92920dd513fd18c27afba2a9633614f75d8f8b9a14095e3fafe8165330871287222e6681dd9c0f830cf5d464457b257d0900eed29107fad8af\
-3ac4f87cf5af5183ff0516ccd9aeac1186006c8d11b18742dfb526aadbf2906772fbfe8fb18798967fd397a724d59f6fcd4c32736550986d227a6b447ef70585c049a1a4d7bf25*$/pkzip$", "password"},
+	{"$pkzip$1*2*2*0*e4*1c5*eda7a8de*0*47*8*e4*4bb6*436c9ffa4328870f6272349b591095e1b1126420c3041744650282bc4f575d0d4a5fc5fb34724e6a1cde742192387b9ed749ab5c72cd6bb0206f102e9216538f095fb773661cfde82c2e2a619332998124648bf4cd0da56279f0c297567d9b5d684125ee92920dd513fd18c27afba2a9633614f75d8f8b9a14095e3fafe8165330871287222e6681dd9c0f830cf5d464457b257d0900eed29107fad8af3ac4f87cf5af5183ff0516ccd9aeac1186006c8d11b18742dfb526aadbf2906772fbfe8fb18798967fd397a724d59f6fcd4c32736550986d227a6b447ef70585c049a1a4d7bf25*$/pkzip$", "password" },
+	{"$pkzip$1*2*2*0*e4*1c5*eda7a8de*0*47*8*e4*4bb6*436c9ffa4328870f6272349b591095e1b1126420c3041744650282bc4f575d0d4a5fc5fb34724e6a1cde742192387b9ed749ab5c72cd6bb0206f102e9216538f095fb773661cfde82c2e2a619332998124648bf4cd0da56279f0c297567d9b5d684125ee92920dd513fd18c27afba2a9633614f75d8f8b9a14095e3fafe8165330871287222e6681dd9c0f830cf5d464457b257d0900eed29107fad8af3ac4f87cf5af5183ff0516ccd9aeac1186006c8d11b18742dfb526aadbf2906772fbfe8fb18798967fd397a724d59f6fcd4c32736550986d227a6b447ef70585c049a1a4d7bf25*$/pkzip$", "password"},
 	/* now a pkzip archive, with 3 files, 1 byte checksum */
-	{"\
-$pkzip$3*1*1*0*8*24*4001*8986ec4d693e86c1a42c1bd2e6a994cb0b98507a6ec937fe0a41681c02fe52c61e3cc046*1*0*8*24*4003*a087adcda58de2e14e73db0043a4ff0ed3acc6a9aee3985d7cb81d5ddb32b840ea20\
-57d9*2*0*e4*1c5*eda7a8de*0*4c*8*e4*eda7*89a792af804bf38e31fdccc8919a75ab6eb75d1fd6e7ecefa3c5b9c78c3d50d656f42e582af95882a38168a8493b2de5031bb8b39797463cb4769a955a2ba72abe48ee75b103\
-f93ef9984ae740559b9bd84cf848d693d86acabd84749853675fb1a79edd747867ef52f4ee82435af332d43f0d0bb056c49384d740523fa75b86a6d29a138da90a8de31dbfa89f2f6b0550c2b47c43d907395904453ddf42a665\
-b5f7662de170986f89d46d944b519e1db9d13d4254a6b0a5ac02b3cfdd468d7a4965e4af05699a920e6f3ddcedb57d956a6b2754835b14e174070ba6aec4882d581c9f30*$/pkzip$", "3!files"},
+	{"$pkzip$3*1*1*0*8*24*4001*8986ec4d693e86c1a42c1bd2e6a994cb0b98507a6ec937fe0a41681c02fe52c61e3cc046*1*0*8*24*4003*a087adcda58de2e14e73db0043a4ff0ed3acc6a9aee3985d7cb81d5ddb32b840ea2057d9*2*0*e4*1c5*eda7a8de*0*4c*8*e4*eda7*89a792af804bf38e31fdccc8919a75ab6eb75d1fd6e7ecefa3c5b9c78c3d50d656f42e582af95882a38168a8493b2de5031bb8b39797463cb4769a955a2ba72abe48ee75b103f93ef9984ae740559b9bd84cf848d693d86acabd84749853675fb1a79edd747867ef52f4ee82435af332d43f0d0bb056c49384d740523fa75b86a6d29a138da90a8de31dbfa89f2f6b0550c2b47c43d907395904453ddf42a665b5f7662de170986f89d46d944b519e1db9d13d4254a6b0a5ac02b3cfdd468d7a4965e4af05699a920e6f3ddcedb57d956a6b2754835b14e174070ba6aec4882d581c9f30*$/pkzip$", "3!files"},
 	/* following are from CMIYC 2012 */
 	{"$pkzip$1*1*2*0*163*2b5*cd154083*0*26*8*163*cd15*d6b094794b40116a8b387c10159225d776f815b178186e51faf16fa981fddbffdfa22f6c6f32d2f81dab35e141f2899841991f3cb8d53f8ee1f1d85657f7c7a82ebb2d63182803c6beee00e0bf6c72edeeb1b00dc9f07f917bb8544cc0e96ca01503cd0fb6632c296cebe3fb9b64543925daae6b7ea95cfd27c42f6f3465e0ab2c812b9aeeb15209ce3b691f27ea43a7a77b89c2387e31c4775866a044b6da783af8ddb72784ccaff4d9a246db96484e865ea208ade290b0131b4d2dd21f172693e6b5c90f2eb9b67572b55874b6d3a78763212b248629e744c07871a6054e24ef74b6d779e44970e1619df223b4e5a72a189bef40682b62be6fb7f65e087ca6ee19d1ebfc259fa7e3d98f3cb99347689f8360294352accffb146edafa9e91afba1f119f95145738ac366b332743d4ff40d49fac42b8758c43b0af5b60b8a1c63338359ffbff432774f2c92de3f8c49bd4611e134db98e6a3f2cfb148d2b20f75abab6*$/pkzip$", "passwort"},
 	{"$pkzip$1*1*2*0*163*2b6*46abc149*0*28*8*163*46ab*0f539b23b761a347a329f362f7f1f0249515f000404c77ec0b0ffe06f29140e8fa3e8e5a6354e57f3252fae3d744212d4d425dc44389dd4450aa9a4f2f3c072bee39d6ac6662620812978f7ab166c66e1acb703602707ab2da96bb28033485ec192389f213e48eda8fc7d9dad1965b097fafebfda6703117db90e0295db9a653058cb28215c3245e6e0f6ad321065bf7b8cc5f66f6f2636e0d02ea35a6ba64bbf0191c308098fd836e278abbce7f10c3360a0a682663f59f92d9c2dcfc87cde2aae27ea18a14d2e4a0752b6b51e7a5c4c8c2bab88f4fb0aba27fb20e448655021bb3ac63752fdb01e6b7c99f9223f9e15d71eb1bd8e323f522fc3da467ff0aae1aa17824085d5d6f1cdfc9c7c689cd7cb057005d94ba691f388484cfb842c8775baac220a5490ed945c8b0414dbfc4589254b856aade49f1aa386db86e9fc87e6475b452bd72c5e2122df239f8c2fd462ca54c1a5bddac36918c5f5cf0cc94aa6ee820*$/pkzip$", "Credit11"},
 	{"$pkzip$1*1*2*0*163*2b6*46abc149*0*26*8*163*46ab*7ea9a6b07ddc9419439311702b4800e7e1f620b0ab8535c5aa3b14287063557b176cf87a800b8ee496643c0b54a77684929cc160869db4443edc44338294458f1b6c8f056abb0fa27a5e5099e19a07735ff73dc91c6b20b05c023b3ef019529f6f67584343ac6d86fa3d12113f3d374b047efe90e2a325c0901598f31f7fb2a31a615c51ea8435a97d07e0bd4d4afbd228231dbc5e60bf1116ce49d6ce2547b63a1b057f286401acb7c21afbb673f3e26bc1b2114ab0b581f039c2739c7dd0af92c986fc4831b6c294783f1abb0765cf754eada132df751cf94cad7f29bb2fec0c7c47a7177dea82644fc17b455ba2b4ded6d9a24e268fcc4545cae73b14ceca1b429d74d1ebb6947274d9b0dcfb2e1ac6f6b7cd2be8f6141c3295c0dbe25b65ff89feb62cb24bd5be33853b88b8ac839fdd295f71e17a7ae1f054e27ba5e60ca03c6601b85c3055601ce41a33127938440600aaa16cfdd31afaa909fd80afc8690aaf*$/pkzip$", "7J0rdan!!"},
 	/* CMIYC 2013 "pro" hard hash */
 	{"$pkzip$1*2*2*0*6b*73*8e687a5b*0*46*8*6b*0d9d*636fedc7a78a7f80cda8542441e71092d87d13da94c93848c230ea43fab5978759e506110b77bd4bc10c95bc909598a10adfd4febc0d42f3cd31e4fec848d6f49ab24bb915cf939fb1ce09326378bb8ecafde7d3fe06b6013628a779e017be0f0ad278a5b04e41807ae9fc*$/pkzip$", "c00rslit3!"},
-	/* http://corkami.googlecode.com/files/ChristmasGIFts.zip (fixed with 2 byte checksums from timestamp, using new $pkzip2$ type) */
+	/* https://storage.googleapis.com/google-code-archive-downloads/v2/code.google.com/corkami/ChristmasGIFts.zip */
 	{"$pkzip2$3*2*1*2*8*c0*7224*72f6*6195f9f3401076b22f006105c4323f7ac8bb8ebf8d570dc9c7f13ddacd8f071783f6bef08e09ce4f749af00178e56bc948ada1953a0263c706fd39e96bb46731f827a764c9d55945a89b952f0503747703d40ed4748a8e5c31cb7024366d0ef2b0eb4232e250d343416c12c7cbc15d41e01e986857d320fb6a2d23f4c44201c808be107912dbfe4586e3bf2c966d926073078b92a2a91568081daae85cbcddec75692485d0e89994634c71090271ac7b4a874ede424dafe1de795075d2916eae*1*6*8*c0*26ee*461b*944bebb405b5eab4322a9ce6f7030ace3d8ec776b0a989752cf29569acbdd1fb3f5bd5fe7e4775d71f9ba728bf6c17aad1516f3aebf096c26f0c40e19a042809074caa5ae22f06c7dcd1d8e3334243bca723d20875bd80c54944712562c4ff5fdb25be5f4eed04f75f79584bfd28f8b786dd82fd0ffc760893dac4025f301c2802b79b3cb6bbdf565ceb3190849afdf1f17688b8a65df7bc53bc83b01a15c375e34970ae080307638b763fb10783b18b5dec78d8dfac58f49e3c3be62d6d54f9*2*0*2a*1e*4a204eab*ce8*2c*0*2a*4a20*7235*6b6e1a8de47449a77e6f0d126b217d6b2b72227c0885f7dc10a2fb3e7cb0e611c5c219a78f98a9069f30*$/pkzip2$", "123456"},
+	{"$pkzip$1*1*2*0*14*6*775f54d8*0*47*8*14*8cd0*11b75efed56a5795f07c509268a88b4a6ff362ef*$/pkzip$", "test"},
 	{NULL}
 };
 
@@ -190,14 +137,15 @@ static const char *ValidateZipContents(FILE *in, long offset, u32 offex, int len
 static int valid(char *ciphertext, struct fmt_main *self)
 {
 	c8 *p, *cp, *cpkeep;
-	int cnt, data_len, ret=0;
+	int cnt, ret=0;
+	u64 data_len;
 	u32 crc;
 	FILE *in;
 	const char *sFailStr;
 	long offset;
 	u32 offex;
 	int type;
-	int complen = 0;
+	u64 complen = 0;
 	int type2 = 0;
 
 	if (strncmp(ciphertext, FORMAT_TAG, FORMAT_TAG_LEN)) {
@@ -242,7 +190,7 @@ static int valid(char *ciphertext, struct fmt_main *self)
 				sFailStr = "Invalid compressed length";
 				goto Bail;
 			}
-			sscanf(cp, "%x", &complen);
+			sscanf(cp, "%"PRIx64, &complen);
 			if ((cp = strtokm(NULL, "*")) == NULL || !cp[0] || !ishexlc_oddOK(cp)) {
 				sFailStr = "Invalid data length value";
 				goto Bail;
@@ -271,7 +219,7 @@ static int valid(char *ciphertext, struct fmt_main *self)
 			sFailStr = "Invalid data length value";
 			goto Bail;
 		}
-		sscanf(cp, "%x", &data_len);
+		sscanf(cp, "%"PRIx64, &data_len);
 		if ((cp = strtokm(NULL, "*")) == NULL || !ishexlc(cp) || strlen(cp) != 4) {
 			sFailStr = "invalid checksum value";
 			goto Bail;
@@ -341,7 +289,7 @@ static int valid(char *ciphertext, struct fmt_main *self)
 
 Bail:;
 #ifdef ZIP_DEBUG
-	if (!ret) fprintf (stderr, "pkzip validation failed [%s]  Hash is %s\n", sFailStr, ciphertext);
+	if (!ret) fprintf(stderr, "pkzip validation failed [%s]  Hash is %.64s\n", sFailStr, ciphertext);
 #endif
 	MEM_FREE(cpkeep);
 	return ret;
@@ -396,14 +344,9 @@ static void init(struct fmt_main *self)
 #ifdef PKZIP_USE_MULT_TABLE
 	unsigned short n=0;
 #endif
-#ifdef _OPENMP
-	int omp_t;
 
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
+	omp_autotune(self, OMP_SCALE);
+
 	saved_key = mem_calloc(sizeof(*saved_key), self->params.max_keys_per_crypt);
 	K12 = mem_calloc(sizeof(*K12) * 3, self->params.max_keys_per_crypt);
 	chk = mem_calloc(sizeof(*chk), self->params.max_keys_per_crypt);
@@ -514,6 +457,11 @@ static void init(struct fmt_main *self)
 	SIGS[11].magic_sig_len[0] = 3;
 	SIGS[11].magic_count = 1;
 	SIGS[11].max_len = 3;
+//case 12: // PST
+	SIGS[12].magic_signature[0] = (u8*)str_alloc_copy("!BDN");
+	SIGS[12].magic_sig_len[0] = 4;
+	SIGS[12].magic_count = 1;
+	SIGS[12].max_len = 4;
 
 	SIGS[255].max_len = 64;
 #endif
@@ -528,13 +476,26 @@ static void done(void)
 
 static void set_salt(void *_salt)
 {
+	int i;
+	int need_fixup = 0;
+	long tot_len = 0;
+
 	salt = *((PKZ_SALT**)_salt);
-	if (salt->H[0].h && salt->H[1].h && salt->H[2].h)
-		return;
+
+	for (i = 0; i < MAX_PKZ_FILES; i++) {
+		if (!salt->H[i].h) {
+			need_fixup = 1;
+			break;
+		}
+	}
+
 	// we 'late' fixup the salt.
-	salt->H[0].h = &salt->zip_data[0];
-	salt->H[1].h = &salt->zip_data[1+salt->H[0].datlen];
-	salt->H[2].h = &salt->zip_data[2+salt->H[0].datlen+salt->H[1].datlen];
+	if (need_fixup) {
+		for (i = 0; i < MAX_PKZ_FILES; i++) {
+			salt->H[i].h = &salt->zip_data[i + tot_len];
+			tot_len += salt->H[i].datlen;
+		}
+	}
 }
 
 static void *get_salt(char *ciphertext)
@@ -542,15 +503,16 @@ static void *get_salt(char *ciphertext)
 	/* NOTE, almost NO error checking at all in this function.  Proper error checking done in valid() */
 	static union alignment {
 		unsigned char c[8];
-		ARCH_WORD_32 a[1];
+		uint64_t a[1];	// salt alignment of 8 bytes required. uint64_t values in the salt.
 	} a;
 	unsigned char *salt_p = a.c;
 	PKZ_SALT *salt, *psalt;
 	long offset=0;
-	char *H[3] = {0,0,0};
-	long ex_len[3] = {0,0,0};
+	char *H[MAX_PKZ_FILES] = { 0 };
+	long ex_len[MAX_PKZ_FILES] = { 0 };
+	long tot_len;
 	u32 offex;
-	int i, j;
+	size_t i, j;
 	c8 *p, *cp, *cpalloc = (char*)mem_alloc(strlen(ciphertext)+1);
 	int type2 = 0;
 
@@ -569,8 +531,10 @@ static void *get_salt(char *ciphertext)
 	sscanf(cp, "%x", &(salt->cnt));
 	cp = strtokm(NULL, "*");
 	sscanf(cp, "%x", &(salt->chk_bytes));
-	for(i = 0; i < salt->cnt; ++i) {
+	for (i = 0; i < salt->cnt; ++i) {
 		int data_enum;
+
+		salt->H[i].type = type2 ? 2 : 1;
 		cp = strtokm(NULL, "*");
 		data_enum = *cp - '0';
 		cp = strtokm(NULL, "*");
@@ -586,9 +550,9 @@ static void *get_salt(char *ciphertext)
 
 		if (data_enum > 1) {
 			cp = strtokm(NULL, "*");
-			sscanf(cp, "%x", &(salt->compLen));
+			sscanf(cp, "%"PRIx64, &(salt->compLen));
 			cp = strtokm(NULL, "*");
-			sscanf(cp, "%x", &(salt->deCompLen));
+			sscanf(cp, "%"PRIx64, &(salt->deCompLen));
 			cp = strtokm(NULL, "*");
 			sscanf(cp, "%x", &(salt->crc32));
 			cp = strtokm(NULL, "*");
@@ -599,7 +563,7 @@ static void *get_salt(char *ciphertext)
 		cp = strtokm(NULL, "*");
 		sscanf(cp, "%x", &(salt->H[i].compType));
 		cp = strtokm(NULL, "*");
-		sscanf(cp, "%x", &(salt->H[i].datlen));
+		sscanf(cp, "%"PRIx64, &(salt->H[i].datlen));
 		cp = strtokm(NULL, "*");
 
 		for (j = 0; j < 4; ++j) {
@@ -612,8 +576,7 @@ static void *get_salt(char *ciphertext)
 				salt->H[i].c2 <<= 4;
 				salt->H[i].c2 |= atoi16[ARCH_INDEX(cp[j])];
 			}
-		} else
-			salt->H[i].c2 = salt->H[i].c; // fake out 2nd hash, by copying first hash
+		}
 		cp = strtokm(NULL, "*");
 		if (data_enum > 1) {
 			/* if 2 or 3, we have the FULL zip blob for decrypting. */
@@ -622,7 +585,7 @@ static void *get_salt(char *ciphertext)
 				FILE *fp;
 				fp = fopen(cp, "rb");
 				if (!fp) {
-					fprintf (stderr, "Error opening file for pkzip data:  %s\n", cp);
+					fprintf(stderr, "Error opening file for pkzip data:  %s\n", cp);
 					MEM_FREE(cpalloc);
 					return 0;
 				}
@@ -632,7 +595,7 @@ static void *get_salt(char *ciphertext)
 					ex_len[i] = salt->compLen;
 					H[i] = mem_alloc(salt->compLen);
 					if (fread(H[i], 1, salt->compLen, fp) != salt->compLen) {
-						fprintf (stderr, "Error reading zip file for pkzip data:  %s\n", cp);
+						fprintf(stderr, "Error reading zip file for pkzip data:  %s\n", cp);
 						fclose(fp);
 						MEM_FREE(cpalloc);
 						return 0;
@@ -649,7 +612,7 @@ static void *get_salt(char *ciphertext)
 					ex_len[i] = 384;
 					H[i] = mem_alloc(384);
 					if (fread(H[i], 1, 384, fp) != 384) {
-						fprintf (stderr, "Error reading zip file for pkzip data:  %s\n", cp);
+						fprintf(stderr, "Error reading zip file for pkzip data:  %s\n", cp);
 						fclose(fp);
 						MEM_FREE(cpalloc);
 						return 0;
@@ -705,16 +668,21 @@ static void *get_salt(char *ciphertext)
 			salt->H[i].magic = 0;	// remove any 'magic' logic from this hash.
 	}
 
-	psalt = mem_calloc(1, sizeof(PKZ_SALT) + ex_len[0]+ex_len[1]+ex_len[2]+2);
+	tot_len = 0;
+	for (i = 0; i < salt->cnt; i++)
+		tot_len += ex_len[i];
+	tot_len += salt->cnt - 1;
+	psalt = mem_calloc(1, sizeof(PKZ_SALT) + tot_len);
 	memcpy(psalt, salt, sizeof(*salt));
-	memcpy(psalt->zip_data, H[0], ex_len[0]);
-	MEM_FREE(H[0]);
-	if(salt->cnt > 1)
-		memcpy(psalt->zip_data+ex_len[0]+1, H[1], ex_len[1]);
-	MEM_FREE(H[1]);
-	if(salt->cnt > 2)
-		memcpy(psalt->zip_data+ex_len[0]+ex_len[1]+2, H[2], ex_len[2]);
-	MEM_FREE(H[2]);
+
+	tot_len = 0;
+	for (i = 0; i < salt->cnt; i++) {
+		memcpy(psalt->zip_data + i + tot_len, H[i], ex_len[i]);
+		tot_len += ex_len[i];
+		MEM_FREE(H[i]);
+	}
+	tot_len += salt->cnt - 1;
+
 	MEM_FREE(salt);
 
 	psalt->dsalt.salt_alloc_needs_free = 1;  // we used mem_calloc, so JtR CAN free our pointer when done with them.
@@ -722,15 +690,14 @@ static void *get_salt(char *ciphertext)
 	// set the JtR core linkage stuff for this dyna_salt
 	memcpy(salt_p, &psalt, sizeof(psalt));
 	psalt->dsalt.salt_cmp_offset = SALT_CMP_OFF(PKZ_SALT, cnt);
-	psalt->dsalt.salt_cmp_size = SALT_CMP_SIZE(PKZ_SALT, cnt, full_zip_idx, ex_len[0]+ex_len[1]+ex_len[2]+2);
-
+	psalt->dsalt.salt_cmp_size = SALT_CMP_SIZE(PKZ_SALT, cnt, zip_data, tot_len);
 	return salt_p;
 }
 
 static void set_key(char *key, int index)
 {
 	/* Keep the PW, so we can return it in get_key if asked to do so */
-	strnzcpy(saved_key[index], key, PLAINTEXT_LENGTH + 1);
+	strnzcpy(saved_key[index], key, sizeof(*saved_key));
 	dirty = 1;
 }
 
@@ -815,11 +782,11 @@ static int cmp_exact_loadfile(int index)
 	/* Open the zip file, and 'seek' to the proper offset of the binary zip blob */
 	fp = fopen(salt->fname, "rb");
 	if (!fp) {
-		fprintf (stderr, "\nERROR, the zip file: %s has been removed.\nWe are a possible password has been found, but FULL validation can not be done!\n", salt->fname);
+		fprintf(stderr, "\nERROR, the zip file: %s has been removed.\nWe are a possible password has been found, but FULL validation can not be done!\n", salt->fname);
 		return 1;
 	}
 	if (fseek(fp, salt->offset, SEEK_SET)) {
-		fprintf (stderr, "\nERROR, the zip file: %s fseek() failed.\nWe are a possible password has been found, but FULL validation can not be done!\n", salt->fname);
+		fprintf(stderr, "\nERROR, the zip file: %s fseek() failed.\nWe are a possible password has been found, but FULL validation can not be done!\n", salt->fname);
 		fclose(fp);
 		return 1;
 	}
@@ -828,7 +795,7 @@ static int cmp_exact_loadfile(int index)
 	key0.u = K12[index*3], key1.u = K12[index*3+1], key2.u = K12[index*3+2];
 	k=12;
 	if (fread(in, 1, 12, fp) != 12) {
-		fprintf (stderr, "\nERROR, the zip file: %s fread() failed.\nWe are a possible password has been found, but FULL validation can not be done!\n", salt->fname);
+		fprintf(stderr, "\nERROR, the zip file: %s fread() failed.\nWe are a possible password has been found, but FULL validation can not be done!\n", salt->fname);
 		fclose(fp);
 		return 1;
 	}
@@ -877,7 +844,7 @@ static int cmp_exact_loadfile(int index)
 		if (ferror(fp)) {
 			inflateEnd(&strm);
 			fclose(fp);
-			fprintf (stderr, "\nERROR, the zip file: %s fread() failed.\nWe are a possible password has been found, but FULL validation can not be done!\n", salt->fname);
+			fprintf(stderr, "\nERROR, the zip file: %s fread() failed.\nWe are a possible password has been found, but FULL validation can not be done!\n", salt->fname);
 			return 1;
 		}
 		if (strm.avail_in == 0)
@@ -1062,7 +1029,7 @@ static int validate_ascii(const u8 *out, int inplen)
 
 			if (out[i] > 0xC0) {
 				int len;
-				if(i > inplen-4)
+				if (i > inplen-4)
 					return 1;
 				len = isLegalUTF8_char(&out[i], 5);
 				if (len < 0) return 0;
@@ -1166,7 +1133,7 @@ MAYBE_INLINE static int check_inflate_CODE2(u8 *next)
 	if (257+(hold&0x1F) > 286)
 		return 0;	// nlen, but we do not use it.
 	hold >>= 5;
-	if(1+(hold&0x1F) > 30)
+	if (1+(hold&0x1F) > 30)
 		return 0;		// ndist, but we do not use it.
 	hold >>= 5;
 	ncode = 4+(hold&0xF);
@@ -1410,7 +1377,7 @@ static int crypt_all(int *pcount, struct db_salt *_salt)
 		u8 curInfBuf[128];
 #endif
 		int k, SigChecked;
-		u16 e, e2, v1, v2;
+		u16 e, v1, v2;
 		z_stream strm;
 		int ret;
 
@@ -1441,7 +1408,6 @@ static int crypt_all(int *pcount, struct db_salt *_salt)
 			b = salt->H[++cur_hash_idx].h;
 			k=11;
 			e = salt->H[cur_hash_idx].c;
-			e2 = salt->H[cur_hash_idx].c2;
 
 			do
 			{
@@ -1452,18 +1418,25 @@ static int crypt_all(int *pcount, struct db_salt *_salt)
 			}
 			while(--k);
 
-			/* if the hash is a 2 byte checksum type, then check that value first */
-			/* There is no reason to continue if this byte does not check out.  */
-			if (salt->chk_bytes == 2 && C != (e&0xFF) && C != (e2&0xFF))
-				goto Failed_Bailout;
+			if (salt->H[cur_hash_idx].type == 2) {
+				u16 e2 = salt->H[cur_hash_idx].c2;
 
-			C = PKZ_MULT(*b++,key2);
-#if 1
-			// https://github.com/magnumripper/JohnTheRipper/issues/467
-			// Fixed, JimF.  Added checksum test for crc32 and timestamp.
-			if (C != (e>>8) && C != (e2>>8))
-				goto Failed_Bailout;
-#endif
+				if (salt->chk_bytes == 2 && C != (e & 0xff) && C != (e2 & 0xff))
+					goto Failed_Bailout;
+
+				C = PKZ_MULT(*b++, key2);
+
+				if (C != (e >> 8) && C != (e2 >> 8))
+					goto Failed_Bailout;
+			} else {
+				if (salt->chk_bytes == 2 && C != (e & 0xff))
+					goto Failed_Bailout;
+
+				C = PKZ_MULT(*b++, key2);
+
+				if (C != (e >> 8))
+					goto Failed_Bailout;
+			}
 
 			// Now, update the key data (with that last byte.
 			key0.u = jtr_crc32 (key0.u, C);
@@ -1514,7 +1487,7 @@ static int crypt_all(int *pcount, struct db_salt *_salt)
 				continue;
 			}
 #if 1
-			// https://github.com/magnumripper/JohnTheRipper/issues/467
+			// https://github.com/openwall/john/issues/467
 			// Ok, if this is a code 3, we are done.
 			// Code moved to after the check for stored type.  (FIXED)  This check was INVALID for a stored type file.
 			if ( (C & 6) == 6)
@@ -1583,7 +1556,7 @@ static int crypt_all(int *pcount, struct db_salt *_salt)
 					if (!check_inflate_CODE2(curDecryBuf))
 						goto Failed_Bailout;
 #if (ZIP_DEBUG==2)
-					fprintf (stderr, "CODE2 Pass=%s  count = %u, found = %u\n", saved_key[idx], count, ++found);
+					fprintf(stderr, "CODE2 Pass=%s  count = %u, found = %u\n", saved_key[idx], count, ++found);
 #endif
 				}
 				else {
@@ -1604,7 +1577,7 @@ static int crypt_all(int *pcount, struct db_salt *_salt)
 					if (!check_inflate_CODE1(curDecryBuf, til))
 						goto Failed_Bailout;
 #if (ZIP_DEBUG==2)
-					fprintf (stderr, "CODE1 Pass=%s  count = %u, found = %u\n", saved_key[idx], count, ++found);
+					fprintf(stderr, "CODE1 Pass=%s  count = %u, found = %u\n", saved_key[idx], count, ++found);
 #endif
 				}
 			}
@@ -1733,7 +1706,7 @@ struct fmt_main fmt_pkzip = {
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_CASE | FMT_8_BIT | FMT_OMP | FMT_DYNA_SALT,
+		FMT_CASE | FMT_8_BIT | FMT_OMP | FMT_DYNA_SALT | FMT_HUGE_INPUT,
 		{ NULL },
 		{ FORMAT_TAG, FORMAT_TAG2 },
 		tests
@@ -1749,7 +1722,7 @@ struct fmt_main fmt_pkzip = {
 		{ NULL },
 		fmt_default_source,
 		{
-			fmt_default_binary_hash /* Not usable with $SOURCE_HASH$ */
+			fmt_default_binary_hash
 		},
 		fmt_default_dyna_salt_hash,
 		NULL,
@@ -1759,7 +1732,7 @@ struct fmt_main fmt_pkzip = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			fmt_default_get_hash /* Not usable with $SOURCE_HASH$ */
+			fmt_default_get_hash
 		},
 		cmp_all,
 		cmp_one,
@@ -1768,4 +1741,15 @@ struct fmt_main fmt_pkzip = {
 };
 
 #endif /* plugin stanza */
+
+#else
+
+#if !defined(FMT_EXTERNS_H) && !defined(FMT_REGISTERS_H)
+#ifdef __GNUC__
+#warning pkzip format requires zlib to function. The format has been disabled
+#elif _MSC_VER
+#pragma message(": warning pkzip format requires zlib to function. The format has been disabled :")
+#endif
+#endif
+
 #endif /* HAVE_LIBZ */

@@ -10,12 +10,12 @@
    You should have received a copy of the CC0 Public Domain Dedication along with
    this software. If not, see <http://creativecommons.org/publicdomain/zero/1.0/>.
 */
-#pragma once
+
 #ifndef __BLAKE2_H__
 #define __BLAKE2_H__
 
 #include <stddef.h>
-#include "stdint.h"
+#include <stdint.h>
 #include "aligned.h"
 #include "jumbo.h"
 
@@ -57,7 +57,7 @@ extern "C" {
     uint8_t  personal[BLAKE2S_PERSONALBYTES];  // 32
   } blake2s_param;
 
-  JTR_ALIGN( 64 ) typedef struct __blake2s_state
+  typedef struct JTR_ALIGN( 64 ) __blake2s_state
   {
     uint32_t h[8];
     uint32_t t[2];
@@ -82,7 +82,7 @@ extern "C" {
     uint8_t  personal[BLAKE2B_PERSONALBYTES];  // 64
   } blake2b_param;
 
-  JTR_ALIGN( 64 ) typedef struct __blake2b_state
+  typedef struct JTR_ALIGN( 64 ) __blake2b_state
   {
     uint64_t h[8];
     uint64_t t[2];
@@ -91,10 +91,10 @@ extern "C" {
     size_t   buflen;
     uint8_t  last_node;
   } blake2b_state;
-#if !defined(__SSE2__) && !defined(__SSE4_1__) && !defined(__XOP__)
+#if defined(JOHN_NO_SIMD) || (!defined(__SSE2__) && !defined(__SSE4_1__) && !defined(__XOP__))
   typedef struct __blake2sp_state
 #else
-  JTR_ALIGN( 64 ) typedef struct __blake2sp_state
+  typedef struct JTR_ALIGN( 64 ) __blake2sp_state
 #endif
   {
     blake2s_state S[8][1];
@@ -103,10 +103,10 @@ extern "C" {
     size_t  buflen;
   } blake2sp_state;
 
-#if !defined(__SSE2__) && !defined(__SSE4_1__) && !defined(__XOP__)
+#if defined(JOHN_NO_SIMD) || (!defined(__SSE2__) && !defined(__SSE4_1__) && !defined(__XOP__))
   typedef struct __blake2bp_state
 #else
-  JTR_ALIGN( 64 ) typedef struct __blake2bp_state
+  typedef struct JTR_ALIGN( 64 ) __blake2bp_state
 #endif
   {
     blake2b_state S[4][1];
@@ -146,7 +146,7 @@ extern "C" {
   int blake2sp( uint8_t *out, const void *in, const void *key, const uint8_t outlen, const uint64_t inlen, uint8_t keylen );
   int blake2bp( uint8_t *out, const void *in, const void *key, const uint8_t outlen, const uint64_t inlen, uint8_t keylen );
 
-  static inline int blake2( uint8_t *out, const void *in, const void *key, const uint8_t outlen, const uint64_t inlen, uint8_t keylen )
+  inline static int blake2( uint8_t *out, const void *in, const void *key, const uint8_t outlen, const uint64_t inlen, uint8_t keylen )
   {
     return blake2b( out, in, key, outlen, inlen, keylen );
   }

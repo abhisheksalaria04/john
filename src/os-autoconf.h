@@ -13,7 +13,7 @@
  * the call to ./configure.  NOTE, over time, this fill will be
  * reduced more and more, and likely will go away at some time.
  * when that happens, the os.h will simply be used for non autoconf
- * builds (i.e. make -f Makefile.legacy )
+ * builds (i.e. make -sj4 -f Makefile.legacy )
  */
 
 /*
@@ -42,32 +42,6 @@
 #else
 #define OS_TIMER			0
 #warning ITIMER_REAL is not available - will emulate timers
-#endif
-#endif
-
-#endif
-
-#ifdef NEED_OS_FLOCK
-
-#if defined (_MSC_VER) || defined (__MINGW32__)
-#define OS_FLOCK			0
-#else
-#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
-#define _DARWIN_C_SOURCE /* for LOCK_EX */
-#endif
-#if PREFER_FLOCK
-#include <sys/file.h>
-#ifdef LOCK_EX
-#define OS_FLOCK			1
-#else
-#define OS_FLOCK			0
-#warning LOCK_EX is not available - will skip locking
-#endif
-#else
-#define OS_FLOCK			0
-#if (HAVE_FCNTL_H)
-#define FCNTL_LOCKS			1
-#endif
 #endif
 #endif
 

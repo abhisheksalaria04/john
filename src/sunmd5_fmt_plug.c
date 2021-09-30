@@ -32,31 +32,34 @@ john_register_one(&fmt_sunmd5);
 
 #ifdef _OPENMP
 #include <omp.h>
-#ifndef OMP_SCALE
-#define OMP_SCALE 2
-#endif
 #endif
 
 #include "arch.h"
+
+#if !ARCH_LITTLE_ENDIAN
+// For now, neuter this format from SIMD building.
+// Someone else can port to BE at a later date.
+#undef SIMD_COEF_32
+#undef SIMD_PARA_MD5
+#endif
+
 #include "misc.h"
 #include "options.h"
-#include "misc.h"
 #include "params.h"
 #include "memory.h"
 #include "common.h"
 #include "formats.h"
 #include "loader.h"
-#include "memory.h"
 #include "md5.h"
 #include "simd-intrinsics.h"
-#include "memdbg.h"
 
-/*
- * these 2 are for testing non-MMX mode. if we
- * undefine these 2, then we force build oSSL model.
- */
-//#undef SIMD_PARA_MD5
-//#undef SIMD_COEF_32
+#ifndef OMP_SCALE
+#if SIMD_COEF_32
+#define OMP_SCALE 2 // Tuned for core i7 w/ MKPC
+#else
+#define OMP_SCALE 8 // Tuned for core i7 w/ SIMD disabled
+#endif
+#endif
 
 #ifndef MD5_CBLOCK
 #define MD5_CBLOCK 64
@@ -79,11 +82,11 @@ john_register_one(&fmt_sunmd5);
 #define SALT_ALIGN			1
 
 #if SIMD_COEF_32
-#define MIN_KEYS_PER_CRYPT  SIMD_COEF_32
-#define MAX_KEYS_PER_CRYPT  (16 * SIMD_COEF_32 * SIMD_PARA_MD5)
+#define MIN_KEYS_PER_CRYPT  (SIMD_COEF_32 * SIMD_PARA_MD5)
+#define MAX_KEYS_PER_CRYPT  (SIMD_COEF_32 * SIMD_PARA_MD5 * 4)
 #else
 #define MIN_KEYS_PER_CRYPT	1
-#define MAX_KEYS_PER_CRYPT		1
+#define MAX_KEYS_PER_CRYPT	2
 #endif
 
 #define FORMAT_LABEL			"SunMD5"
@@ -95,7 +98,7 @@ john_register_one(&fmt_sunmd5);
 
 #define BENCHMARK_COMMENT		""
 // it is salted, but very slow, AND there is no difference between 1 and multi salts, so simply turn off salt benchmarks
-#define BENCHMARK_LENGTH		-1
+#define BENCHMARK_LENGTH		0x107
 
 /* THIS one IS a depricated sun string, but for real:  $md5$3UqYqndY$$6P.aaWOoucxxq.l00SS9k0: Sun MD5 "password"  */
 /* $md5,rounds=5000$GUBv0xjJ$$mSwgIswdjlTY0YxV7HBVm0   passwd  This one was the python code from http://packages.python.org/passlib/lib/passlib.hash.sun_md5_crypt.html, but the rounds are busted. */
@@ -219,23 +222,16 @@ static const char constant_phrase[] =
 	"Be all my sins remember'd.\n";
 
 static unsigned char mod5[0x100];
+static int ngroups = 1;
 
 static void init(struct fmt_main *self)
 {
 	int i;
 #ifdef SIMD_COEF_32
-	int j, k, ngroups = 1;
+	int j, k;
 #endif
-#ifdef _OPENMP
-	int omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
 
-#ifdef SIMD_COEF_32
-	ngroups = omp_t;
-#endif
-#endif
+	ngroups = omp_autotune(self, OMP_SCALE);
 
 #ifdef SIMD_COEF_32
 	/*
@@ -346,7 +342,7 @@ static void *get_binary(char *ciphertext)
 {
 	static union {
 		char c[FULL_BINARY_SIZE];
-		ARCH_WORD_32 w[FULL_BINARY_SIZE / sizeof(ARCH_WORD_32)];
+		uint32_t w[FULL_BINARY_SIZE / sizeof(uint32_t)];
 	} out;
 	unsigned l;
 	unsigned char *cp;
@@ -377,13 +373,8 @@ static void *get_salt(char *ciphertext)
 	return out;
 }
 
-static int get_hash_0(int index) { return *((ARCH_WORD_32*)(crypt_out[index])) & PH_MASK_0; }
-static int get_hash_1(int index) { return *((ARCH_WORD_32*)(crypt_out[index])) & PH_MASK_1; }
-static int get_hash_2(int index) { return *((ARCH_WORD_32*)(crypt_out[index])) & PH_MASK_2; }
-static int get_hash_3(int index) { return *((ARCH_WORD_32*)(crypt_out[index])) & PH_MASK_3; }
-static int get_hash_4(int index) { return *((ARCH_WORD_32*)(crypt_out[index])) & PH_MASK_4; }
-static int get_hash_5(int index) { return *((ARCH_WORD_32*)(crypt_out[index])) & PH_MASK_5; }
-static int get_hash_6(int index) { return *((ARCH_WORD_32*)(crypt_out[index])) & PH_MASK_6; }
+#define COMMON_GET_HASH_VAR crypt_out
+#include "common-get-hash.h"
 
 static int salt_hash(void *salt)
 {
@@ -408,7 +399,7 @@ static void set_salt(void *salt)
 
 static void set_key(char *key, int index)
 {
-	strnzcpy(saved_key[index], key, PLAINTEXT_LENGTH + 1);
+	strnzcpyn(saved_key[index], key, sizeof(*saved_key));
 }
 
 static char *get_key(int index)
@@ -421,7 +412,7 @@ static int cmp_all(void *binary, int count)
 	int index;
 
 	for (index = 0; index < count; index++)
-		if (*((ARCH_WORD_32*)binary) == *((ARCH_WORD_32*)crypt_out[index]))
+		if (*((uint32_t*)binary) == *((uint32_t*)crypt_out[index]))
 			return 1;
 
 	return 0;
@@ -429,7 +420,7 @@ static int cmp_all(void *binary, int count)
 
 static int cmp_one(void *binary, int index)
 {
-	return *((ARCH_WORD_32*)binary) == *((ARCH_WORD_32*)crypt_out[index]);
+	return *((uint32_t*)binary) == *((uint32_t*)crypt_out[index]);
 }
 
 static int cmp_exact(char *source, int index)
@@ -443,7 +434,7 @@ static int cmp_exact(char *source, int index)
 // md5bit with no conditional logic.
 #define md5bit_2(d,b) (((d[((b)>>3)&0xF]>>((b)&7)))&1)
 
-static inline int
+inline static int
 md5bit(unsigned char *digest, int bit_num)
 {
 	return (((digest[((bit_num)>>3)&0xF]>>((bit_num)&7)))&1);
@@ -460,7 +451,7 @@ md5bit(unsigned char *digest, int bit_num)
 #endif
 }
 
-static inline int
+inline static int
 coin_step(unsigned char *digest, int i, int j, int shift)
 {
 	return md5bit(digest, digest[(digest[i] >> mod5[digest[j]]) & 0x0F] >> ((digest[j] >> (digest[i] & 0x07)) & 0x01)) << shift;
@@ -511,11 +502,6 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 {
 	const int count = *pcount;
 	int idx, group_idx;
-#ifdef _OPENMP
-	int ngroups = OMP_SCALE * omp_get_max_threads();
-#else
-	int ngroups = 1;
-#endif
 	int group_sz = (count + ngroups - 1) / ngroups;
 
 	for (idx = 0; idx < count; ++idx) {
@@ -536,21 +522,18 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 		MD5_Final(data[idx].digest, &data[idx].context);
 	}
 
+/*
+ * We don't use default(none) here because some compilers export
+ * constant_phrase into the parallel region automatically and don't allow
+ * listing it in shared(), whereas some others require listing it in shared(),
+ * and we don't want to drop const from constant_phrase nor are we confident
+ * in getting all per-compiler-version #if's right (especially not for future
+ * versions).  (The same issue with "const int count" we'd work around by
+ * simply dropping the const from there.)
+ */
 #ifdef _OPENMP
-#ifdef __INTEL_COMPILER
-#ifdef SIMD_COEF_32
-#pragma omp parallel for default(none) private(idx) shared(ngroups, group_sz, saved_salt, data, input_buf, input_buf_big, out_buf, constant_phrase)
-#else
-#pragma omp parallel for default(none) private(idx) shared(ngroups, group_sz, saved_salt, data, constant_phrase)
-#endif // SIMD_COEF_32
-#else
-#ifdef SIMD_COEF_32
-#pragma omp parallel for default(none) private(idx) shared(ngroups, group_sz, saved_salt, data, input_buf, input_buf_big, out_buf)
-#else
-#pragma omp parallel for default(none) private(idx) shared(ngroups, group_sz, saved_salt, data)
-#endif // SIMD_COEF_32
-#endif // __INTEL_COMPILER
-#endif // _OPENMP
+#pragma omp parallel for private(idx)
+#endif
 	for (group_idx = 0; group_idx < ngroups; ++group_idx) {
 		int roundasciilen;
 		int round, maxrounds = BASIC_ROUND_COUNT + getrounds(saved_salt);
@@ -697,7 +680,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 					cpo[GETPOS0(k+16)] = roundascii[k];
 				}
 				cpo[GETPOS0(k+16)] = 0x80;
-				((ARCH_WORD_32*)cpo)[14 * SIMD_COEF_32]=((16+roundasciilen)<<3);
+				((uint32_t*)cpo)[14 * SIMD_COEF_32]=((16+roundasciilen)<<3);
 			}
 			/* now do the 'loop' for the small 1-limb blocks. */
 			zs = zs0 = zb = zb0 = 0;
@@ -705,8 +688,8 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 			for (i = 0; i < nsmall-MIN_DROP_BACK; i += BLK_CNT) {
 				for (j = 0; j < BLK_CNT && zs < nsmall; ++j) {
 					pConx px = &data[smalls[zs++]];
-					ARCH_WORD_32 *pi = (ARCH_WORD_32*)px->digest;
-					ARCH_WORD_32 *po = (ARCH_WORD_32*)&input_buf[group_idx][PARAGETPOS(0, j)];
+					uint32_t *pi = (uint32_t*)px->digest;
+					uint32_t *po = (uint32_t*)&input_buf[group_idx][PARAGETPOS(0, j)];
 					/*
 					 * digest is flat, input buf is SSE_COEF.
 					 * input_buf is po (output) here, we are writing to it.
@@ -722,10 +705,10 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 				 * in non linear order, there is no gain trying to keep it in COEF order
 				 */
 				for (j = 0; j < BLK_CNT && zs0 < nsmall; ++j) {
-					ARCH_WORD_32 *pi, *po;
+					uint32_t *pi, *po;
 					pConx px = &data[smalls[zs0++]];
-					pi = (ARCH_WORD_32*)&out_buf[group_idx][PARAGETOUTPOS(0, j)];
-					po = (ARCH_WORD_32*)px->digest;
+					pi = (uint32_t*)&out_buf[group_idx][PARAGETOUTPOS(0, j)];
+					po = (uint32_t*)px->digest;
 					po[0] = pi[0];
 					po[1] = pi[COEF];
 					po[2] = pi[COEF+COEF];
@@ -756,7 +739,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 			for (j = 0; j < BLK_CNT; ++j) {
 				unsigned char *cpo23 = &(input_buf_big[group_idx][23][PARAGETPOS(0, j)]);
 				unsigned char *cpo24 = &(input_buf_big[group_idx][24][PARAGETPOS(0, j)]);
-				*((ARCH_WORD_32*)cpo24) = 0; /* key clean */
+				*((uint32_t*)cpo24) = 0; /* key clean */
 				cpo23[GETPOS0(61)] = roundascii[0];
 				switch(roundasciilen) {
 					case 1:
@@ -794,13 +777,13 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 						cpo24[3] = 0x80;
 						break;
 				}
-				((ARCH_WORD_32*)cpo24)[14*SIMD_COEF_32]=((16+constant_phrase_size+roundasciilen)<<3);
+				((uint32_t*)cpo24)[14*SIMD_COEF_32]=((16+constant_phrase_size+roundasciilen)<<3);
 			}
 			for (i = 0; i < nbig-MIN_DROP_BACK; i += BLK_CNT) {
 				for (j = 0; j < BLK_CNT && zb < nbig; ++j) {
 					pConx px = &data[bigs[zb++]];
-					ARCH_WORD_32 *pi = (ARCH_WORD_32 *)px->digest;
-					ARCH_WORD_32 *po = (ARCH_WORD_32*)&input_buf_big[group_idx][0][PARAGETPOS(0, j)];
+					uint32_t *pi = (uint32_t *)px->digest;
+					uint32_t *po = (uint32_t*)&input_buf_big[group_idx][0][PARAGETPOS(0, j)];
 					/*
 					 * digest is flat, input buf is SSE_COEF.
 					 * input_buf is po (output) here, we are writing to it.
@@ -815,10 +798,10 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 					SIMDmd5body(input_buf_big[group_idx][j], (unsigned int *)out_buf[group_idx], (unsigned int *)out_buf[group_idx], SSEi_RELOAD|SSEi_MIXED_IN);
 
 				for (j = 0; j < BLK_CNT && zb0 < nbig; ++j) {
-					ARCH_WORD_32 *pi, *po;
+					uint32_t *pi, *po;
 					pConx px = &data[bigs[zb0++]];
-					pi = (ARCH_WORD_32*)&out_buf[group_idx][PARAGETOUTPOS(0, j)];
-					po = (ARCH_WORD_32*)px->digest;
+					pi = (uint32_t*)&out_buf[group_idx][PARAGETOUTPOS(0, j)];
+					po = (uint32_t*)px->digest;
 					po[0] = pi[0];
 					po[1] = pi[COEF];
 					po[2] = pi[COEF+COEF];
@@ -935,13 +918,8 @@ struct fmt_main fmt_sunmd5 = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,

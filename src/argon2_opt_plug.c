@@ -11,9 +11,9 @@
  * <http://creativecommons.org/publicdomain/zero/1.0/>.
  */
 
-#ifdef __SSE2__
+#if !defined (JOHN_NO_SIMD) && defined(__SSE2__)
 
-#include "stdint.h"
+#include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -21,7 +21,6 @@
 #include "argon2_opt.h"
 #include "blake2.h"
 #include "blamka-round-opt.h"
-#include "memdbg.h"
 
 /* LEGACY CODE: version 1.2.1 and earlier
 * Function fills a new memory block by overwriting @next_block.
@@ -227,7 +226,7 @@ void argon2_fill_segment(const argon2_instance_t *instance,
             fill_block(state, (uint8_t *)ref_block->v,
                        (uint8_t *)curr_block->v);
         } else {
-            if(0 == position.pass) {
+            if (0 == position.pass) {
                 fill_block(state, (uint8_t *)ref_block->v,
                            (uint8_t *)curr_block->v);
             } else {

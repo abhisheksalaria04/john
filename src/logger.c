@@ -13,8 +13,10 @@
 #ifndef _XOPEN_SOURCE
 #define _XOPEN_SOURCE /* for fileno(3) and fsync(2) */
 #endif
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE /* for strcasestr */
+#endif
 
-#define NEED_OS_FLOCK
 #include "os.h"
 
 #include <stdio.h>
@@ -32,14 +34,12 @@
 #endif
 #include <sys/types.h>
 #include <sys/stat.h>
-#if (!AC_BUILT || HAVE_FCNTL_H)
-#include <fcntl.h>
-#endif
 #include <errno.h>
 #include <time.h>
 #include <stdarg.h>
 #include <string.h>
 #include <signal.h>
+#include <stdlib.h>
 
 #include "arch.h"
 #include "misc.h"
@@ -49,22 +49,19 @@
 #include "status.h"
 #include "options.h"
 #include "config.h"
-#include "options.h"
 #include "recovery.h"
 #include "unicode.h"
 #include "dynamic.h"
-#ifdef HAVE_MPI
-#include "john-mpi.h"
-#endif
+#include "john_mpi.h"
 #include "cracker.h"
 #include "signals.h"
-#include "memdbg.h"
+#include "logger.h"
 
 static int cfg_beep;
 static int cfg_log_passwords;
 static int cfg_showcand;
-static char *LogDateFormat;
-static char *LogDateStderrFormat;
+static const char *LogDateFormat;
+static const char *LogDateStderrFormat;
 static int LogDateFormatUTC=0;
 static char *log_perms;
 static char *pot_perms;
@@ -111,7 +108,66 @@ struct log_file {
 static struct log_file log = {NULL, NULL, NULL, 0, -1};
 static struct log_file pot = {NULL, NULL, NULL, 0, -1};
 
-static int in_logger = 0;
+static char *admin_start, *admin_end, *admin_string, *terminal_reset;
+static char *other_start, *other_end;
+static int in_logger, show_admins;
+
+#if !(__MINGW32__ || _MSC_VER)
+
+/*
+ * Shared helper for locking a file. Caller uses jtr_lock(fd, cmd, type, name)
+ * with fcntl syntax for cmd and type. jtr_lock is actually a macro adding
+ * __FUNCTION__, __FILE__ and __LINE__ to params and calling log_lock.
+ */
+int log_lock(int fd, int cmd, int type, const char *name,
+             const char *function, const char *source_file, int line)
+{
+	struct flock lock;
+
+	memset(&lock, 0, sizeof(lock));
+#ifdef LOCK_DEBUG
+	fprintf(stderr, "%u: %s(): Locking %s (%s, %s)...\n",
+	        NODE, function, name,
+	        type == F_RDLCK ? "F_RDLCK" : type == F_WRLCK ? "F_WRLCK"
+	        : type == F_UNLCK ? "F_UNLCK" : "",
+	        cmd == F_SETLKW ? "F_SETLKW" : cmd == F_SETLK ? "F_SETLK"
+	        : cmd == F_UNLCK ? "F_UNLCK" : "");
+#endif
+
+	lock.l_type = type;
+	while (fcntl(fd, cmd, &lock)) {
+		if (errno == EAGAIN) {
+			static int warned;
+			struct timeval t;
+
+			if (cmd == F_SETLK)
+				return -1;
+
+			if (!warned++) {
+				log_event("Got EAGAIN despite F_SETLKW (only logged once per node) %s:%d %s", source_file, line, function);
+				fprintf(stderr, "Node %d: File locking apparently exhausted, check ulimits and any NFS server limits. This is recoverable but will harm performance (muting further of these messages from same node)\n", NODE);
+				srand(NODE);
+			}
+
+			/* Sleep for a random time of max. ~260 ms */
+			t.tv_sec = 0; t.tv_usec = (rand() & 1023) << 8;
+			select(0, NULL, NULL, NULL, &t);
+			continue;
+		} else if (errno != EINTR)
+			pexit("%s:%d %s() fcntl(%s, %s, %s)",
+			      source_file, line, function, name,
+			      type == F_RDLCK ? "F_RDLCK" : type == F_WRLCK ? "F_WRLCK"
+			      : type == F_UNLCK ? "F_UNLCK" : "",
+			      cmd == F_SETLKW ? "F_SETLKW" : cmd == F_SETLK ? "F_SETLK"
+			      : cmd == F_UNLCK ? "F_UNLCK" : "");
+	}
+
+#ifdef LOCK_DEBUG
+	fprintf(stderr, "%u: %s(): Locked %s\n", NODE, function, name);
+#endif
+	return 0;
+}
+#endif /* !(__MINGW32__ || _MSC_VER) */
 
 static void log_file_init(struct log_file *f, char *name, char *perms, int size)
 {
@@ -163,48 +219,17 @@ static void log_file_flush(struct log_file *f)
 {
 	int count;
 	long int pos_b4 = 0;
-#if FCNTL_LOCKS
-	struct flock lock;
-#endif
 
 	if (f->fd < 0) return;
 
 	count = f->ptr - f->buffer;
 	if (count <= 0) return;
 
-#if OS_FLOCK || FCNTL_LOCKS
-#ifdef LOCK_DEBUG
-	fprintf(stderr, "%s(%u): Locking %s...\n",
-	        __FUNCTION__, options.node_min, f->name);
-#endif
-#if FCNTL_LOCKS
-	memset(&lock, 0, sizeof(lock));
-	lock.l_type = F_WRLCK;
-	while (fcntl(f->fd, F_SETLKW, &lock)) {
-		if (errno != EINTR)
-			pexit("fcntl(F_WRLCK)");
-	}
-#else
-	while (flock(f->fd, LOCK_EX)) {
-		if (errno != EINTR)
-			pexit("flock(LOCK_EX)");
-	}
-#endif
-#ifdef LOCK_DEBUG
-	fprintf(stderr, "%s(%u): Locked %s exclusively\n",
-	        __FUNCTION__, options.node_min, f->name);
-#endif
-#endif
+	jtr_lock(f->fd, F_SETLKW, F_WRLCK, f->name);
 
-	if (f == &pot) {
+	if (f == &pot)
 		pos_b4 = (long int)lseek(f->fd, 0, SEEK_END);
-#if defined(LOCK_DEBUG)
-		fprintf(stderr,
-		        "%s(%u): writing %d at %ld, ending at %ld to file %s\n",
-		        __FUNCTION__, options.node_min, count, pos_b4,
-		        pos_b4+count, f->name);
-#endif
-	}
+
 
 	if (write_loop(f->fd, f->buffer, count) < 0) pexit("write");
 	f->ptr = f->buffer;
@@ -212,19 +237,7 @@ static void log_file_flush(struct log_file *f)
 	if (f == &pot && pos_b4 == crk_pot_pos)
 		crk_pot_pos += count;
 
-#if OS_FLOCK || FCNTL_LOCKS
-#ifdef LOCK_DEBUG
-	fprintf(stderr, "%s(%u): Unlocking %s\n",
-	        __FUNCTION__, options.node_min, f->name);
-#endif
-#if FCNTL_LOCKS
-	lock.l_type = F_UNLCK;
-	fcntl(f->fd, F_SETLK, &lock);
-#else
-	if (flock(f->fd, LOCK_UN))
-		pexit("flock(LOCK_UN)");
-#endif
-#endif
+	jtr_lock(f->fd, F_SETLK, F_UNLCK, f->name);
 
 #ifdef SIGUSR2
 	/* We don't really send a sync trigger "at crack" but
@@ -271,7 +284,7 @@ static void log_file_fsync(struct log_file *f)
 	if (f->fd < 0) return;
 
 	log_file_flush(f);
-#if HAVE_WINDOWS_H==0
+#if !HAVE_WINDOWS_H
 	if (fsync(f->fd)) pexit("fsync");
 #endif
 }
@@ -299,7 +312,7 @@ static int log_time(void)
 
 	Time = pot.fd >= 0 ? status_get_time() : status_restored_time;
 
-	if (LogDateFormat) {
+	if (LogDateFormat && *LogDateFormat) {
 		struct tm *t_m;
 		char Buf[128];
 		time_t t;
@@ -322,7 +335,7 @@ static int log_time(void)
 	if (options.fork || mpi_p > 1) {
 #endif
 		count2 = (int)sprintf(log.ptr + count1,
-		                      "%u ", options.node_min);
+		                      "%u ", NODE);
 		if (count2 < 0)
 			return count2;
 		count1 += count2;
@@ -337,9 +350,49 @@ static int log_time(void)
 	return count1 + count2;
 }
 
+/*
+ * Change of "^" in passed string to ANSI Escape.
+ * If input is a NULL pointer or feature is disabled, return a null string.
+ */
+static char *parse_esc(const char *string)
+{
+	char *out = str_alloc_copy(string);
+	char *s = out;
+
+	if (!show_admins || !s)
+		return "";
+
+	while (*s) {
+		if (*s == '^')
+			*s = 0x1b;
+		s++;
+	}
+
+	return out;
+}
+
 void log_init(char *log_name, char *pot_name, char *session)
 {
 	in_logger = 1;
+
+	show_admins = cfg_get_bool(SECTION_OPTIONS, NULL, "MarkAdminCracks", 0);
+
+	if (isatty(fileno(stdout))) {
+		admin_start = parse_esc(cfg_get_param(SECTION_OPTIONS, NULL,
+		                                      "MarkAdminStart"));
+		admin_end = parse_esc(cfg_get_param(SECTION_OPTIONS, NULL,
+		                                    "MarkAdminEnd"));
+		other_start = parse_esc(cfg_get_param(SECTION_OPTIONS, NULL,
+		                                      "MarkOtherStart"));
+		other_end = parse_esc(cfg_get_param(SECTION_OPTIONS, NULL,
+		                                    "MarkOtherEnd"));
+		terminal_reset = parse_esc(cfg_get_param(SECTION_OPTIONS, NULL,
+		                                         "TerminalReset"));
+	} else
+		admin_start = admin_end = other_start = other_end = terminal_reset = "";
+
+	admin_string = parse_esc(cfg_get_param(SECTION_OPTIONS, NULL,
+	                                       "MarkAdminString"));
 
 	if (log_name && log.fd < 0) {
 		if (session)
@@ -361,7 +414,7 @@ void log_init(char *log_name, char *pot_name, char *session)
 				}
 			}
 		}
-		if (!(log_perms = cfg_get_param(SECTION_OPTIONS, NULL,
+		if (!(log_perms = (char*)cfg_get_param(SECTION_OPTIONS, NULL,
 						"LogFilePermissions")))
 			log_perms = "0600";
 
@@ -369,7 +422,7 @@ void log_init(char *log_name, char *pot_name, char *session)
 	}
 
 	if (pot_name && pot.fd < 0) {
-                if (!(pot_perms = cfg_get_param(SECTION_OPTIONS, NULL,
+                if (!(pot_perms = (char*)cfg_get_param(SECTION_OPTIONS, NULL,
 						"PotFilePermissions")))
 			pot_perms = "0600";
 
@@ -419,15 +472,61 @@ static char *components(char *string, int len)
 	return out;
 }
 
+/* Quick'n'dirty guess of whether user is an administrator or not */
+static int is_admin(char *login, char *uid)
+{
+	if (login) {
+		char *s;
+
+		if (strcasestr(login, "admin") || strcasestr(login, "root") ||
+		    strcasestr(login, "super") || strcasestr(login, "sysadm") ||
+		    !strcasecmp(login, "toor") || !strcasecmp(login, "sa"))
+			return 1;
+
+		/* Avoid false positives for this short substring */
+		if ((s = strcasestr(login, "adm"))) {
+			char c;
+
+			if (s > login) {
+				c = s[-1];
+
+				if (c < 'A' || c > 'z' ||
+				    (c > 'Z' && c < 'a'))
+					return 1;
+			}
+
+			c = s[3];
+			if (c < 'A' || c > 'z' || (c > 'Z' && c < 'a'))
+				return 1;
+		}
+	}
+
+	if (!uid)
+		return 0;
+
+	if (!strcmp(uid, "0"))
+		return 1;
+
+	if (!options.format || !strncasecmp(options.format, "nt", 2) ||
+	    !strncasecmp(options.format, "lm", 2))
+		if (!strcmp(uid, "500"))
+			return 1;
+
+	return 0;
+}
+
+#define ADM_START admin ? admin_start : other_start
+#define ADM_END   admin ? admin_end : other_end
+
 void log_guess(char *login, char *uid, char *ciphertext, char *rep_plain,
                char *store_plain, char field_sep, int index)
 {
 	int count1, count2;
 	int len;
-	char spacer[] = "                ";
 	char *secret = "";
 	char uid_sep[2] = { 0 };
 	char *uid_out = "";
+	int admin = is_admin(login, uid);
 
 /* This is because printf("%-16s") does not line up multibyte UTF-8.
    We need to count characters, not octets. */
@@ -441,16 +540,19 @@ void log_guess(char *login, char *uid, char *ciphertext, char *rep_plain,
 		uid_out = uid;
 	}
 
-	if (options.verbosity > 1) {
+	if (options.verbosity > 2 || (admin && options.verbosity > 1)) {
 		if (options.secure) {
 			secret = components(rep_plain, len);
-			printf("%-16s (%s%s%s)\n",
-			       secret, login, uid_sep, uid_out);
+			printf("%-16s (%s%s%s%s%s)     \n", secret,
+			       ADM_START, login, uid_sep, uid_out, ADM_END);
 		} else {
+			char spacer[] = "                ";
+
 			spacer[len > 16 ? 0 : 16 - len] = 0;
 
-			printf("%s%s (%s%s%s)\n",
-			       rep_plain, spacer, login, uid_sep, uid_out);
+			printf("%s%s%s%s (%s%s%s%s%s%s)     \n", ADM_START, rep_plain, ADM_END,
+			       spacer, ADM_START, login, ADM_END,
+			       uid_sep, uid_out, terminal_reset);
 
 			if (options.fork)
 				fflush(stdout);
@@ -493,12 +595,13 @@ void log_guess(char *login, char *uid, char *ciphertext, char *rep_plain,
 			if (cfg_log_passwords)
 				count2 += (int)sprintf(log.ptr + count2,
 				                       ": %s", rep_plain);
+			if (admin && *admin_string)
+				count2 += (int)sprintf(log.ptr + count2,
+				                       " %s", admin_string);
 			if (cfg_showcand)
 				count2 += (int)sprintf(log.ptr + count2,
-				                       " as candidate #"LLu"",
-				                       ((unsigned long long)
-				                       status.cands.hi << 32) +
-				                       status.cands.lo +
+				                       " as candidate #%"PRIu64,
+				                       status.cands +
 				                       index + 1);
 			count2 += (int)sprintf(log.ptr + count2, "\n");
 
@@ -527,10 +630,10 @@ void log_event(const char *format, ...)
 	va_list args;
 	int count1, count2;
 
-	if (options.flags & FLG_LOG_STDERR) {
+	if (options.log_stderr) {
 		unsigned int Time;
 
-		if (LogDateStderrFormat) {
+		if (LogDateStderrFormat && *LogDateStderrFormat) {
 			struct tm *t_m;
 			char Buf[128];
 			time_t t;
@@ -549,7 +652,7 @@ void log_event(const char *format, ...)
 #else
 		if (options.fork || mpi_p > 1)
 #endif
-			fprintf(stderr, "%u ", options.node_min);
+			fprintf(stderr, "%u ", NODE);
 
 		Time = pot.fd >= 0 ? status_get_time() : status_restored_time;
 

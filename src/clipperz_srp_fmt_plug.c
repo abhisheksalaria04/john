@@ -49,23 +49,23 @@
  * n = 125617018995153554710546479714086468244499594888726646874671447258204721048803
  * g = 2 */
 
+#if AC_BUILT
+#include "autoconfig.h"
+#endif
+
+#if !AC_BUILT && !__MIC__
+#define HAVE_LIBGMP 1 /* legacy build uses libgmp by default, except for MIC */
+#endif
+
+#if HAVE_LIBGMP || HAVE_LIBCRYPTO /* we need one of these for bignum */
+
 #if FMT_EXTERNS_H
 extern struct fmt_main fmt_clipperz;
 #elif FMT_REGISTERS_H
 john_register_one(&fmt_clipperz);
 #else
 
-#if AC_BUILT
-/* need to know if HAVE_LIBGMP is set, for autoconfig build */
-#include "autoconfig.h"
-#endif
-
 #include <string.h>
-#include "sha2.h"
-#include "arch.h"
-#include "params.h"
-#include "common.h"
-#include "formats.h"
 #ifdef HAVE_LIBGMP
 #if HAVE_GMP_GMP_H
 #include <gmp/gmp.h>
@@ -77,22 +77,24 @@ john_register_one(&fmt_clipperz);
 #include <openssl/bn.h>
 #define EXP_STR " oSSL-exp"
 #endif
-#include "johnswap.h"
+
 #ifdef _OPENMP
 #include <omp.h>
-#ifndef OMP_SCALE
-#define OMP_SCALE               64
 #endif
-#endif
-#include "memdbg.h"
 
+#include "sha2.h"
+#include "arch.h"
+#include "params.h"
+#include "common.h"
+#include "formats.h"
+#include "johnswap.h"
 
 #define FORMAT_LABEL		"Clipperz"
 #define FORMAT_NAME		"SRP"
 #define ALGORITHM_NAME		"SHA256 32/" ARCH_BITS_STR EXP_STR
 
 #define BENCHMARK_COMMENT	""
-#define BENCHMARK_LENGTH	-1
+#define BENCHMARK_LENGTH	0x107
 
 #define CLIPPERZSIG		"$clipperz$"
 #define CLIPPERZSIGLEN		(sizeof(CLIPPERZSIG)-1)
@@ -106,8 +108,12 @@ john_register_one(&fmt_clipperz);
 #define SALT_ALIGN		1
 #define USERNAMELEN             32
 
+#ifndef OMP_SCALE
+#define OMP_SCALE               256 // MKPC & scale tuned for i7
+#endif
+
 #define MIN_KEYS_PER_CRYPT	1
-#define MAX_KEYS_PER_CRYPT	4
+#define MAX_KEYS_PER_CRYPT	2
 
 #define SZ 				128
 
@@ -135,7 +141,7 @@ static char (*saved_key)[PLAINTEXT_LENGTH + 1];
 // BN_bn2bin sometimes tries to write 33 bytes, hence allow some padding!
 // that is because these are mod 0x115B8B692E0E045692CF280B436735C77A5A9E8A9E7ED56C965F87DB5B2A2ECE3
 // which is a 65 hex digit number (33 bytes long).
-static ARCH_WORD_32 (*crypt_out)[(FULL_BINARY_SIZE/4) + 1];
+static uint32_t (*crypt_out)[(FULL_BINARY_SIZE/4) + 1];
 
 static struct custom_salt {
 	unsigned char saved_salt[SZ];
@@ -147,12 +153,9 @@ static int max_keys_per_crypt;
 static void init(struct fmt_main *self)
 {
 	int i;
-#if defined (_OPENMP)
-	int omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
+
+	omp_autotune(self, OMP_SCALE);
+
 	saved_key = mem_calloc_align(sizeof(*saved_key),
 			self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
 	crypt_out = mem_calloc_align(sizeof(*crypt_out), self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
@@ -265,7 +268,7 @@ static void *get_binary(char *ciphertext)
 {
 	static union {
 		unsigned char c[FULL_BINARY_SIZE];
-		ARCH_WORD_32 dummy[1];
+		uint32_t dummy[1];
 	} buf;
 	unsigned char *out = buf.c;
 	char *p, *q;
@@ -312,13 +315,8 @@ static void *get_salt(char *ciphertext)
 	return (void *)&cs;
 }
 
-static int get_hash_0(int index)       { return crypt_out[index][0] & PH_MASK_0; }
-static int get_hash_1(int index)       { return crypt_out[index][0] & PH_MASK_1; }
-static int get_hash_2(int index)       { return crypt_out[index][0] & PH_MASK_2; }
-static int get_hash_3(int index)       { return crypt_out[index][0] & PH_MASK_3; }
-static int get_hash_4(int index)       { return crypt_out[index][0] & PH_MASK_4; }
-static int get_hash_5(int index)       { return crypt_out[index][0] & PH_MASK_5; }
-static int get_hash_6(int index)       { return crypt_out[index][0] & PH_MASK_6; }
+#define COMMON_GET_HASH_VAR crypt_out
+#include "common-get-hash.h"
 
 static int salt_hash(void *salt)
 {
@@ -355,7 +353,7 @@ static char *get_key(int index)
 	return saved_key[index];
 }
 
-static inline void hex_encode(unsigned char *str, int len, unsigned char *out)
+inline static void hex_encode(unsigned char *str, int len, unsigned char *out)
 {
 	int i;
 	for (i = 0; i < len; ++i) {
@@ -444,14 +442,14 @@ static int cmp_all(void *binary, int count)
 {
 	int i;
 	for (i = 0; i < count; ++i) {
-		if (*((ARCH_WORD_32*)binary) == *((ARCH_WORD_32*)(crypt_out[i])))
+		if (*((uint32_t*)binary) == *((uint32_t*)(crypt_out[i])))
 			return 1;
 	}
 	return 0;
 }
 static int cmp_one(void *binary, int index)
 {
-	return *((ARCH_WORD_32*)binary) == *((ARCH_WORD_32*)(crypt_out[index]));
+	return *((uint32_t*)binary) == *((uint32_t*)(crypt_out[index]));
 }
 
 static int cmp_exact(char *source, int index)
@@ -506,13 +504,8 @@ struct fmt_main fmt_clipperz = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,
@@ -521,3 +514,4 @@ struct fmt_main fmt_clipperz = {
 };
 
 #endif /* plugin stanza */
+#endif /* HAVE_LIBGMP || HAVE_LIBCRYPTO */

@@ -17,7 +17,7 @@
 #include "arch.h"
 #include "common.h"
 #include "MD5_std.h"
-#include "cryptmd5_common.h"
+#include "md5crypt_common.h"
 
 #if MD5_std_mt
 #include <omp.h>
@@ -29,7 +29,6 @@ static int salt_changed;
 #else
 MD5_std_combined CC_CACHE_ALIGN MD5_std_all;
 #endif
-#include "memdbg.h"
 
 #if !MD5_IMM
 static const MD5_data MD5_data_init = {

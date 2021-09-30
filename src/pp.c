@@ -30,7 +30,7 @@
 #include "autoconfig.h"
 #else
 #include <sys/mman.h>
-#define _GNU_SOURCE
+#define _GNU_SOURCE 1
 #define _FILE_OFFSET_BITS 64
 #define __USE_MINGW_ANSI_STDIO 1
 #ifdef __SIZEOF_INT128__
@@ -41,11 +41,7 @@
 #if HAVE_LIBGMP || HAVE_INT128 || HAVE___INT128 || HAVE___INT128_T
 
 #include <stdio.h>
-#ifndef JTR_MODE
 #include <stdint.h>
-#else
-#include "stdint.h"
-#endif
 #include <stdlib.h>
 #if !AC_BUILT
 #include <string.h>
@@ -70,18 +66,6 @@
 #endif
 #include <ctype.h>
 #include <signal.h>
-
-#if _MSC_VER || __MINGW32__ || __MINGW64__ || __CYGWIN__ || HAVE_WINDOWS_H
-#include "win32_memmap.h"
-#undef MEM_FREE
-#if !defined(__CYGWIN__) && !defined(__MINGW64__)
-#include "mmap-windows.c"
-#endif /* __CYGWIN */
-#endif /* _MSC_VER ... */
-
-#if defined(HAVE_MMAP)
-#include <sys/mman.h>
-#endif
 
 #if HAVE_INT128 || HAVE___INT128 || HAVE___INT128_T
 #include "mpz_int128.h"
@@ -122,6 +106,8 @@
 #include "common.h"
 #include "path.h"
 #include "signals.h"
+#include "mem_map.h"
+#include "memory.h"
 #include "loader.h"
 #include "logger.h"
 #include "status.h"
@@ -130,14 +116,12 @@
 #include "external.h"
 #include "cracker.h"
 #include "john.h"
-#include "memory.h"
 #include "unicode.h"
 #include "prince.h"
 #include "rpp.h"
 #include "rules.h"
 #include "mask.h"
 #include "regex.h"
-#include "memdbg.h"
 
 #define _STR_VALUE(arg) #arg
 #define STR_MACRO(n)    _STR_VALUE(n)
@@ -148,8 +132,7 @@ int prince_wl_max;
 char *prince_skip_str;
 char *prince_limit_str;
 
-extern int rpp_real_run; /* set to 1 when we really get into prince mode */
-
+static double progress;
 static char *mem_map, *map_pos, *map_end;
 #if HAVE_REXGEN
 static char *regex_alpha;
@@ -160,9 +143,7 @@ static char *regex;
 #else
 
 #undef MIN
-#define MIN(a,b) (((a) < (b)) ? (a) : (b))
 #undef MAX
-#define MAX(a,b) (((a) > (b)) ? (a) : (b))
 
 #endif
 
@@ -187,6 +168,11 @@ static char *regex;
 #define ALLOC_NEW_DUPES  0x100000
 
 #define ENTRY_END_HASH   0xFFFFFFFF
+
+#ifndef JTR_MODE
+#define MIN(a,b) (((a) < (b)) ? (a) : (b))
+#define MAX(a,b) (((a) > (b)) ? (a) : (b))
+#endif
 
 typedef uint8_t  u8;
 typedef uint16_t u16;
@@ -465,7 +451,11 @@ static void check_realloc_elems (db_entry_t *db_entry)
 
     if (db_entry->elems_buf == NULL)
     {
+#ifdef JTR_MODE
       fprintf (stderr, "Out of memory trying to allocate "Zu" bytes\n", (size_t) elems_alloc_new * sizeof (elem_t));
+#else
+      fprintf (stderr, "Out of memory trying to allocate %zu bytes\n", (size_t) elems_alloc_new * sizeof (elem_t));
+#endif
 
 #ifndef JTR_MODE
       exit (-1);
@@ -492,7 +482,11 @@ static void check_realloc_chains (db_entry_t *db_entry)
 
     if (db_entry->chains_buf == NULL)
     {
+#ifdef JTR_MODE
       fprintf (stderr, "Out of memory trying to allocate "Zu" bytes\n", (size_t) chains_alloc_new * sizeof (chain_t));
+#else
+      fprintf (stderr, "Out of memory trying to allocate %zu bytes\n", (size_t) chains_alloc_new * sizeof (chain_t));
+#endif
 
 #ifndef JTR_MODE
       exit (-1);
@@ -830,7 +824,7 @@ static void add_uniq (db_entry_t *db_entry, char *input_buf, int input_len)
 mpz_t save;
 
 #ifndef JTR_MODE
-static void catch_int ()
+static void catch_int (int signum)
 {
   FILE *fp = fopen (SAVE_FILE, "w");
 
@@ -842,7 +836,7 @@ static void catch_int ()
 
   fclose (fp);
 
-  exit (0);
+  exit (signum==0?0:signum);
 }
 
 int main (int argc, char *argv[])
@@ -859,22 +853,22 @@ static void save_state(FILE *file)
   mpz_t half; mpz_init(half);
 
   mpz_fdiv_r_2exp(half, rec_pos, 64); // lower 64 bits
-  fprintf(file, ""LLu"\n", (unsigned long long)mpz_get_ui(half));
+  fprintf(file, "%"PRIu64"\n", (uint64_t)mpz_get_ui(half));
 
   mpz_fdiv_q_2exp(half, rec_pos, 64); // upper 64 bits
-  fprintf(file, ""LLu"\n", (unsigned long long)mpz_get_ui(half));
+  fprintf(file, "%"PRIu64"\n", (uint64_t)mpz_get_ui(half));
 }
 
 static int restore_state(FILE *file)
 {
-  unsigned long long temp;
+  uint64_t temp;
   mpz_t hi;
 
-  if (fscanf(file, ""LLu"\n", &temp) != 1)
+  if (fscanf(file, "%"PRIu64"\n", &temp) != 1)
     return 1;
   mpz_set_ui(rec_pos, temp);
 
-  if (fscanf(file, ""LLu"\n", &temp) != 1)
+  if (fscanf(file, "%"PRIu64"\n", &temp) != 1)
     return 1;
   mpz_init_set_ui(hi, temp);
   mpz_mul_2exp(hi, hi, 64); // hi = temp << 64
@@ -901,7 +895,6 @@ void pp_hybrid_fix_state(void)
 
 static double get_progress(void)
 {
-  static double progress;
   mpf_t fpos, perc;
 
   if (rec_pos_destroyed)
@@ -910,7 +903,7 @@ static double get_progress(void)
   mpf_init(fpos); mpf_init(perc);
 
   mpf_set_z(fpos, rec_pos);
-  if (0 != mpf_sgn(count))
+  if (mpf_sgn(count))
     mpf_div(perc, fpos, count);
   progress = 100.0 * mpf_get_d(perc);
 
@@ -939,11 +932,24 @@ static int get_bits(mpz_t *op)
   return b;
 }
 
-/* There should be legislation against adding a BOM to UTF-8 */
-static MAYBE_INLINE char *skip_bom(char *string)
+/*
+ * There should be legislation against adding a BOM to UTF-8, not to
+ * mention calling UTF-16 a "text file".
+ */
+static MAYBE_INLINE char *check_bom(char *string)
 {
+  static int warned;
+
+  if (((unsigned char*)string)[0] < 0xef)
+    return string;
   if (!memcmp(string, "\xEF\xBB\xBF", 3))
     string += 3;
+  if (options.input_enc == UTF_8 &&
+      (!memcmp(string, "\xFE\xFF", 2) || !memcmp(string, "\xFF\xFE", 2))) {
+    if (john_main_process && !warned++)
+      fprintf(stderr, "Warning: UTF-16 BOM seen in wordlist.\n");
+    string += 2;
+  }
   return string;
 }
 
@@ -967,7 +973,7 @@ static MAYBE_INLINE char *mgets(int *len)
   return pos;
 }
 
-void do_prince_crack(struct db_main *db, char *wordlist, int rules)
+void do_prince_crack(struct db_main *db, const char *wordlist, int rules)
 #endif
 {
   mpz_t pw_ks_pos[OUT_LEN_MAX + 1];
@@ -1063,8 +1069,8 @@ void do_prince_crack(struct db_main *db, char *wordlist, int rules)
       case IDX_CASE_PERMUTE:          case_permute      = 1;              break;
       case IDX_DUPE_CHECK_DISABLE:    dupe_check        = 0;              break;
       case IDX_SAVE_POS_DISABLE:      save_pos          = 0;              break;
-      case IDX_SKIP:                  mpz_set_str (skip,  optarg, 0);     break;
-      case IDX_LIMIT:                 mpz_set_str (limit, optarg, 0);     break;
+      case IDX_SKIP:                  mpz_set_str (skip,  optarg, 10);    break;
+      case IDX_LIMIT:                 mpz_set_str (limit, optarg, 10);    break;
       case IDX_OUTPUT_FILE:           output_file       = optarg;         break;
 
       default: return (-1);
@@ -1175,23 +1181,28 @@ void do_prince_crack(struct db_main *db, char *wordlist, int rules)
   setmode (fileno (stdout), O_BINARY);
   #endif
 #else
-  char last_buf[PLAINTEXT_BUFFER_SIZE] = "\r";
-  char *last = last_buf;
+  union {
+    char buffer[LINE_BUFFER_SIZE];
+    ARCH_WORD dummy;
+  } aligned;
+  char *last = aligned.buffer;
   int loopback = (options.flags & FLG_PRINCE_LOOPBACK) ? 1 : 0;
-  int our_fmt_len = db->format->params.plaintext_length - mask_add_len;
+  int mask_mult = MAX(1, mask_num_qw);
+  int our_fmt_len = (db->format->params.plaintext_length + ((mask_mult - 1) * mask_add_len)) / mask_mult - mask_add_len;
 
   dupe_check = (options.flags & FLG_DUPESUPP) ? 1 : 0;
 
-  log_event("Proceeding with PRINCE (" REALGMP " version)%s",
-            loopback ? " in loopback mode" : "");
+  if (john_main_process)
+    log_event("Proceeding with PRINCE (" REALGMP " version)%s",
+              loopback ? " in loopback mode" : "");
 
-  /* This mode defaults to length 16 (unless lowered by format) */
-  pw_min = MAX(PW_MIN, options.req_minlength);
+  /* This mode defaults to length 16 (unless lowered by format)... */
+  pw_min = MAX(PW_MIN, options.eff_minlength);
   pw_max = MIN(PW_MAX, our_fmt_len);
 
-  /* ...but can be bumped using -max-len */
+  /* ...but can be bumped or decreased using -max-len */
   if (options.req_maxlength)
-    pw_max = options.req_maxlength;
+    pw_max = options.eff_maxlength;
 
 #if HAVE_REXGEN
   /* Hybrid regex */
@@ -1204,11 +1215,6 @@ void do_prince_crack(struct db_main *db, char *wordlist, int rules)
       our_fmt_len--;
   }
 #endif
-
-  if (mask_num_qw > 1) {
-    pw_min /= MIN(PW_MIN, mask_num_qw);
-    pw_max /= mask_num_qw;
-  }
 
   if (pw_max > OUT_LEN_MAX)
   {
@@ -1285,14 +1291,34 @@ void do_prince_crack(struct db_main *db, char *wordlist, int rules)
 
   /* If we did not give a name for wordlist mode, we use one from john.conf */
   if (!wordlist)
-  if (!(wordlist = cfg_get_param(SECTION_PRINCE, NULL, "Wordlist")))
-  if (!(wordlist = cfg_get_param(SECTION_OPTIONS, NULL, "Wordlist")))
+  if (!(wordlist =
+        cfg_get_param(SECTION_PRINCE, NULL, "Wordlist")) || !*wordlist)
+  if (!(wordlist =
+        cfg_get_param(SECTION_OPTIONS, NULL, "Wordlist")) || !*wordlist)
     wordlist = options.wordlist = WORDLIST_NAME;
 
-	if (rec_restored && john_main_process)
-    fprintf(stderr, "Proceeding with prince%c%s\n",
+  if (rec_restored && john_main_process) {
+    fprintf(stderr, "Proceeding with prince%c%s",
             loopback ? '-' : ':',
             loopback ? "loopback" : path_expand(wordlist));
+    if (options.flags & FLG_RULES_CHK) {
+      if (options.rule_stack)
+        fprintf(stderr, ", rules:(%s x %s)",
+                options.activewordlistrules, options.rule_stack);
+      else
+        fprintf(stderr, ", rules:%s", options.activewordlistrules);
+    }
+    if (options.flags & FLG_MASK_CHK)
+      fprintf(stderr, ", hybrid mask:%s", options.mask ?
+              options.mask : options.eff_mask);
+    if (!options.activewordlistrules && options.rule_stack)
+      fprintf(stderr, ", rules-stack:%s", options.rule_stack);
+    if (options.req_minlength >= 0 || options.req_maxlength)
+      fprintf(stderr, ", lengths: %d-%d",
+              options.eff_minlength + mask_add_len,
+              pw_max + mask_add_len);
+    fprintf(stderr, "\n");
+  }
 
   log_event("- Wordlist file: %.100s", path_expand(wordlist));
   log_event("- Will generate candidates of length %d - %d", pw_min, pw_max);
@@ -1317,12 +1343,15 @@ void do_prince_crack(struct db_main *db, char *wordlist, int rules)
       error();
     }
 
-  /* rules.c honors -min/max-len options on its own */
-    rules_init(options.internal_cp == options.target_enc ?
-               pw_max : db->format->params.plaintext_length);
+    rules_init(db, pw_max);
     rule_count = rules_count(&ctx, -1);
 
-    log_event("- %d preprocessed word mangling rules", rule_count);
+    if (rules_stacked_after)
+      log_event("- Total %u (%d x %u) preprocessed word mangling rules",
+                rule_count * crk_stacked_rule_count,
+                rule_count, crk_stacked_rule_count);
+    else
+      log_event("- %d preprocessed word mangling rules", rule_count);
 
     list_init(&rule_list);
 
@@ -1336,22 +1365,18 @@ void do_prince_crack(struct db_main *db, char *wordlist, int rules)
         list_add(rule_list, rule);
         active_rules++;
 
-        if (options.verbosity >= VERB_LEGACY)
-        {
-          if (strcmp(prerule, rule))
-            log_event("- Rule #%d: '%.100s' accepted as '%.100s'",
-                      rule_number + 1, prerule, rule);
-          else
-            log_event("- Rule #%d: '%.100s' accepted",
-                      rule_number + 1, prerule);
-        }
-      } else {
-        if (options.verbosity >= VERB_LEGACY)
-          log_event("- Rule #%d: '%.100s' rejected",
+        if (strcmp(prerule, rule))
+          log_event("- Rule #%d: '%.100s' accepted as '%.100s'",
+                    rule_number + 1, prerule, rule);
+        else
+          log_event("- Rule #%d: '%.100s' accepted",
                     rule_number + 1, prerule);
-      }
+      } else if (strncmp(prerule, "!!", 2))
+        log_event("- Rule #%d: '%.100s' rejected",
+                  rule_number + 1, prerule);
 
-      if (!(rule = rpp_next(&ctx))) break;
+      if (!(rule = rpp_next(&ctx)))
+        break;
       rule_number++;
     } while (rules);
 
@@ -1478,6 +1503,9 @@ void do_prince_crack(struct db_main *db, char *wordlist, int rules)
   FILE *read_fp;
   uint64_t file_len;
   int warn = cfg_get_bool(SECTION_OPTIONS, NULL, "WarnEncoding", 0);
+#ifdef HAVE_MMAP
+  int mmap_max = cfg_get_int(SECTION_OPTIONS, NULL, "WordlistMemoryMapMaxSize");
+#endif
 
   if (!john_main_process)
     warn = 0;
@@ -1500,7 +1528,12 @@ void do_prince_crack(struct db_main *db, char *wordlist, int rules)
   }
 
 #ifdef HAVE_MMAP
-  if (options.flags & FLG_PRINCE_MMAP)
+  if (mmap_max == -1)
+  {
+    mmap_max = 1 << 20;
+  }
+  if (options.flags & FLG_PRINCE_MMAP &&
+      mmap_max && mmap_max >= (file_len >> 20))
   {
     log_event("- Memory mapping wordlist ("LLd" bytes)",
               (long long)file_len);
@@ -1608,7 +1641,7 @@ void do_prince_crack(struct db_main *db, char *wordlist, int rules)
     if (!strncmp(input_buf, "#!comment", 9))
       continue;
 
-    char *line = skip_bom(input_buf);
+    char *line = check_bom(input_buf);
 
     if (!mem_map)
       input_len = in_superchop (input_buf);
@@ -1661,8 +1694,13 @@ void do_prince_crack(struct db_main *db, char *wordlist, int rules)
     {
       const char old_c = input_buf[0];
 
+#ifdef JTR_MODE
       const char new_cu = toupper (ARCH_INDEX(old_c));
       const char new_cl = tolower (ARCH_INDEX(old_c));
+#else
+      const char new_cu = toupper (old_c);
+      const char new_cl = tolower (old_c);
+#endif
 
       if (old_c != new_cu)
       {
@@ -1934,8 +1972,6 @@ void do_prince_crack(struct db_main *db, char *wordlist, int rules)
 
   mpf_set_z(count, total_ks_cnt);
   mpf_mul_ui(count, count, rule_count);
-  if (mask_tot_cand)
-    mpf_mul_ui(count, count, mask_tot_cand);
 
   crk_init(db, fix_state, NULL);
 #endif
@@ -2265,7 +2301,7 @@ void do_prince_crack(struct db_main *db, char *wordlist, int rules)
                   break;
                 pp_hybrid_fix_state();
               } else
-              if (options.mask) {
+              if (options.flags & FLG_MASK_CHK) {
                 if ((jtr_done = do_mask_crack(pw_buf)))
                   break;
               } else
@@ -2298,7 +2334,7 @@ void do_prince_crack(struct db_main *db, char *wordlist, int rules)
                       break;
                     pp_hybrid_fix_state();
                   } else
-                  if (options.mask) {
+                  if (options.flags & FLG_MASK_CHK) {
                     if ((jtr_done = do_mask_crack(word)))
                       break;
                   } else
@@ -2371,7 +2407,7 @@ void do_prince_crack(struct db_main *db, char *wordlist, int rules)
 
   if (save_pos)
   {
-    catch_int ();
+    catch_int (0);
   }
 #endif
 
@@ -2383,7 +2419,10 @@ void do_prince_crack(struct db_main *db, char *wordlist, int rules)
   log_event("PRINCE done. Cleaning up.");
 
   if (!event_abort)
-      mpz_set(rec_pos, total_ks_cnt);
+  {
+    progress = 100.0;
+    mpz_set(rec_pos, total_ks_cnt);
+  }
 #endif
   mpz_clear (iter_max);
   mpz_clear (total_ks_cnt);

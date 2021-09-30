@@ -20,235 +20,248 @@ indent_style = space
 indent_size = 4
 
 [doc/*]
-indent_size = 8
+tab_width = 8
 
 # Hashcat guys don't understand the beauty of tabs
 [pp.[ch]]
 indent_style = space
 indent_size = 2
 
-# Core files do use a tab size of 8
+[7z2john.pl]
+indent_style = space
+indent_size = 2
+
+# M4 is a bastard
+[*.{ac,m4}]
+indent_style = space
+indent_size = 2
+
+# Core files best keeping a tab size of 8
 [*.{S,sh}]
 indent_size = 8
 
-[AFS_fmt.[ch]]
+[AFS_fmt.h]
 indent_size = 8
 
-[BF_fmt.[ch]]
+[BF_fmt.h]
 indent_size = 8
 
-[BF_std.[ch]]
+[BF_std.h]
 indent_size = 8
 
-[BSDI_fmt.[ch]]
+[BSDI_fmt.h]
 indent_size = 8
 
-[DES_bs.[ch]]
+[DES_bs.h]
 indent_size = 8
 
-[DES_bs_b.[ch]]
+[DES_bs_b.h]
 indent_size = 8
 
-[DES_fmt.[ch]]
+[DES_fmt.h]
 indent_size = 8
 
-[DES_std.[ch]]
+[DES_std.h]
 indent_size = 8
 
-[LM_fmt.[ch]]
+[LM_fmt.h]
 indent_size = 8
 
-[MD5_fmt.[ch]]
+[MD5_fmt.h]
 indent_size = 8
 
-[MD5_std.[ch]]
+[MD5_std.h]
 indent_size = 8
 
-[alpha.[ch]]
+[alpha.h]
 indent_size = 8
 
-[arm32le.[ch]]
+[arm32le.h]
 indent_size = 8
 
-[batch.[ch]]
+[batch.h]
 indent_size = 8
 
-[bench.[ch]]
+[bench.h]
 indent_size = 8
 
 [best.*]
 indent_size = 8
 
-[c3_fmt.[ch]]
+[c3_fmt.h]
 indent_size = 8
 
-[charset.[ch]]
+[charset.h]
 indent_size = 8
 
-[common.[ch]]
+[common.h]
 indent_size = 8
 
-[compiler.[ch]]
+[compiler.h]
 indent_size = 8
 
-[config.[ch]]
+[config.h]
 indent_size = 8
 
-[cracker.[ch]]
+[cracker.h]
 indent_size = 8
 
-[crc32.[ch]]
+[crc32.h]
 indent_size = 8
 
-[detect.[ch]]
+[detect.h]
 indent_size = 8
 
-[dummy.[ch]]
+[dummy.h]
 indent_size = 8
 
-[external.[ch]]
+[external.h]
 indent_size = 8
 
-[formats.[ch]]
+[formats.h]
 indent_size = 8
 
-[getopt.[ch]]
+[getopt.h]
 indent_size = 8
 
-[ia64.[ch]]
+[ia64.h]
 indent_size = 8
 
-[idle.[ch]]
+[idle.h]
 indent_size = 8
 
-[inc.[ch]]
+[inc.h]
 indent_size = 8
 
-[john.[ch]]
+[john.asm]
+indent_size = 8
+end_of_line = crlf
+
+[john.h]
 indent_size = 8
 
-[list.[ch]]
+[list.h]
 indent_size = 8
 
-[loader.[ch]]
+[loader.h]
 indent_size = 8
 
-[logger.[ch]]
+[logger.h]
 indent_size = 8
 
-[math.[ch]]
+[math.h]
 indent_size = 8
 
-[memory.[ch]]
+[memory.h]
 indent_size = 8
 
-[mic.[ch]]
+[mic.h]
 indent_size = 8
 
-[mips32.[ch]]
+[mips32.h]
 indent_size = 8
 
-[mips64.[ch]]
+[mips64.h]
 indent_size = 8
 
-[misc.[ch]]
+[misc.h]
 indent_size = 8
 
-[nonstd.[ch]]
+[nonstd.h]
 indent_size = 8
 
-[options.[ch]]
+[options.h]
 indent_size = 8
 
-[os.[ch]]
+[os.h]
 indent_size = 8
 
-[pa-risc.[ch]]
+[pa-risc.h]
 indent_size = 8
 
-[params.[ch]]
+[params.h]
 indent_size = 8
 
-[path.[ch]]
+[path.h]
 indent_size = 8
 
-[ppc32.[ch]]
+[ppc32.h]
 indent_size = 8
 
-[ppc32alt.[ch]]
+[ppc32alt.h]
 indent_size = 8
 
-[ppc64.[ch]]
+[ppc64.h]
 indent_size = 8
 
-[ppc64alt.[ch]]
+[ppc64alt.h]
 indent_size = 8
 
-[recovery.[ch]]
+[recovery.h]
 indent_size = 8
 
-[rpp.[ch]]
+[rpp.h]
 indent_size = 8
 
-[rules.[ch]]
+[rules.h]
 indent_size = 8
 
-[sboxes-s.[ch]]
+[sboxes-s.h]
 indent_size = 8
 
-[sboxes.[ch]]
+[sboxes.h]
 indent_size = 8
 
-[signals.[ch]]
+[signals.h]
 indent_size = 8
 
-[single.[ch]]
+[single.h]
 indent_size = 8
 
-[sparc32.[ch]]
+[sparc32.h]
 indent_size = 8
 
-[sparc64.[ch]]
+[sparc64.h]
 indent_size = 8
 
-[status.[ch]]
+[status.h]
 indent_size = 8
 
-[symlink.[ch]]
+[symlink.h]
 indent_size = 8
 
-[times.[ch]]
+[times.h]
 indent_size = 8
 
-[trip_fmt.[ch]]
+[trip_fmt.h]
 indent_size = 8
 
-[tty.[ch]]
+[tty.h]
 indent_size = 8
 
-[unafs.[ch]]
+[unafs.h]
 indent_size = 8
 
-[unique.[ch]]
+[unique.h]
 indent_size = 8
 
-[unshadow.[ch]]
+[unshadow.h]
 indent_size = 8
 
-[vax.[ch]]
+[vax.h]
 indent_size = 8
 
-[wordlist.[ch]]
+[wordlist.h]
 indent_size = 8
 
-[x86-64.[ch]]
+[x86-64.h]
 indent_size = 8
 
-[x86-any.[ch]]
+[x86-any.h]
 indent_size = 8
 
-[x86-mmx.[ch]]
+[x86-mmx.h]
 indent_size = 8
 
-[x86-sse.[ch]]
+[x86-sse.h]
 indent_size = 8

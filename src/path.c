@@ -21,8 +21,6 @@
 
 static char *john_home_path = NULL;
 static int john_home_length;
-static char *john_home_pathex = NULL;
-static int john_home_lengthex;
 
 #if JOHN_SYSTEMWIDE
 #if (!AC_BUILT || HAVE_UNISTD_H) && !_MSC_VER
@@ -37,14 +35,13 @@ static char *user_home_path = NULL;
 static int user_home_length;
 #endif
 
-#include "memdbg.h"
 
 void path_init(char **argv)
 {
 #if JOHN_SYSTEMWIDE
 	char *home_dir;
 #ifdef JOHN_PRIVATE_HOME
-	char *private;
+	const char *private;
 #endif
 #else
 	char *pos;
@@ -81,6 +78,13 @@ void path_init(char **argv)
 		if (errno != EEXIST) pexit("mkdir: %s", private);
 	} else
 		fprintf(stderr, "Created directory: %s\n", private);
+#if HAVE_OPENCL
+	private = path_expand(JOHN_PRIVATE_HOME "/opencl");
+	if (mkdir(private, S_IRUSR | S_IWUSR | S_IXUSR)) {
+		if (errno != EEXIST) pexit("mkdir: %s", private);
+	} else
+		fprintf(stderr, "Created directory: %s\n", private);
+#endif
 #endif
 #else
 	if (argv[0]) {
@@ -106,54 +110,20 @@ void path_init(char **argv)
 					*pos = '/';
 					pos = strchr(pos, '\\');
 				}
+#if !(defined(__DJGPP__) || defined(__CYGWIN__) || defined(_MSC_VER) || defined(__MINGW32__))
+			} else {
+				fprintf(stderr,
+				    "Error: Cannot find John home. Invoke the program via full or relative pathname.\n"
+				    "For example, /full/path/%s or path/%s, or set and use a shell alias.\n", argv[0], argv[0]);
+				error();
+#endif
 			}
 		}
 	}
 #endif
 }
 
-void path_init_ex(const char *path)
-{
-	int dos = 0;
-	char *pos;
-
-	pos = strrchr(path, '/');
-	if (!pos) {
-		pos = strrchr(path, '\\');
-		if (pos>path && path[1] == ':') {
-			path += 2;
-			dos = 1;
-		}
-		else if (pos == path)
-			dos = 1;
-	}
-	if (pos) {
-		john_home_lengthex = pos - path + 1;
-		if (john_home_lengthex >= PATH_BUFFER_SIZE) return;
-
-		john_home_pathex = mem_alloc(PATH_BUFFER_SIZE);
-		memcpy(john_home_pathex, path, john_home_lengthex);
-		john_home_pathex[john_home_lengthex] = 0;
-		pos = strchr(john_home_pathex, '\\');
-		while (dos && pos) {
-			*pos = '/';
-			pos = strchr(pos, '\\');
-		}
-	}
-}
-
-char *path_expand_ex(char *name)
-{
-	if (john_home_pathex &&
-	    john_home_lengthex + strlen(name) < PATH_BUFFER_SIZE) {
-		strnzcpy(&john_home_pathex[john_home_lengthex], name,
-			PATH_BUFFER_SIZE - john_home_lengthex);
-		return john_home_pathex;
-	}
-	return name;
-}
-
-char *path_expand(char *name)
+const char *path_expand(const char *name)
 {
 	if (!strncmp(name, "$JOHN/", 6)) {
 		if (john_home_path &&
@@ -180,7 +150,7 @@ char *path_expand(char *name)
 	return name;
 }
 
-char *path_expand_safe(char *name)
+const char *path_expand_safe(const char *name)
 {
 	char *full_path;
 
@@ -215,7 +185,7 @@ char *path_expand_safe(char *name)
 	return full_path;
 }
 
-char *path_session(char *session, char *suffix)
+char *path_session(const char *session, const char *suffix)
 {
 	int keep, add;
 	char *p;
@@ -245,6 +215,4 @@ void path_done(void)
 #if JOHN_SYSTEMWIDE
 	MEM_FREE(user_home_path);
 #endif
-	if (john_home_pathex)
-		MEM_FREE(john_home_pathex);
 }

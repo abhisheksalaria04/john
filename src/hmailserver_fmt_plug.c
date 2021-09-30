@@ -42,7 +42,6 @@ john_register_one(&fmt_hmailserver);
 #include "common.h"
 #include "formats.h"
 #include "dynamic.h"
-#include "memdbg.h"
 
 #define FORMAT_LABEL        "hMailServer"
 #define FORMAT_NAME         ""
@@ -50,7 +49,7 @@ john_register_one(&fmt_hmailserver);
 #define ALGORITHM_NAME      "?" /* filled in by dynamic */
 
 #define BENCHMARK_COMMENT   ""
-#define BENCHMARK_LENGTH    0
+#define BENCHMARK_LENGTH    7
 
 // set PLAINTEXT_LENGTH to 0, so dyna will set this
 #define PLAINTEXT_LENGTH	0
@@ -106,13 +105,13 @@ static int hmailserver_valid(char *ciphertext, struct fmt_main *self)
 {
 	int i;
 
-	if ( ciphertext == NULL )
+	if (!ciphertext)
 		return 0;
 
 	get_ptr();
-	i = strlen( ciphertext );
+	i = strnlen(ciphertext, CIPHERTEXT_LENGTH + SALT_SIZE + 1);
 
-	if (i != CIPHERTEXT_LENGTH+SALT_SIZE)
+	if (i != CIPHERTEXT_LENGTH + SALT_SIZE)
 		return pDynamic->methods.valid(ciphertext, pDynamic);
 	return pDynamic->methods.valid(Convert(Conv_Buf, ciphertext), pDynamic);
 }

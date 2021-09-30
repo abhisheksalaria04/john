@@ -11,12 +11,12 @@
 
 #ifdef HAVE_OPENCL
 
-#include "common-opencl.h"
-#include "memdbg.h"
+#include "opencl_common.h"
 
 /* Allow the developer to select configurable step size for gws. */
 int autotune_get_next_gws_size(size_t num, int step, int startup,
-                             int default_value) {
+                               int default_value)
+{
 	if (startup) {
 		if (step == 0)
 			return GET_EXACT_MULTIPLE(default_value, local_work_size);
@@ -28,6 +28,21 @@ int autotune_get_next_gws_size(size_t num, int step, int startup,
 		return num * 2;
 
 	return num + step;
+}
+
+int autotune_get_prev_gws_size(size_t num, int step)
+{
+	int value;
+
+	if (step < 1)
+		value = MAX(1, num >> 1);
+	else
+		value = MAX(1, num - step);
+
+	if (value < local_work_size)
+		local_work_size = value;
+
+	return value;
 }
 
 /* Can be used to select a 'good' default lws size */
@@ -83,7 +98,7 @@ void autotune_find_best_lws(size_t group_size_limit,
    of keys per crypt for the given format
    -- */
 void autotune_find_best_gws(int sequential_id, unsigned int rounds, int step,
-                          unsigned long long int max_run_time, int have_lws)
+                            int max_duration, int have_lws)
 {
 	char *tmp_value;
 
@@ -93,7 +108,7 @@ void autotune_find_best_gws(int sequential_id, unsigned int rounds, int step,
 	step = GET_MULTIPLE_OR_ZERO(step, local_work_size);
 
 	//Call the default function.
-	opencl_find_best_gws(step, max_run_time, sequential_id, rounds, have_lws);
+	opencl_find_best_gws(step, max_duration, sequential_id, rounds, have_lws);
 }
 
 #endif

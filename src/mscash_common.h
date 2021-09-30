@@ -8,11 +8,11 @@
  * There's ABSOLUTELY NO WARRANTY, express or implied.
  *
  *  Functions and data which is common among the mscash and mscash2 crackers
- *  (CPU, OpenCL, Cuda)
+ *  (CPU, OpenCL)
  */
 
 #define BENCHMARK_COMMENT                 ""
-#define BENCHMARK_LENGTH                  0
+#define BENCHMARK_LENGTH                  7
 #define FORMAT_TAG                        "M$"
 #define FORMAT_TAG_LEN                   (sizeof(FORMAT_TAG)-1)
 #define FORMAT_TAG2                       "$DCC2$"
@@ -33,9 +33,7 @@ extern struct fmt_tests mscash2_common_tests[];
 extern void mscash1_adjust_tests(struct fmt_main *self, unsigned encoding,
                                  unsigned plain_len,
                                  void (*set_key_utf8)(char*,int),
-                                 void (*set_key_encoding)(char*,int),
-                                 void *(*get_salt_utf8)(char*),
-                                 void *(*get_salt_encoding)(char*));
+                                 void (*set_key_encoding)(char*,int));
 
 extern int   mscash1_common_valid(char *ciphertext, struct fmt_main *self);
 extern char *mscash1_common_split(char *ciphertext, int index, struct fmt_main *self);
@@ -46,4 +44,3 @@ extern void mscash2_adjust_tests(unsigned encoding, unsigned plain_len, unsigned
 extern int mscash2_common_valid(char *ciphertext, int max_salt_length, struct fmt_main *self);
 extern char *mscash2_common_split(char *ciphertext, int index, struct fmt_main *self);
 extern char *mscash2_common_prepare(char *split_fields[10], struct fmt_main *self);
-

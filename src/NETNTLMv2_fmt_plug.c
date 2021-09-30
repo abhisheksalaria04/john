@@ -44,7 +44,9 @@ extern struct fmt_main fmt_NETNTLMv2;
 john_register_one(&fmt_NETNTLMv2);
 #else
 
+#include <stdint.h>
 #include <string.h>
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -54,18 +56,17 @@ john_register_one(&fmt_NETNTLMv2);
 #include "common.h"
 #include "formats.h"
 #include "options.h"
-#include "stdint.h"
-
 #include "md5.h"
 #include "hmacmd5.h"
-
 #include "unicode.h"
 #include "byteorder.h"
 
-#include "memdbg.h"
-
 #ifndef uchar
 #define uchar unsigned char
+#endif
+
+#ifndef OMP_SCALE
+#define OMP_SCALE			16	// MKPC and OMP_SCALE tuned for core i7
 #endif
 
 #define FORMAT_LABEL		"netntlmv2"
@@ -74,7 +75,7 @@ john_register_one(&fmt_NETNTLMv2);
 #define FORMAT_TAG_LEN       (sizeof(FORMAT_TAG)-1)
 #define ALGORITHM_NAME		"MD4 HMAC-MD5 32/" ARCH_BITS_STR
 #define BENCHMARK_COMMENT	""
-#define BENCHMARK_LENGTH	0
+#define BENCHMARK_LENGTH	7
 #define PLAINTEXT_LENGTH	125 /* lmcons.h - PWLEN (256) ? 127 ? */
 #define USERNAME_LENGTH		60 /* lmcons.h - UNLEN (256) / LM20_UNLEN (20) */
 #define DOMAIN_LENGTH		45 /* lmcons.h - CNLEN / DNLEN */
@@ -89,10 +90,7 @@ john_register_one(&fmt_NETNTLMv2);
 
 // these may be altered in init() if running OMP
 #define MIN_KEYS_PER_CRYPT	1
-#define MAX_KEYS_PER_CRYPT	1
-#ifndef OMP_SCALE
-#define OMP_SCALE		3072
-#endif
+#define MAX_KEYS_PER_CRYPT	32
 
 static struct fmt_tests tests[] = {
   {"", "password",                  {"USER1",                 "", "Domain",        "1122334455667788","5E4AB1BF243DCA304A00ADEF78DC38DF","0101000000000000BB50305495AACA01338BC7B090A62856000000000200120057004F0052004B00470052004F00550050000000000000000000"} },
@@ -122,12 +120,8 @@ static int keys_prepared;
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	int omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
+	omp_autotune(self, OMP_SCALE);
+
 	saved_plain = mem_calloc(self->params.max_keys_per_crypt,
 	                         sizeof(*saved_plain));
 	saved_len = mem_calloc(self->params.max_keys_per_crypt,
@@ -152,7 +146,7 @@ static int valid(char *ciphertext, struct fmt_main *self)
   if (ciphertext == NULL) return 0;
   else if (strncmp(ciphertext, FORMAT_TAG, FORMAT_TAG_LEN)!=0) return 0;
 
-  if (strlen(ciphertext) > TOTAL_LENGTH)
+  if (strnlen(ciphertext, TOTAL_LENGTH + 1) > TOTAL_LENGTH)
     return 0;
 
   pos = &ciphertext[FORMAT_TAG_LEN];
@@ -194,16 +188,16 @@ static int valid(char *ciphertext, struct fmt_main *self)
 
 static char *prepare(char *split_fields[10], struct fmt_main *self)
 {
+	char *login         = split_fields[0];
+	char *uid           = split_fields[2];
 	char *srv_challenge = split_fields[3];
 	char *nethashv2     = split_fields[4];
 	char *cli_challenge = split_fields[5];
-	char *login = split_fields[0];
-	char *uid = split_fields[2];
 	char *identity = NULL, *tmp;
 
 	if (!strncmp(split_fields[1], FORMAT_TAG, FORMAT_TAG_LEN))
 		return split_fields[1];
-	if (!split_fields[0]||!split_fields[2]||!split_fields[3]||!split_fields[4]||!split_fields[5])
+	if (!login || !uid || !srv_challenge || !nethashv2 || !cli_challenge)
 		return split_fields[1];
 
 	/* DOMAIN\USER: -or- USER::DOMAIN: */
@@ -212,7 +206,7 @@ static char *prepare(char *split_fields[10], struct fmt_main *self)
 		strcpy(identity, tmp + 1);
 
 		/* Upper-Case Username - Not Domain */
-		enc_strupper((char *)identity);
+		enc_strupper(identity);
 
 		strncat(identity, login, tmp - login);
 	}
@@ -220,7 +214,7 @@ static char *prepare(char *split_fields[10], struct fmt_main *self)
 		identity = (char *) mem_alloc(strlen(login)*2 + strlen(uid) + 1);
 		strcpy(identity, login);
 
-		enc_strupper((char *)identity);
+		enc_strupper(identity);
 
 		strcat(identity, uid);
 	}
@@ -243,7 +237,8 @@ static char *split(char *ciphertext, int index, struct fmt_main *self)
   char *pos = NULL;
   int identity_length = 0;
 
-  if (strstr(ciphertext, "$SOURCE_HASH$"))
+  if (strnlen(ciphertext, LINE_BUFFER_SIZE) < LINE_BUFFER_SIZE &&
+      strstr(ciphertext, "$SOURCE_HASH$"))
 	  return ciphertext;
 
   /* Calculate identity length */
@@ -296,9 +291,8 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 #ifdef _OPENMP
 #pragma omp parallel for
-	for(i=0; i<count; i++)
 #endif
-	{
+	for (i = 0; i < count; i++) {
 		unsigned char ntlm_v2_hash[16];
 		HMACMD5Context ctx;
 
@@ -355,7 +349,8 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 static int cmp_all(void *binary, int count)
 {
 	int index;
-	for(index=0; index<count; index++)
+
+	for (index = 0; index < count; index++)
 		if (!memcmp(output[index], binary, BINARY_SIZE))
 			return 1;
 	return 0;
@@ -446,8 +441,7 @@ static void set_salt(void *salt)
 
 static void set_key(char *key, int index)
 {
-	saved_len[index]= strlen(key);
-	memcpy((char *)saved_plain[index], key, saved_len[index]+ 1);
+	saved_len[index]= strnzcpyn((char*)saved_plain[index], key, sizeof(*saved_plain));
 	keys_prepared = 0;
 }
 
@@ -467,41 +461,6 @@ static int salt_hash(void *salt)
 	return hash & (SALT_HASH_SIZE - 1);
 }
 
-static int get_hash_0(int index)
-{
-	return *(ARCH_WORD_32 *)output[index] & PH_MASK_0;
-}
-
-static int get_hash_1(int index)
-{
-	return *(ARCH_WORD_32 *)output[index] & PH_MASK_1;
-}
-
-static int get_hash_2(int index)
-{
-	return *(ARCH_WORD_32 *)output[index] & PH_MASK_2;
-}
-
-static int get_hash_3(int index)
-{
-	return *(ARCH_WORD_32 *)output[index] & PH_MASK_3;
-}
-
-static int get_hash_4(int index)
-{
-	return *(ARCH_WORD_32 *)output[index] & PH_MASK_4;
-}
-
-static int get_hash_5(int index)
-{
-	return *(ARCH_WORD_32 *)output[index] & PH_MASK_5;
-}
-
-static int get_hash_6(int index)
-{
-	return *(ARCH_WORD_32 *)output[index] & PH_MASK_6;
-}
-
 struct fmt_main fmt_NETNTLMv2 = {
 	{
 		FORMAT_LABEL,
@@ -517,7 +476,7 @@ struct fmt_main fmt_NETNTLMv2 = {
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_CASE | FMT_8_BIT | FMT_SPLIT_UNIFIES_CASE | FMT_OMP | FMT_UNICODE | FMT_UTF8,
+		FMT_CASE | FMT_8_BIT | FMT_SPLIT_UNIFIES_CASE | FMT_OMP | FMT_UNICODE | FMT_ENC | FMT_HUGE_INPUT,
 		{ NULL },
 		{ FORMAT_TAG },
 		tests
@@ -533,13 +492,7 @@ struct fmt_main fmt_NETNTLMv2 = {
 		{ NULL },
 		fmt_default_source,
 		{
-			fmt_default_binary_hash_0,
-			fmt_default_binary_hash_1,
-			fmt_default_binary_hash_2,
-			fmt_default_binary_hash_3,
-			fmt_default_binary_hash_4,
-			fmt_default_binary_hash_5,
-			fmt_default_binary_hash_6
+			fmt_default_binary_hash
 		},
 		salt_hash,
 		NULL,
@@ -549,13 +502,7 @@ struct fmt_main fmt_NETNTLMv2 = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+			fmt_default_get_hash
 		},
 		cmp_all,
 		cmp_one,

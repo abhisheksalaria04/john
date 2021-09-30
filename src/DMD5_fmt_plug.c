@@ -12,8 +12,11 @@
  * Input format:
  * $DIGEST-MD5$ username $ realm $ nonce $ digest_uri $ cnonce $ nc $ qop $ response [ $ authzid ]
  *
- * Just base64-decode the blob you see when sniffing, to get all data needed for above.
+ * Just base64-decode the blob you see when sniffing, to get all data needed
+ * for above.
  *
+ * See https://tools.ietf.org/html/rfc2831 (Using Digest Authentication as a
+ * SASL Mechanism) for algorithm details.
  */
 
 #if FMT_EXTERNS_H
@@ -23,11 +26,9 @@ john_register_one(&fmt_DMD5);
 #else
 
 #include <string.h>
+
 #ifdef _OPENMP
 #include <omp.h>
-#ifndef OMP_SCALE
-#define OMP_SCALE 1024
-#endif
 #endif
 
 #include "arch.h"
@@ -35,30 +36,28 @@ john_register_one(&fmt_DMD5);
 #include "md5.h"
 #include "common.h"
 #include "formats.h"
-#include "memdbg.h"
 
-#define FORMAT_LABEL		"dmd5"
-#define FORMAT_NAME		"DIGEST-MD5 C/R"
-#define ALGORITHM_NAME		"MD5 32/" ARCH_BITS_STR
-#define FORMAT_TAG			"$DIGEST-MD5$"
-#define FORMAT_TAG_LEN		(sizeof(FORMAT_TAG)-1)
+#define FORMAT_LABEL            "dmd5"
+#define FORMAT_NAME             "DIGEST-MD5 C/R"
+#define ALGORITHM_NAME          "MD5 32/" ARCH_BITS_STR
+#define FORMAT_TAG              "$DIGEST-MD5$"
+#define FORMAT_TAG_LEN          (sizeof(FORMAT_TAG)-1)
+#define BENCHMARK_COMMENT       ""
+#define BENCHMARK_LENGTH        7
+#define MD5_HEX_SIZE            (2 * BINARY_SIZE)
+#define BINARY_SIZE             16
+#define BINARY_ALIGN            4
+#define SALT_SIZE               sizeof(struct custom_salt)
+#define SALT_ALIGN              4
+#define DSIZE                   (128 - sizeof(int))
+#define CIPHERTEXT_LENGTH       (DSIZE * 4)
+#define PLAINTEXT_LENGTH        32
+#define MIN_KEYS_PER_CRYPT      1
+#define MAX_KEYS_PER_CRYPT      1024
 
-#define BENCHMARK_COMMENT	""
-#define BENCHMARK_LENGTH	-1
-
-#define MD5_HEX_SIZE		(2 * BINARY_SIZE)
-#define BINARY_SIZE		16
-#define BINARY_ALIGN		4
-#define SALT_SIZE		sizeof(cur_salt)
-#define SALT_ALIGN		1
-
-#define DSIZE			(128 - sizeof(int))
-#define CIPHERTEXT_LENGTH	(DSIZE * 4)
-
-#define PLAINTEXT_LENGTH	32
-
-#define MIN_KEYS_PER_CRYPT	1
-#define MAX_KEYS_PER_CRYPT	1
+#ifndef OMP_SCALE
+#define OMP_SCALE               2 // Tuned w/ MKPC for core i7
+#endif
 
 static const char itoa16_shr_04[] =
 	"0000000000000000"
@@ -96,33 +95,33 @@ static const char itoa16_and_0f[] =
 	"0123456789abcdef"
 	"0123456789abcdef";
 
-static struct {
-	unsigned char login_id[DSIZE];   // username:realm
+static struct custom_salt {
+	unsigned char login_id[DSIZE + 64 /* sizeof(realm) */];   // username:realm
 	unsigned int  login_id_len;
 
 	unsigned char nonces[DSIZE];     // :nonce:cnonce[:authzid]
 	unsigned int  nonces_len;
 
-	unsigned char prehash_KD[DSIZE]; // :nonce:nc:cnonce:qop:hex_A2_hash
+	unsigned char prehash_KD[DSIZE + 2 * MD5_HEX_SIZE]; // :nonce:nc:cnonce:qop:hex_A2_hash
 	unsigned int  prehash_KD_len;
-} cur_salt;
+} *cur_salt;
 
-static ARCH_WORD_32 (*crypt_key)[BINARY_SIZE/4];
+static uint32_t (*crypt_key)[BINARY_SIZE/4];
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
 
 static struct fmt_tests tests[] = {
+	// Two hashes from https://tools.ietf.org/html/rfc2831#section-8
+	{"$DIGEST-MD5$chris$elwood.innosoft.com$OA6MG9tEQGm2hh$imap/elwood.innosoft.com$OA6MHXh6VqTrRk$00000001$auth$d388dad90d4bbd760a152321f2143af7", "secret"},
+	{"$DIGEST-MD5$chris$elwood.innosoft.com$OA9BSXrbuRhWay$acap/elwood.innosoft.com$OA9BSuZWMSpW8m$00000001$auth$6084c6db3fede7352c551284490fd0fc", "secret"},
+	// And one unrelated hash
 	{"$DIGEST-MD5$s3443$pjwstk$00$ldap/10.253.34.43$0734d94ad9abd5bd7fc5e7e77bcf49a8$00000001$auth-int$dd98347e6da3efd6c4ff2263a729ef77", "test"},
 	{NULL}
 };
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	int omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
+	omp_autotune(self, OMP_SCALE);
+
 	saved_key = mem_calloc(self->params.max_keys_per_crypt,
 	                       PLAINTEXT_LENGTH + 1);
 	crypt_key = mem_calloc(self->params.max_keys_per_crypt,
@@ -160,8 +159,8 @@ static int valid(char *ciphertext, struct fmt_main *self)
 	data = p + 1; // cnonce
 	if (!(p = strchr(data, '$')) || (int)(p-data) > MD5_HEX_SIZE)
 		return 0;
-	if (hexlenl(data, 0) != p-data)
-		return 0;
+	/* if (hexlenl(data, 0) != p-data) // this is not always hex data!
+		return 0; */
 	data = p + 1; // nc
 	if (!(p = strchr(data, '$')) || (int)(p-data) >= 9)
 		return 0;
@@ -185,7 +184,7 @@ static int valid(char *ciphertext, struct fmt_main *self)
 
 static void *get_binary(char *ciphertext)
 {
-	static ARCH_WORD_32 out[BINARY_SIZE/4];
+	static uint32_t out[BINARY_SIZE/4];
 	char response[MD5_HEX_SIZE + 1];
 	unsigned int i;
 	char *p, *data = ciphertext + FORMAT_TAG_LEN;
@@ -226,10 +225,12 @@ static void *get_salt(char *ciphertext)
 	char *ccopy = strdup(ciphertext);
 	char *p, *data = ccopy + FORMAT_TAG_LEN;
 	MD5_CTX ctx;
-	char A2[DSIZE];
+	char A2[DSIZE + sizeof(digest_uri)];
 	unsigned char hash[BINARY_SIZE];
 	unsigned char hex_hash[2*MD5_HEX_SIZE];
+	static struct custom_salt cs;
 
+	memset(&cs, 0, sizeof(cs));
 	if ((p = strchr(data, '$'))) *p = 0;
 	strnzcpy(username, data, sizeof(username));
 
@@ -284,30 +285,30 @@ static void *get_salt(char *ciphertext)
 	}
 	*ptr_dst = 0;
 
-	snprintf((char*)cur_salt.prehash_KD, sizeof(cur_salt.prehash_KD),
+	snprintf((char*)cs.prehash_KD, sizeof(cs.prehash_KD),
 	         ":%s:%s:%s:%s:%s", nonce, nc, cnonce, qop, hex_hash);
-	cur_salt.prehash_KD_len = strlen((char*)cur_salt.prehash_KD);
+	cs.prehash_KD_len = strlen((char*)cs.prehash_KD);
 
 	if (authzid[0])
-		snprintf((char*)cur_salt.nonces, sizeof(cur_salt.nonces),
+		snprintf((char*)cs.nonces, sizeof(cs.nonces),
 		         ":%s:%s:%s", nonce, cnonce, authzid);
 	else
-		snprintf((char*)cur_salt.nonces, sizeof(cur_salt.nonces),
+		snprintf((char*)cs.nonces, sizeof(cs.nonces),
 		         ":%s:%s", nonce, cnonce);
 
-	cur_salt.nonces_len = strlen((char*)cur_salt.nonces);
+	cs.nonces_len = strlen((char*)cs.nonces);
 
-	snprintf((char*)cur_salt.login_id, sizeof(cur_salt.login_id),
+	snprintf((char*)cs.login_id, sizeof(cs.login_id),
 	         "%s:%s:", username, realm);
-	cur_salt.login_id_len = strlen((char*)cur_salt.login_id);
+	cs.login_id_len = strlen((char*)cs.login_id);
 
 	MEM_FREE(ccopy);
-	return (void*)&cur_salt;
+	return (void*)&cs;
 }
 
 static void set_salt(void *salt)
 {
-	memcpy(&cur_salt, salt, sizeof(cur_salt));
+	cur_salt = (struct custom_salt *)salt;
 }
 
 static void set_key(char *key, int index)
@@ -323,13 +324,12 @@ static char *get_key(int index)
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
 	const int count = *pcount;
-	int index = 0;
+	int index;
 
 #ifdef _OPENMP
 #pragma omp parallel for
-	for (index = 0; index < count; index++)
 #endif
-	{
+	for (index = 0; index < count; index++) {
 		unsigned char hash[16];
 		unsigned char hex_hash[MD5_HEX_SIZE];
 		unsigned char *ptr_src, *ptr_dst;
@@ -338,7 +338,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 		MD5_Init(&ctx);
 		// "username:realm"
-		MD5_Update(&ctx, cur_salt.login_id, cur_salt.login_id_len);
+		MD5_Update(&ctx, cur_salt->login_id, cur_salt->login_id_len);
 		// "password"
 		MD5_Update(&ctx, saved_key[index], strlen(saved_key[index]));
 		MD5_Final(hash, &ctx);
@@ -347,7 +347,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 		// previous result
 		MD5_Update(&ctx, hash, BINARY_SIZE);
 		// ":nonce:cnonce[:authzid]"
-		MD5_Update(&ctx, cur_salt.nonces, cur_salt.nonces_len);
+		MD5_Update(&ctx, cur_salt->nonces, cur_salt->nonces_len);
 		MD5_Final(hash, &ctx);
 
 		// hexify
@@ -364,25 +364,22 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 		// previous result, in hex
 		MD5_Update(&ctx, hex_hash, MD5_HEX_SIZE);
 		// ":nonce:nc:cnonce:qop:hex_A2_hash
-		MD5_Update(&ctx, cur_salt.prehash_KD, cur_salt.prehash_KD_len);
+		MD5_Update(&ctx, cur_salt->prehash_KD, cur_salt->prehash_KD_len);
 		MD5_Final((unsigned char*)crypt_key[index], &ctx);
 	}
+
 	return count;
 }
 
 static int cmp_all(void *binary, int count)
 {
-#if defined(_OPENMP) || (MAX_KEYS_PER_CRYPT > 1)
 	int index;
-	ARCH_WORD_32 b = ((ARCH_WORD_32*)binary)[0];
+	uint32_t b = ((uint32_t*)binary)[0];
 
 	for (index = 0; index < count; index++)
 		if (crypt_key[index][0] == b)
 			return 1;
 	return 0;
-#else
-	return ((ARCH_WORD_32*)binary)[0] == crypt_key[0][0];
-#endif
 }
 
 static int cmp_one(void *binary, int index)
@@ -395,13 +392,8 @@ static int cmp_exact(char *source, int index)
 	return 1;
 }
 
-static int get_hash_0(int index) { return crypt_key[index][0] & PH_MASK_0; }
-static int get_hash_1(int index) { return crypt_key[index][0] & PH_MASK_1; }
-static int get_hash_2(int index) { return crypt_key[index][0] & PH_MASK_2; }
-static int get_hash_3(int index) { return crypt_key[index][0] & PH_MASK_3; }
-static int get_hash_4(int index) { return crypt_key[index][0] & PH_MASK_4; }
-static int get_hash_5(int index) { return crypt_key[index][0] & PH_MASK_5; }
-static int get_hash_6(int index) { return crypt_key[index][0] & PH_MASK_6; }
+#define COMMON_GET_HASH_VAR crypt_key
+#include "common-get-hash.h"
 
 struct fmt_main fmt_DMD5 = {
 	{
@@ -451,13 +443,8 @@ struct fmt_main fmt_DMD5 = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,

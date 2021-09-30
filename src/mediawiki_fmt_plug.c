@@ -56,14 +56,13 @@ john_register_one(&fmt_mediawiki);
 #include "formats.h"
 #include "dynamic.h"
 #include "options.h"
-#include "memdbg.h"
 
 #define FORMAT_LABEL		"MediaWiki"
 #define FORMAT_NAME		"" /* md5($s.'-'.md5($p)) */
 
 #define ALGORITHM_NAME		"?" /* filled in by md5-gen */
 #define BENCHMARK_COMMENT	""
-#define BENCHMARK_LENGTH	0
+#define BENCHMARK_LENGTH	7
 
 #define MD5_BINARY_SIZE		16
 #define MD5_HEX_SIZE		(MD5_BINARY_SIZE * 2)
@@ -233,15 +232,6 @@ static void get_ptr() {
 		fmt_mediawiki.methods.prepare = fmt_default_prepare;
 	}
 }
-
-/**
- * GNU Emacs settings: K&R with 1 tab indent.
- * Local Variables:
- * c-file-style: "k&r"
- * c-basic-offset: 8
- * indent-tabs-mode: t
- * End:
- */
 
 #endif /* plugin stanza */
 

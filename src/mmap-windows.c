@@ -14,33 +14,23 @@
  * UnmapViewOfFile:   http://msdn.microsoft.com/en-us/library/aa366882(VS.85).aspx
  */
 
+#ifndef _MMAP_WIN
+#define _MMAP_WIN
+
+#if (_MSC_VER || HAVE_WINDOWS_H) && !defined(__CYGWIN__) && !defined(__MINGW64__) && !defined(__MINGW32__)
+
 #include <io.h>
 #include <windows.h>
 #include <sys/types.h>
-#include "memdbg.h"
 
-#define PROT_READ     0x1
-#define PROT_WRITE    0x2
-/* This flag is only available in WinXP+ */
-#ifdef FILE_MAP_EXECUTE
-#define PROT_EXEC     0x4
-#else
-#define PROT_EXEC        0x0
-#define FILE_MAP_EXECUTE 0
-#endif
-
-#define MAP_SHARED    0x01
-#define MAP_PRIVATE   0x02
-#define MAP_ANONYMOUS 0x20
-#define MAP_ANON      MAP_ANONYMOUS
-#define MAP_FAILED    ((void *) -1)
+#include "mem_map.h"
 
 #ifdef __USE_FILE_OFFSET64
-# define DWORD_HI(x) (x >> 32)
-# define DWORD_LO(x) ((x) & 0xffffffff)
+ #define DWORD_HI(x) (x >> 32)
+ #define DWORD_LO(x) ((x) & 0xffffffff)
 #else
-# define DWORD_HI(x) (0)
-# define DWORD_LO(x) (x)
+ #define DWORD_HI(x) (0)
+ #define DWORD_LO(x) (x)
 #endif
 
 static void *mmap(void *start, size_t length, int prot, int flags, int fd, off_t offset)
@@ -115,3 +105,7 @@ static void munmap(void *addr, size_t length)
 
 #undef DWORD_HI
 #undef DWORD_LO
+
+#endif /* (_MSC_VER || HAVE_WINDOWS_H) && !defined(__CYGWIN__) && !defined(__MINGW64__) && !defined(__MINGW32__) */
+
+#endif /* _MMAP_WIN */

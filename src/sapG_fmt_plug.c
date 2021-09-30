@@ -1,8 +1,9 @@
 /*
- * this is a SAP PASSCODE (CODEVN G) plugin for john the ripper.
- * tested on linux/x86 only, rest is up to you.. at least, someone did the reversing :-)
+ * This is a SAP PASSCODE (CODEVN G) plugin for JtR.
  *
- * please note: this code is in a "works for me"-state, feel free to modify/speed up/clean/whatever it...
+ * Tested on linux/x86 only, rest is up to you... at least, someone did the reversing :-)
+ *
+ * Please note: this code is in a "works for me"-state, feel free to modify/speed up/clean/whatever it...
  *
  * (c) x7d8 sap loverz, public domain, btw
  * cheers: see test-cases.
@@ -22,13 +23,12 @@ john_register_one(&fmt_sapG);
 #include <string.h>
 #include <ctype.h>
 
-#include "arch.h"
-
-#ifdef SIMD_COEF_32
-#define NBKEYS	(SIMD_COEF_32 * SIMD_PARA_SHA1)
+#if defined(_OPENMP)
+#include <omp.h>
 #endif
-#include "simd-intrinsics.h"
 
+#include "arch.h"
+#include "simd-intrinsics.h"
 #include "misc.h"
 #include "common.h"
 #include "formats.h"
@@ -36,48 +36,48 @@ john_register_one(&fmt_sapG);
 #include "options.h"
 #include "unicode.h"
 #include "johnswap.h"
+#include "config.h"
 
-#define FORMAT_LABEL			"sapg"
-#define FORMAT_NAME				"SAP CODVN F/G (PASSCODE)"
-
-#define ALGORITHM_NAME			"SHA1 " SHA1_ALGORITHM_NAME
-
-static unsigned int omp_t = 1;
-#if defined(_OPENMP)
-#include <omp.h>
-#ifndef OMP_SCALE
-#define OMP_SCALE				2048
-#endif
-#endif
-
-#include "memdbg.h"
-
-#define BENCHMARK_COMMENT		""
-#define BENCHMARK_LENGTH		0
-
-#define SALT_FIELD_LENGTH		40
-#define USER_NAME_LENGTH		12 /* max. length of user name in characters */
-#define SALT_LENGTH				(USER_NAME_LENGTH * 4)	/* bytes of UTF-8 */
-#define PLAINTEXT_LENGTH		40 /* Characters */
-#define UTF8_PLAINTEXT_LENGTH	MIN(125, PLAINTEXT_LENGTH * 4) /* bytes */
-
-#define BINARY_SIZE				20
-#define BINARY_ALIGN			4
-#define SALT_SIZE				sizeof(struct saltstruct)
-#define SALT_ALIGN				4
-#define CIPHERTEXT_LENGTH		(SALT_LENGTH + 1 + 2*BINARY_SIZE)	/* SALT + $ + 2x20 bytes for SHA1-representation */
+#define FORMAT_LABEL            "sapg"
+#define FORMAT_NAME             "SAP CODVN F/G (PASSCODE)"
+#define ALGORITHM_NAME          "SHA1 " SHA1_ALGORITHM_NAME
+#define BENCHMARK_COMMENT        ""
+#define BENCHMARK_LENGTH        7
+#define SALT_FIELD_LENGTH       40
+#define USER_NAME_LENGTH        12 /* max. length of user name in characters */
+#define SALT_LENGTH             (USER_NAME_LENGTH * 4)    /* bytes of UTF-8 */
+#define PLAINTEXT_LENGTH        40 /* Characters */
+#define UTF8_PLAINTEXT_LENGTH   MIN(125, PLAINTEXT_LENGTH * 3) /* bytes */
+#define BINARY_SIZE             20
+#define BINARY_ALIGN            4
+#define SALT_SIZE               sizeof(struct saltstruct)
+#define SALT_ALIGN              4
+#define CIPHERTEXT_LENGTH       (SALT_LENGTH + 1 + 2*BINARY_SIZE)    /* SALT + $ + 2x20 bytes for SHA1-representation */
 
 #ifdef SIMD_COEF_32
-#define MIN_KEYS_PER_CRYPT		NBKEYS
-#define MAX_KEYS_PER_CRYPT		NBKEYS
-#define GETPOS(i, index)		( (index&(SIMD_COEF_32-1))*4 + ((i)&60)*SIMD_COEF_32 + (3-((i)&3)) + (unsigned int)index/SIMD_COEF_32*SHA_BUF_SIZ*SIMD_COEF_32*4 ) //for endianity conversion
-#define GETWORDPOS(i, index)	( (index&(SIMD_COEF_32-1))*4 + ((i)&60)*SIMD_COEF_32 + (unsigned int)index/SIMD_COEF_32*SHA_BUF_SIZ*SIMD_COEF_32*4 )
-#define GETSTARTPOS(index)		( (index&(SIMD_COEF_32-1))*4 + (unsigned int)index/SIMD_COEF_32*SHA_BUF_SIZ*SIMD_COEF_32*4 )
-#define GETOUTPOS(i, index)		( (index&(SIMD_COEF_32-1))*4 + ((i)&(0xffffffff-3))*SIMD_COEF_32 + (3-((i)&3)) + (unsigned int)index/SIMD_COEF_32*20*SIMD_COEF_32 ) //for endianity conversion
-
+#define NBKEYS                  (SIMD_COEF_32 * SIMD_PARA_SHA1)
+#define GETWORDPOS(i, index)    ( (index&(SIMD_COEF_32-1))*4 + ((i)&60)*SIMD_COEF_32 + (unsigned int)index/SIMD_COEF_32*64*SIMD_COEF_32 )
+#define GETSTARTPOS(index)      ( (index&(SIMD_COEF_32-1))*4 +                         (unsigned int)index/SIMD_COEF_32*64*SIMD_COEF_32 )
+#define GETOUTSTARTPOS(index)   ( (index&(SIMD_COEF_32-1))*4 +                         (unsigned int)index/SIMD_COEF_32*20*SIMD_COEF_32 )
+#if ARCH_LITTLE_ENDIAN
+#define GETPOS(i, index)        ( (index&(SIMD_COEF_32-1))*4 + ((i)&60)*SIMD_COEF_32 +             (3-((i)&3)) + (unsigned int)index/SIMD_COEF_32*64*SIMD_COEF_32 ) //for endianity conversion
 #else
-#define MIN_KEYS_PER_CRYPT		1
-#define MAX_KEYS_PER_CRYPT		1
+#define GETPOS(i, index)        ( (index&(SIMD_COEF_32-1))*4 + ((i)&60)*SIMD_COEF_32 +             ((i)&3) + (unsigned int)index/SIMD_COEF_32*64*SIMD_COEF_32 ) //for endianity conversion
+#endif
+#define MIN_KEYS_PER_CRYPT      NBKEYS
+// max keys increased to allow sorting based on limb counts
+#define MAX_KEYS_PER_CRYPT      (NBKEYS * 64)
+#else
+#define MIN_KEYS_PER_CRYPT      1
+#define MAX_KEYS_PER_CRYPT      32
+#endif
+
+#ifndef OMP_SCALE
+#if defined (SIMD_COEF_32)
+#define OMP_SCALE               4 // Tuned w/ MKPC for core i7
+#else
+#define OMP_SCALE               16
+#endif
 #endif
 
 //this array is from disp+work (sap's worker process)
@@ -119,6 +119,13 @@ static struct fmt_tests tests[] = {
 
 static UTF8 (*saved_plain)[UTF8_PLAINTEXT_LENGTH + 1];
 static int *keyLen;
+static int max_keys;
+
+/*
+ * If john.conf option 'SAPhalfHash' is true, we support 'half hashes' from
+ * the RFC_READ table. This means second half of the hash are zeros.
+ */
+static int half_hashes;
 
 #ifdef SIMD_COEF_32
 
@@ -133,7 +140,7 @@ static unsigned int *clean_pos;
 #else
 
 static UTF8 (*saved_key)[UTF8_PLAINTEXT_LENGTH + 1];
-static ARCH_WORD_32 (*crypt_key)[BINARY_SIZE / sizeof(ARCH_WORD_32)];
+static uint32_t (*crypt_key)[BINARY_SIZE / sizeof(uint32_t)];
 
 #endif
 
@@ -144,38 +151,31 @@ static struct saltstruct {
 
 static void init(struct fmt_main *self)
 {
-	static int warned = 0;
 #ifdef SIMD_COEF_32
 	int i;
 #endif
+
+	half_hashes = cfg_get_bool(SECTION_OPTIONS, NULL, "SAPhalfHashes", 0);
+
 	// This is needed in order NOT to upper-case german double-s
 	// in UTF-8 mode.
 	initUnicode(UNICODE_MS_NEW);
-
-	if (!options.listconf && options.target_enc != UTF_8 &&
-	    !(options.flags & FLG_TEST_CHK) && warned++ == 0)
-		fprintf(stderr, "Warning: SAP-F/G format should always be UTF-8.\n"
-		        "Use --target-encoding=utf8\n");
 
 	// Max 40 characters or 125 bytes of UTF-8, We actually do not truncate
 	// multibyte input at 40 characters later because it's too expensive.
 	if (options.target_enc == UTF_8)
 		self->params.plaintext_length = UTF8_PLAINTEXT_LENGTH;
 
-#if defined (_OPENMP)
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
+	omp_autotune(self, OMP_SCALE);
 
+	max_keys = self->params.max_keys_per_crypt;
 	saved_plain = mem_calloc(self->params.max_keys_per_crypt,
 	                         sizeof(*saved_plain));
 	keyLen = mem_calloc(self->params.max_keys_per_crypt, sizeof(*keyLen));
 #ifdef SIMD_COEF_32
 	clean_pos = mem_calloc(self->params.max_keys_per_crypt,
 	                       sizeof(*clean_pos));
-	for(i = 0; i < LIMB; i++)
+	for (i = 0; i < LIMB; i++)
 		saved_key[i] = mem_calloc_align(self->params.max_keys_per_crypt,
 		                                SHA_BUF_SIZ * 4,
 		                                MEM_ALIGN_SIMD);
@@ -198,7 +198,7 @@ static void done(void)
 	MEM_FREE(crypt_key);
 #ifdef SIMD_COEF_32
 	MEM_FREE(interm_crypt);
-	for(i = 0; i < LIMB; i++)
+	for (i = 0; i < LIMB; i++)
 		MEM_FREE(saved_key[i]);
 	MEM_FREE(clean_pos);
 #endif
@@ -278,12 +278,12 @@ static void *get_salt(char *ciphertext)
 
 static void clear_keys(void)
 {
-	memset(keyLen, 0, sizeof(*keyLen) * omp_t * MAX_KEYS_PER_CRYPT);
+	memset(keyLen, 0, sizeof(*keyLen) * max_keys);
 }
 
 static void set_key(char *key, int index)
 {
-	memcpy((char*)saved_plain[index], key, UTF8_PLAINTEXT_LENGTH);
+	strnzcpy((char*)saved_plain[index], key, sizeof(*saved_plain));
 	keyLen[index] = -1;
 }
 
@@ -293,25 +293,57 @@ static char *get_key(int index) {
 
 static int cmp_all(void *binary, int count) {
 #ifdef SIMD_COEF_32
-	unsigned int x,y=0;
+	unsigned int x, y;
 
-#ifdef _OPENMP
-	for(;y<SIMD_PARA_SHA1*omp_t;y++)
-#else
-	for(;y<SIMD_PARA_SHA1;y++)
-#endif
-	for(x=0;x<SIMD_COEF_32;x++)
-	{
-		if( ((unsigned int*)binary)[0] == ((unsigned int*)crypt_key)[x+y*SIMD_COEF_32*5] )
-			return 1;
+	for (y = 0; y < max_keys; y += SIMD_COEF_32) {
+		for (x = 0; x < SIMD_COEF_32; x++) {
+			if ( ((unsigned int*)binary)[0] == ((unsigned int*)crypt_key)[x+y*5] )
+				return 1;
+		}
 	}
 	return 0;
 #else
 	unsigned int index;
 	for (index = 0; index < count; index++)
-		if (!memcmp(binary, crypt_key[index], BINARY_SIZE))
+		if (!memcmp(binary, crypt_key[index], BINARY_SIZE / 2))
 			return 1;
 	return 0;
+#endif
+}
+
+/*
+ * We support 'half hashes' from the RFC_READ table. This means second half
+ * of the hash are zeros.
+ */
+static int cmp_one(void *binary, int index)
+{
+#ifdef SIMD_COEF_32
+	unsigned int x,y;
+	x = index&(SIMD_COEF_32-1);
+	y = (unsigned int)index/SIMD_COEF_32;
+
+	if ( (((unsigned int*)binary)[0] != ((unsigned int*)crypt_key)[x+y*SIMD_COEF_32*5])   |
+	     (((unsigned int*)binary)[1] != ((unsigned int*)crypt_key)[x+y*SIMD_COEF_32*5+SIMD_COEF_32]))
+		return 0;
+	if ((((unsigned int*)binary)[2] == ((unsigned int*)crypt_key)[x+y*SIMD_COEF_32*5+2*SIMD_COEF_32]) &&
+	    (((unsigned int*)binary)[3] == ((unsigned int*)crypt_key)[x+y*SIMD_COEF_32*5+3*SIMD_COEF_32]) &&
+		 (((unsigned int*)binary)[4] == ((unsigned int*)crypt_key)[x+y*SIMD_COEF_32*5+4*SIMD_COEF_32]) )
+		return 1;
+	if (half_hashes &&
+	    ((((unsigned int*)binary)[2] >> 16) == (((unsigned int*)crypt_key)[x+y*SIMD_COEF_32*5+2*SIMD_COEF_32] >> 16)) &&
+	    ((((unsigned int*)binary)[2] & 0xffff) == 0) &&
+	    (((unsigned int*)binary)[3] == 0) && (((unsigned int*)binary)[4] == 0))
+		return 1;
+	return 0;
+#else
+	const char zeros[BINARY_SIZE / 2] = { 0 };
+
+	if (half_hashes)
+		return (!memcmp(binary, crypt_key[index], BINARY_SIZE) ||
+		        (!memcmp(binary, crypt_key[index], BINARY_SIZE / 2) &&
+		         !memcmp(((unsigned char*)binary) + BINARY_SIZE / 2, zeros, BINARY_SIZE / 2)));
+	else
+		return (!memcmp(binary, crypt_key[index], BINARY_SIZE));
 #endif
 }
 
@@ -320,40 +352,21 @@ static int cmp_exact(char *source, int index)
 	return 1;
 }
 
-static int cmp_one(void *binary, int index)
-{
-#ifdef SIMD_COEF_32
-	unsigned int x,y;
-	x = index&(SIMD_COEF_32-1);
-	y = (unsigned int)index/SIMD_COEF_32;
-
-	if( (((unsigned int*)binary)[0] != ((unsigned int*)crypt_key)[x+y*SIMD_COEF_32*5])   |
-	    (((unsigned int*)binary)[1] != ((unsigned int*)crypt_key)[x+y*SIMD_COEF_32*5+SIMD_COEF_32]) |
-	    (((unsigned int*)binary)[2] != ((unsigned int*)crypt_key)[x+y*SIMD_COEF_32*5+2*SIMD_COEF_32]) |
-	    (((unsigned int*)binary)[3] != ((unsigned int*)crypt_key)[x+y*SIMD_COEF_32*5+3*SIMD_COEF_32])|
-	    (((unsigned int*)binary)[4] != ((unsigned int*)crypt_key)[x+y*SIMD_COEF_32*5+4*SIMD_COEF_32]) )
-		return 0;
-	return 1;
-#else
-	return !memcmp(binary, crypt_key[index], BINARY_SIZE);
-#endif
-}
-
 /*
  * calculate the length of data that has to be hashed from the magic array. pass the first hash result in here.
  * this is part of the walld0rf-magic
  * The return value will always be between 32 and 82, inclusive
  */
 #if SIMD_COEF_32
-static inline unsigned int extractLengthOfMagicArray(unsigned const char *pbHashArray, unsigned int index)
+inline static unsigned int extractLengthOfMagicArray(unsigned const char *pbHashArray, unsigned int index)
 #else
-static inline unsigned int extractLengthOfMagicArray(unsigned const char *pbHashArray)
+inline static unsigned int extractLengthOfMagicArray(unsigned const char *pbHashArray)
 #endif
 {
 	unsigned int modSum = 0;
 
 #if SIMD_COEF_32
-	unsigned const char *p = &pbHashArray[GETOUTPOS(3, index)];
+	unsigned const char *p = &pbHashArray[GETOUTSTARTPOS(index)]; // [(index/SIMD_COEF_32)*20*SIMD_COEF_32+(index%SIMD_COEF_32)*4]
 	modSum += *p++ % 6;
 	modSum += *p++ % 6;
 	modSum += *p++ % 6;
@@ -363,13 +376,16 @@ static inline unsigned int extractLengthOfMagicArray(unsigned const char *pbHash
 	modSum += *p++ % 6;
 	modSum += *p++ % 6;
 	modSum += *p++ % 6;
-	p += 4*(SIMD_COEF_32 - 1) + 2;
+	p += 4*(SIMD_COEF_32 - 1);
+#if ARCH_LITTLE_ENDIAN
+	p += 2;
+#endif
 	modSum += *p++ % 6;
 	modSum += *p % 6;
 #else
 	unsigned int i;
 
-	for (i=0; i<=9; i++)
+	for (i = 0; i < 10; i++)
 		modSum += pbHashArray[i] % 6;
 #endif
 	return modSum + 0x20; //0x20 is hardcoded...
@@ -381,38 +397,45 @@ static inline unsigned int extractLengthOfMagicArray(unsigned const char *pbHash
  * The return value will always be between 0 and 70, inclusive
  */
 #if SIMD_COEF_32
-static inline unsigned int extractOffsetToMagicArray(unsigned const char *pbHashArray, unsigned int index)
+inline static unsigned int extractOffsetToMagicArray(unsigned const char *pbHashArray, unsigned int index)
 #else
-static inline unsigned int extractOffsetToMagicArray(unsigned const char *pbHashArray)
+inline static unsigned int extractOffsetToMagicArray(unsigned const char *pbHashArray)
 #endif
 {
 	unsigned int modSum = 0;
 
 #if SIMD_COEF_32
-	unsigned const int *p = (unsigned int*)&pbHashArray[GETOUTPOS(11, index)];
-	unsigned int temp;
-
-	temp = *p & 0x0707;
-	modSum += (temp >> 8) + (unsigned char)temp;
-	p += SIMD_COEF_32;
-	temp = *p & 0x07070707;
-	modSum += (temp >> 24) + (unsigned char)(temp >> 16) +
-		(unsigned char)(temp >> 8) + (unsigned char)temp;
-	p += SIMD_COEF_32;
-	temp = *p & 0x07070707;
-	modSum += (temp >> 24) + (unsigned char)(temp >> 16) +
-		(unsigned char)(temp >> 8) + (unsigned char)temp;
+	unsigned const char *p = &pbHashArray[GETOUTSTARTPOS(index)]; // [(index/SIMD_COEF_32)*20*SIMD_COEF_32+(index%SIMD_COEF_32)*4]
+	p += 4*(SIMD_COEF_32)*2;
+#if !ARCH_LITTLE_ENDIAN
+	p += 2;
+#endif
+	modSum += *p++ % 8;
+	modSum += *p++ % 8;
+#if ARCH_LITTLE_ENDIAN
+	p += 2;
+#endif
+	p += 4*(SIMD_COEF_32 - 1);
+	modSum += *p++ % 8;
+	modSum += *p++ % 8;
+	modSum += *p++ % 8;
+	modSum += *p++ % 8;
+	p += 4*(SIMD_COEF_32 - 1);
+	modSum += *p++ % 8;
+	modSum += *p++ % 8;
+	modSum += *p++ % 8;
+	modSum += *p % 8;
 #else
 	unsigned int i;
 
-	for (i = 19; i >= 10; i--)
+	for (i = 10; i < 20; i++)
 		modSum += pbHashArray[i] % 8;
 #endif
 	return modSum;
 }
 
 #if SIMD_COEF_32
-static inline void crypt_done(unsigned const int *source, unsigned int *dest, int index)
+inline static void crypt_done(unsigned const int *source, unsigned int *dest, int index)
 {
 	unsigned int i;
 	unsigned const int *s = &source[(index&(SIMD_COEF_32-1)) + (unsigned int)index/SIMD_COEF_32*5*SIMD_COEF_32];
@@ -430,17 +453,13 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 {
 	const int count = *pcount;
 #if SIMD_COEF_32
+#define ti (t*NBKEYS+index)
 
-#if defined(_OPENMP)
 	int t;
+#if defined(_OPENMP)
 #pragma omp parallel for
-	for (t = 0; t < omp_t; t++)
-#define ti ((unsigned int)t*NBKEYS+(unsigned int)index)
-#else
-#define t  0
-#define ti (unsigned int)index
 #endif
-	{
+	for (t = 0; t < (count-1)/(NBKEYS)+1; t++) {
 		unsigned int index, i, longest;
 		int len;
 		unsigned int crypt_len[NBKEYS];
@@ -451,18 +470,19 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 			// Store key into vector key buffer
 			if ((len = keyLen[ti]) < 0) {
-				ARCH_WORD_32 *keybuf_word = (ARCH_WORD_32*)&saved_key[0][GETSTARTPOS(ti)];
+				uint32_t *keybuf_word = (uint32_t*)&saved_key[0][GETSTARTPOS(ti)];
 #if ARCH_ALLOWS_UNALIGNED
-				const ARCH_WORD_32 *wkey = (ARCH_WORD_32*)saved_plain[ti];
+				const uint32_t *wkey = (uint32_t*)saved_plain[ti];
 #else
 				char buf_aligned[UTF8_PLAINTEXT_LENGTH + 1] JTR_ALIGN(4);
 				char *key = (char*)saved_plain[ti];
-				const ARCH_WORD_32 *wkey = is_aligned(key, 4) ?
+				const uint32_t *wkey = is_aligned(key, 4) ?
 						(uint32_t*)key : (uint32_t*)strcpy(buf_aligned, key);
 #endif
-				ARCH_WORD_32 temp;
+				uint32_t temp;
 
 				len = 0;
+#if ARCH_LITTLE_ENDIAN
 				while(((unsigned char)(temp = *wkey++))) {
 					if (!(temp & 0xff00))
 					{
@@ -482,11 +502,33 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 						len+=3;
 						break;
 					}
+#else
+				while((temp = *wkey++) & 0xff000000) {
+					if (!(temp & 0xff0000))
+					{
+						*keybuf_word = (temp & 0xff000000) | (0x80 << 16);
+						len++;
+						break;
+					}
+					if (!(temp & 0xff00))
+					{
+						*keybuf_word = (temp & 0xffff0000) | (0x80 << 8);
+						len+=2;
+						break;
+					}
+					*keybuf_word = temp;
+					if (!(temp & 0xff))
+					{
+						*keybuf_word = temp | 0x80U;
+						len+=3;
+						break;
+					}
+#endif
 					len += 4;
 					if (len & 63)
 						keybuf_word += SIMD_COEF_32;
 					else
-						keybuf_word = (ARCH_WORD_32*)&saved_key[len>>6][GETSTARTPOS(ti)];
+						keybuf_word = (uint32_t*)&saved_key[len>>6][GETSTARTPOS(ti)];
 				}
 
 				// Back-out of trailing spaces
@@ -507,7 +549,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 			while (++i & 3)
 				saved_key[i>>6][GETPOS(i, ti)] = 0;
 			for (; i < (((len+8)>>6)+1)*64; i += 4)
-				*(ARCH_WORD_32*)&saved_key[i>>6][GETWORDPOS(i, ti)] = 0;
+				*(uint32_t*)&saved_key[i>>6][GETWORDPOS(i, ti)] = 0;
 
 			// This should do good but Valgrind insists it's a waste
 			//if (clean_pos[ti] < i)
@@ -555,8 +597,18 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 			while (++i & 3)
 				saved_key[i>>6][GETPOS(i, ti)] = *p++;
 			// ...then a word at a time. This is a good boost, we are copying between 32 and 82 bytes here.
+#if ARCH_ALLOWS_UNALIGNED
 			for (;i < lengthIntoMagicArray + len; i += 4, p += 4)
-				*(ARCH_WORD_32*)&saved_key[i>>6][GETWORDPOS(i, ti)] = JOHNSWAP(*(ARCH_WORD_32*)p);
+#if ARCH_LITTLE_ENDIAN
+				*(uint32_t*)&saved_key[i>>6][GETWORDPOS(i, ti)] = JOHNSWAP(*(uint32_t*)p);
+#else
+				*(uint32_t*)&saved_key[i>>6][GETWORDPOS(i, ti)] = *(uint32_t*)p;
+#endif
+#else
+			for (;i < lengthIntoMagicArray + len; ++i, ++p) {
+				saved_key[i>>6][GETPOS(i, ti)] = *p;
+			}
+#endif
 
 			// Now, the salt. This is typically too short for the stunt above.
 			for (i = 0; i < cur_salt->l; i++)
@@ -570,7 +622,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 			while (++i & 3)
 				saved_key[i>>6][GETPOS(i, ti)] = 0;
 			for (; i < clean_pos[ti]; i += 4)
-				*(ARCH_WORD_32*)&saved_key[i>>6][GETWORDPOS(i, ti)] = 0;
+				*(uint32_t*)&saved_key[i>>6][GETWORDPOS(i, ti)] = 0;
 
 			clean_pos[ti] = len + 1;
 			if (len > longest)
@@ -600,14 +652,11 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 #else
 
-#ifdef _OPENMP
 	int index;
+#ifdef _OPENMP
 #pragma omp parallel for
-	for (index = 0; index < count; index++)
-#else
-#define index 0
 #endif
-	{
+	for (index = 0; index < count; index++) {
 		unsigned int offsetMagicArray, lengthIntoMagicArray;
 		unsigned char temp_key[BINARY_SIZE];
 		unsigned char tempVar[UTF8_PLAINTEXT_LENGTH + MAGIC_ARRAY_SIZE + SALT_LENGTH]; //max size...
@@ -657,11 +706,11 @@ static void *get_binary(char *ciphertext)
 
 	newCiphertextPointer = strrchr(ciphertext, '$') + 1;
 
-	for(i=0;i<BINARY_SIZE;i++)
+	for (i=0;i<BINARY_SIZE;i++)
 	{
 		realcipher[i] = atoi16[ARCH_INDEX(newCiphertextPointer[i*2])]*16 + atoi16[ARCH_INDEX(newCiphertextPointer[i*2+1])];
 	}
-#ifdef SIMD_COEF_32
+#if defined(SIMD_COEF_32) && ARCH_LITTLE_ENDIAN
 	alter_endianity((unsigned char*)realcipher, BINARY_SIZE);
 #endif
 	return (void*)realcipher;
@@ -696,24 +745,9 @@ static char *source(struct db_password *pw, char Buf[LINE_BUFFER_SIZE] )
 }
 #endif
 
-#ifdef SIMD_COEF_32
-#define KEY_OFF (((unsigned int)index/SIMD_COEF_32)*SIMD_COEF_32*5+(index&(SIMD_COEF_32-1)))
-static int get_hash_0(int index) { return ((ARCH_WORD_32*)crypt_key)[KEY_OFF] & PH_MASK_0; }
-static int get_hash_1(int index) { return ((ARCH_WORD_32*)crypt_key)[KEY_OFF] & PH_MASK_1; }
-static int get_hash_2(int index) { return ((ARCH_WORD_32*)crypt_key)[KEY_OFF] & PH_MASK_2; }
-static int get_hash_3(int index) { return ((ARCH_WORD_32*)crypt_key)[KEY_OFF] & PH_MASK_3; }
-static int get_hash_4(int index) { return ((ARCH_WORD_32*)crypt_key)[KEY_OFF] & PH_MASK_4; }
-static int get_hash_5(int index) { return ((ARCH_WORD_32*)crypt_key)[KEY_OFF] & PH_MASK_5; }
-static int get_hash_6(int index) { return ((ARCH_WORD_32*)crypt_key)[KEY_OFF] & PH_MASK_6; }
-#else
-static int get_hash_0(int index) { return *(ARCH_WORD_32*)crypt_key[index] & PH_MASK_0; }
-static int get_hash_1(int index) { return *(ARCH_WORD_32*)crypt_key[index] & PH_MASK_1; }
-static int get_hash_2(int index) { return *(ARCH_WORD_32*)crypt_key[index] & PH_MASK_2; }
-static int get_hash_3(int index) { return *(ARCH_WORD_32*)crypt_key[index] & PH_MASK_3; }
-static int get_hash_4(int index) { return *(ARCH_WORD_32*)crypt_key[index] & PH_MASK_4; }
-static int get_hash_5(int index) { return *(ARCH_WORD_32*)crypt_key[index] & PH_MASK_5; }
-static int get_hash_6(int index) { return *(ARCH_WORD_32*)crypt_key[index] & PH_MASK_6; }
-#endif
+#define COMMON_GET_HASH_SIMD32 5
+#define COMMON_GET_HASH_VAR crypt_key
+#include "common-get-hash.h"
 
 // Here, we remove any salt padding and trim it to 44 bytes
 static char *split(char *ciphertext, int index, struct fmt_main *self)
@@ -799,13 +833,8 @@ struct fmt_main fmt_sapG = {
 		clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,

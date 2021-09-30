@@ -105,6 +105,9 @@ This information is contributed by Davy Douhine (@ddouhine).
 JBoss uses the `md5($u:<realm>:$p)` hashing scheme, and 'ManagementRealm' is
 the default realm for new AS 7.1 installations.
 
+Specifying the username in the input hashes is required as it is used as a salt
+by the JBoss AS/EAP hashing scheme.
+
 
 ```
 $ cat hashes
@@ -154,4 +157,62 @@ $ cat ~/jboss-as-7.1.1.Final/standalone/configuration/mgmt-users.properties
 # is for illustration only and does not correspond to a usable password.
 #
 user=1c3470194afdc84b90a0781c5e4462fc
+```
+
+## Cracking AuthMe hashes
+
+AuthMe is an authentication plugin used by Minecraft servers. AuthMe hashes are
+stored in the following format,
+
+```
+$SHA$c7dedf5a36c4a343$05ae3239eee683872ef1cc9096777bf4b1a72a179709efc17d8bf1603b082065
+```
+
+To crack such hashes, remove the `$SHA$` signature and move the salt to the end
+of the hash string. The resulting hash will thus become,
+
+```
+$ cat sample-hash
+05ae3239eee683872ef1cc9096777bf4b1a72a179709efc17d8bf1603b082065$c7dedf5a36c4a343
+```
+
+```
+$ cat wordlist
+password123
+openwall
+admin
+pantof
+```
+
+```
+$ ../run/john -form=dynamic='sha256(sha256($p).$s)' sample-hash -w=wordlist
+Using default input encoding: UTF-8
+Loaded 1 password hash (dynamic=sha256(sha256($p).$s) [256/256 AVX2 8x])
+Press 'q' or Ctrl-C to abort, almost any other key for status
+pantof           (?)
+Session completed
+```
+
+See `Sha256.java` from `https://github.com/AuthMe/AuthMeReloaded` for addtional details.
+
+NOTE: The inbuilt `dynamic_65` format is a bit faster at cracking such hashes.
+
+## Cracking ZooKeeper hashes
+
+Specifying the username in the input ZooKeeper hashes is required as it is used
+as a salt by the ZooKeeper hashing scheme.
+
+```
+$ cat hashes
+super:UdxDQl4f9v5oITwcAsO9bmWgHSI=
+```
+
+```
+$ ../run/john -form:dynamic='sha1_64($u.$c1.$p),c1=:' hashes
+Loaded 1 password hash (dynamic=sha1_64($u.$c1.$p) [256/256 AVX2 8x1])
+Press 'q' or Ctrl-C to abort, almost any other key for status
+super123         (super)
+1g 0:00:00:00 DONE 1/3 (2018-08-02 10:47) 100.0g/s 66300p/s 66300c/s 66300C/s Super69..super6666
+Use the "--show" option to display all of the cracked passwords reliably
+Session completed
 ```

@@ -16,20 +16,22 @@
 #include "loader.h"
 #include "status.h"
 #include "config.h"
+#include "options.h"
 #include "single.h"
 #include "wordlist.h"
 #include "inc.h"
-#include "memdbg.h"
 
 static void do_single_pass(struct db_main *db)
 {
+	options.flags |= FLG_SINGLE_CHK; /* Make tests elsewhere easier/safer */
 	do_single_crack(db);
 	db->options->flags &= ~DB_WORDS; /* Might speed up pot sync */
+	options.flags &= ~FLG_SINGLE_CHK;
 }
 
 static void do_wordlist_pass(struct db_main *db)
 {
-	char *name;
+	const char *name;
 
 	if (!(name = cfg_get_param(SECTION_OPTIONS, NULL, "Wordlist")))
 	if (!(name = cfg_get_param(SECTION_OPTIONS, NULL, "Wordfile")))

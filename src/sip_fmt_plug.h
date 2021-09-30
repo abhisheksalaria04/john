@@ -12,7 +12,7 @@
 #define URI_MAXLEN        256    /* Max len of uri            */
 #define NONCE_MAXLEN      128    /* Max len of nonce value    */
 #define CNONCE_MAXLEN     128    /* Max len for cnonce value  */
-#define NONCECOUNT_MAXLEN   8    /* Max len for nonce count   */
+#define NONCECOUNT_MAXLEN   9    /* Max len for nonce count   */
 #define QOP_MAXLEN         12    /* Max len for qop value     */
 #define LOGIN_MAXLEN     1024    /* Max len of login entry    */
 #define ALG_MAXLEN          8    /* Max len of algorithm name */
@@ -36,8 +36,8 @@ typedef struct {
 	char method[METHOD_MAXLEN];
 	char uri[URI_MAXLEN];
 	char nonce[NONCE_MAXLEN];
-	char cnonce[NONCE_MAXLEN];
-	char nonce_count[CNONCE_MAXLEN];
+	char cnonce[CNONCE_MAXLEN];
+	char nonce_count[NONCECOUNT_MAXLEN];
 	char qop[QOP_MAXLEN];
 	char algorithm[ALG_MAXLEN];
 	char hash[MD5_LEN_HEX+1];
@@ -50,7 +50,7 @@ int stringtoarray(char **array, char *string, char delimiter)
 	int count;
 	int size = 0;
 	ptr = string;
-	for(count=0 ; flag ; count++) {
+	for (count=0 ; flag ; count++) {
 		for (oldptr=ptr;*ptr&&*ptr!=delimiter;(void)*ptr++)
 			;
 		if (!*ptr) flag = 0;
@@ -65,7 +65,7 @@ int stringtoarray(char **array, char *string, char delimiter)
 void init_bin2hex(char bin2hex_table[256][2])
 {
 	unsigned i=0;
-	for(i=0;i<256;i++) {
+	for (i=0;i<256;i++) {
 		bin2hex_table[i][0] = ( ((i >> 4) & 0x0F) <= 0x09) ? (((i >> 4) & 0x0F) + '0') : (((i >> 4) & 0x0F) + 'a' - 10);
 		bin2hex_table[i][1] = ( ((i)      & 0x0F) <= 0x09) ? (((i)      & 0x0F) + '0') : (((i)      & 0x0F) + 'a' - 10);
 	}
@@ -80,7 +80,7 @@ void bin_to_hex(char bin2hex_table[256][2],
 		size_t hex_buffer_size)
 {
 	unsigned i;
-	for(i=0;i<bin_buffer_size; ++i) {
+	for (i=0;i<bin_buffer_size; ++i) {
 		hex_buffer[i*2  ] = bin2hex_table[bin_buffer[i]][0];
 		hex_buffer[i*2+1] = bin2hex_table[bin_buffer[i]][1];
 	}

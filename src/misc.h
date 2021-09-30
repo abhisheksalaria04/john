@@ -21,27 +21,27 @@
 #include "jumbo.h"
 
 #if !AC_BUILT
-# include <string.h>
-# ifndef _MSC_VER
-#  include <strings.h>
-# endif
+ #include <string.h>
+ #ifndef _MSC_VER
+  #include <strings.h>
+ #endif
 #else
-# include "autoconfig.h"
-# if STRING_WITH_STRINGS
-#  include <string.h>
-#  include <strings.h>
-# elif HAVE_STRING_H
-#  include <string.h>
-# elif HAVE_STRINGS_H
-#  include <strings.h>
-# endif
+ #include "autoconfig.h"
+ #if STRING_WITH_STRINGS
+  #include <string.h>
+  #include <strings.h>
+ #elif HAVE_STRING_H
+  #include <string.h>
+ #elif HAVE_STRINGS_H
+  #include <strings.h>
+ #endif
 #endif
 
 /*
  * Exit on error. Logs the event, closes john.pot and the log file, and
  * terminates the process with non-zero exit status.
  */
-extern void real_error(char *file, int line)
+extern void real_error(const char *file, int line)
 #ifdef __GNUC__
 	__attribute__ ((__noreturn__));
 #else
@@ -54,7 +54,7 @@ extern void real_error(char *file, int line)
  * Exit on error with message.  Will call real_error to do
  * the final exiting, after printing error message.
  */
-extern void real_error_msg(char *file, int line, char *format, ...)
+extern void real_error_msg(const char *file, int line, const char *format, ...)
 #ifdef __GNUC__
 	__attribute__ ((__noreturn__))
 	__attribute__ ((format (printf, 3, 4)));
@@ -67,7 +67,7 @@ extern void real_error_msg(char *file, int line, char *format, ...)
 /*
  * Similar to perror(), but supports formatted output, and calls error().
  */
-extern void real_pexit(char *file, int line, char *format, ...)
+extern void real_pexit(const char *file, int line, const char *format, ...)
 #ifdef __GNUC__
 	__attribute__ ((__noreturn__))
 	__attribute__ ((format (printf, 3, 4)));
@@ -97,9 +97,13 @@ extern char *fgetl(char *s, int size, FILE *stream);
  * s buffer, then the caller MUST call MEM_FREE to that pointer
  * once it is done with it.
  */
-#ifndef _JOHN_MISC_NO_LOG
 extern char *fgetll(char *s, size_t size, FILE *stream);
-#endif
+
+/*
+ * Similar to strncpy(), but with arbitrary padding. We deliberate do
+ * not guarantee a NUL termination, only padding if applicable.
+ */
+extern void *strncpy_pad(void *dst, const void *src, size_t size, uint8_t pad);
 
 /*
  * Similar to strncpy(), but terminates with only one NUL if there's room
@@ -113,9 +117,19 @@ extern char *strnfcpy(char *dst, const char *src, int size);
 extern char *strnzcpy(char *dst, const char *src, int size);
 
 /*
+ * Similar to the above, but also converts to lowercase in a single pass
+ */
+extern char *strnzcpylwr(char *dst, const char *src, int size);
+
+/*
  * Similar to the strnzcpy, but returns the length of the string.
  */
 extern int strnzcpyn(char *dst, const char *src, int size);
+
+/*
+ * Similar to the strnzcpylwr, but returns the length of the string.
+ */
+extern int strnzcpylwrn(char *dst, const char *src, int size);
 
 /*
  * Similar to strncat(), but total buffer size is supplied, and always NUL
@@ -124,10 +138,16 @@ extern int strnzcpyn(char *dst, const char *src, int size);
 extern char *strnzcat(char *dst, const char *src, int size);
 
 /*
+* similar to strncat, but this one protects the dst buffer, AND it
+* assures that dst is properly NULL terminated upon completion.
+*/
+extern char *strnzcatn(char *dst, int size, const char *src, int max_src);
+
+/*
  * Similar to atoi(), but properly handles unsigned int.  Do not use
  * atoi() for unsigned data if the data can EVER be over MAX_INT.
  */
-extern unsigned atou(const char *src);
+extern unsigned int atou(const char *src);
 
 /*
  * Similar to strtok(), but properly handles adjacent delimiters as
@@ -136,10 +156,10 @@ extern unsigned atou(const char *src);
  * for any leading or trailing delims. strtok() strips those off
  * also.
  */
-char *strtokm(char *s1, const char *delimit);
+extern char *strtokm(char *s1, const char *delimit);
 
 #ifndef __has_feature
-# define __has_feature(x) 0
+ #define __has_feature(x) 0
 #endif
 
 #if /* is ASAN enabled? */ \
@@ -166,7 +186,67 @@ char *strtokm(char *s1, const char *delimit);
  */
 const char *jtr_itoa(int num, char *result, int result_len, int base);
 const char *jtr_utoa(unsigned int num, char *result, int result_len, int base);
-const char *jtr_lltoa(long long num, char *result, int result_len, int base);
-const char *jtr_ulltoa(unsigned long long num, char *result, int result_len, int base);
+const char *jtr_lltoa(int64_t num, char *result, int result_len, int base);
+const char *jtr_ulltoa(uint64_t num, char *result, int result_len, int base);
+
+/*
+ * From a potentially large number produce a string possibly using binary
+ * prefix, eg. 437281954 -> "417 Mi".
+ * Note: "leaks" 16 bytes each time (mem_alloc_tiny).
+ */
+extern char *human_prefix(uint64_t num);
+
+/*
+ * From a potentially large number produce a cps string possibly using
+ * prefix, eg. 437281954 -> "437281K c/s".
+ * Note: "leaks" 16 bytes each time (mem_alloc_tiny).
+ */
+extern char *human_speed(uint64_t speed);
+
+/*
+ * From a potentially tiny number produce a string possibly using SI prefix
+ * eg. 0.000123 -> "123 u" or 0.123456 -> "123.456 m".
+ * Note: "leaks" 16 bytes each time (mem_alloc_tiny).
+ */
+extern char *human_prefix_small(double num);
+
+/*
+ * Compute the least common multiple, lowest common multiple, or smallest
+ * common multiple of two integers x and y, usually denoted by LCM(x, y),
+ * is the smallest positive integer that is divisible by both x and y.
+ */
+extern unsigned int lcm(unsigned int x, unsigned int y);
+
+/*
+ * Remove leading spaces from a string.
+ */
+extern char *ltrim(char *str);
+
+/*
+ * Remove trailing spaces from a string.
+ */
+extern char *rtrim(char *str);
+
+/*
+ * Return total physical host memory, in bytes. A return of -1 means we don't
+ * know.
+ */
+extern int64_t host_total_mem(void);
+
+/*
+ * Return available physical host memory, in bytes. A return of -1 means we
+ * don't know.
+ * Note that if we're running several forks or MPI processes on same host, the
+ * figure needs to be divided by that number to be used per process.
+ */
+extern int64_t host_avail_mem(void);
+
+/*
+ * Parse string for boolean. Case insensitive:
+ * y/yes/true/1/OPT_TRISTATE_NO_PARAM: return 1
+ * n/no/false/0/OPT_TRISTATE_NEGATED: return 0
+ * None of the above (including string == NULL): return -1
+ */
+extern int parse_bool(char *string);
 
 #endif

@@ -22,9 +22,8 @@
  */
 
 #include "md4.h"
-#ifndef HAVE_LIBSSL
+#if !HAVE_LIBCRYPTO
 #include <string.h>
-#include "memdbg.h"
 
 /*
  * The basic MD4 functions.

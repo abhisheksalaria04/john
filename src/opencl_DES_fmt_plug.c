@@ -20,13 +20,12 @@ john_register_one(&fmt_opencl_DES);
 #include "formats.h"
 #include "config.h"
 #include "opencl_DES_bs.h"
-#include "opencl_DES_hst_dev_shared.h"
-#include "memdbg.h"
+#include "../run/opencl/opencl_DES_hst_dev_shared.h"
 
 #define FORMAT_NAME			"traditional crypt(3)"
 
 #define BENCHMARK_COMMENT		""
-#define BENCHMARK_LENGTH		0
+#define BENCHMARK_LENGTH		7
 
 #define CIPHERTEXT_LENGTH_1		13
 #define CIPHERTEXT_LENGTH_2		24
@@ -133,20 +132,6 @@ static int valid(char *ciphertext, struct fmt_main *pFmt)
 	}
 }
 
-static char *split(char *ciphertext, int index, struct fmt_main *pFmt)
-{
-	static char out[14];
-
-	if (index) {
-		memcpy(out, &ciphertext[2], 2);
-		memcpy(&out[2], &ciphertext[13], 11);
-	} else
-		memcpy(out, ciphertext, 13);
-
-	out[13] = 0;
-	return out;
-}
-
 static WORD *do_IP(WORD in[2])
 {
 	static WORD out[2];
@@ -228,6 +213,25 @@ static WORD raw_get_salt(char *ciphertext)
 		((WORD)DES_atoi64[ARCH_INDEX(ciphertext[1])] << 6);
 }
 
+static char *split(char *ciphertext, int index, struct fmt_main *pFmt)
+{
+	static char out[14];
+
+	if (index) {
+		memcpy(out, &ciphertext[2], 2);
+		memcpy(&out[2], &ciphertext[13], 11);
+	} else
+		memcpy(out, ciphertext, 13);
+	out[13] = 0;
+
+/* Replace potential invalid salts with their valid counterparts */
+	unsigned int salt = raw_get_salt(out);
+	out[0] = itoa64[salt & 0x3f];
+	out[1] = itoa64[salt >> 6];
+
+	return out;
+}
+
 static void *get_salt(char *ciphertext)
 {
 	static WORD out;
@@ -270,7 +274,7 @@ struct fmt_main fmt_opencl_DES = {
 		sizeof(WORD),
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_CASE | FMT_TRUNC | FMT_BS | FMT_REMOVE,
+		FMT_CASE | FMT_TRUNC | FMT_BS | FMT_REMOVE | FMT_MASK,
 		{ NULL },
 		{ NULL },
 		tests

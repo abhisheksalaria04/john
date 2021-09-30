@@ -40,12 +40,25 @@
 #endif /* !defined __MINGW32__ */
 
 #include "tty.h"
-#include "memdbg.h"
 
 #if !defined(__DJGPP__) && !defined(__MINGW32__) && !defined (_MSC_VER)
 static int tty_fd = -1;
 static struct termios saved_ti;
+#else
+static int in_stdin_mode;
 #endif
+
+/*
+ * This must be async signal-safe (for MPI builds, at least)
+ */
+int tty_has_keyboard(void)
+{
+#if !defined(__DJGPP__) && !defined(__MINGW32__) && !defined (_MSC_VER)
+	return (tty_fd >= 0);
+#else
+	return !(in_stdin_mode && isatty(fileno(stdin)));
+#endif
+}
 
 void tty_init(opt_flags stdin_mode)
 {
@@ -53,25 +66,37 @@ void tty_init(opt_flags stdin_mode)
 	int fd;
 	struct termios ti;
 
-	if (tty_fd >= 0) return;
-
+	if (tty_fd >= 0)
+		return;
 /*
  * If we're in "--stdin" mode (reading candidate passwords from stdin), then
  * only initialize the tty if stdin is not a tty.  Otherwise it could be the
  * same tty, in which case we'd interfere with the user's ability to type
  * candidate passwords directly to John.
  */
-	if (stdin_mode && !tcgetattr(0, &ti))
+	if (stdin_mode && isatty(fileno(stdin)))
 		return;
 
-	if ((fd = open("/dev/tty", O_RDONLY | O_NONBLOCK)) < 0) return;
+	if ((fd = open("/dev/tty", O_RDONLY | O_NONBLOCK)) < 0)
+		return;
 
+/*
+ * Give up the keyboard if we're not the foreground process.  This can be
+ * overridden with --force-tty option.
+ */
+#ifndef BENCH_BUILD
+	if (!(options.flags & FLG_FORCE_TTY))
+#endif
 	if (tcgetpgrp(fd) != getpid()) {
-		close(fd); return;
+		close(fd);
+		return;
 	}
 
 	tcgetattr(fd, &ti);
 	saved_ti = ti;
+/*
+ * Set up terminal for reading keystrokes, and no echo.
+ */
 	ti.c_lflag &= ~(ICANON | ECHO);
 	ti.c_cc[VMIN] = 1;
 	ti.c_cc[VTIME] = 0;
@@ -80,6 +105,8 @@ void tty_init(opt_flags stdin_mode)
 	tty_fd = fd;
 
 	atexit(tty_done);
+#else
+	in_stdin_mode = stdin_mode;
 #endif
 }
 
@@ -102,7 +129,8 @@ int tty_getchar(void)
 			return -1;
 #endif
 		c = 0;
-		if (read(tty_fd, &c, 1) > 0) return c;
+		if (read(tty_fd, &c, 1) > 0)
+			return c;
 	}
 #elif defined(__DJGPP__)
 	if (_bios_keybrd(_KEYBRD_READY))
@@ -120,9 +148,17 @@ void tty_done(void)
 #if !defined(__DJGPP__) && !defined(__MINGW32__) && !defined (_MSC_VER)
 	int fd;
 
-	if (tty_fd < 0) return;
+	if (tty_fd < 0)
+		return;
 
 	fd = tty_fd; tty_fd = -1;
+
+/* Do the usually-best-thing in the race condition sometimes caused by --force-tty */
+#ifndef BENCH_BUILD
+	if (options.flags & FLG_FORCE_TTY)
+		saved_ti.c_lflag |= (ICANON | ECHO);
+#endif
+
 	tcsetattr(fd, TCSANOW, &saved_ti);
 
 	close(fd);

@@ -1,4 +1,5 @@
-/* Skein cracker patch for JtR. Hacked together during April of 2013 by Dhiru
+/*
+ * Skein cracker patch for JtR. Hacked together during April of 2013 by Dhiru
  * Kholia <dhiru at openwall.com>.
  *
  * This software is Copyright (c) 2013 Dhiru Kholia <dhiru at openwall.com> and
@@ -17,53 +18,40 @@ john_register_one(&fmt_skein_512);
 #else
 
 #include <string.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "arch.h"
-#include "sph_skein.h"
 #include "misc.h"
 #include "common.h"
 #include "formats.h"
 #include "params.h"
 #include "options.h"
-#ifdef _OPENMP
-static int omp_t = 1;
-#include <omp.h>
-// OMP_SCALE tuned on core i7 quad core HT
-//        256bt  512bt
-// 1   -  233k   232k
-// 64  - 5406k  5377k
-// 128 - 6730k  6568k
-// 256 - 7618k  7405k
-// 512 - 8243k  8000k
-// 1k  - 8610k  8408k  ** this level chosen
-// 2k  - 8804k  8610k
-// 4k  - 8688k  8648k
-#ifndef OMP_SCALE
-#ifdef __MIC__
-#define OMP_SCALE  64
-#else
-#define OMP_SCALE  1024
-#endif // __MIC__
-#endif // OMP_SCALE
-#endif // _OPENMP
-#include "memdbg.h"
+#include "sph_skein.h"
 
 // Skein-256 or Skein-512 are the real format labels.
-#define FORMAT_LABEL		"Skein"
-#define FORMAT_NAME		""
-#define FORMAT_TAG		"$skein$"
-#define TAG_LENGTH		(sizeof(FORMAT_TAG)-1)
-#define ALGORITHM_NAME		"Skein 32/" ARCH_BITS_STR
-#define BENCHMARK_COMMENT	""
-#define BENCHMARK_LENGTH	-1
-#define PLAINTEXT_LENGTH	125
-#define BINARY_SIZE256		32
-#define BINARY_SIZE512		64
-#define CMP_SIZE		28 // skein224
-#define SALT_SIZE		0
-#define MIN_KEYS_PER_CRYPT	1
-#define MAX_KEYS_PER_CRYPT	1
-#define BINARY_ALIGN		4
-#define SALT_ALIGN		1
+#define FORMAT_LABEL            "Skein"
+#define FORMAT_NAME             ""
+#define FORMAT_TAG              "$skein$"
+#define TAG_LENGTH              (sizeof(FORMAT_TAG)-1)
+#define ALGORITHM_NAME          "Skein 32/" ARCH_BITS_STR
+#define BENCHMARK_COMMENT       ""
+#define BENCHMARK_LENGTH        0x107
+#define PLAINTEXT_LENGTH        125
+#define BINARY_SIZE256          32
+#define BINARY_SIZE512          64
+#define BINARY_ALIGN            4
+#define CMP_SIZE                28 // skein224
+#define SALT_SIZE               0
+#define SALT_ALIGN              1
+#define MIN_KEYS_PER_CRYPT      1
+#define MAX_KEYS_PER_CRYPT      128
+
+#ifndef OMP_SCALE
+#define OMP_SCALE               4 // Tuned w/ MKPC for core i7
+#endif
 
 static struct fmt_tests skein_256_tests[] = {
 	{"39CCC4554A8B31853B9DE7A1FE638A24CCE6B35A55F2431009E18780335D2621", ""},
@@ -88,16 +76,12 @@ static struct fmt_tests skein_512_tests[] = {
 };
 
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
-static ARCH_WORD_32 (*crypt_out)[BINARY_SIZE512 / sizeof(ARCH_WORD_32)];
+static uint32_t (*crypt_out)[BINARY_SIZE512 / sizeof(uint32_t)];
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
+	omp_autotune(self, OMP_SCALE);
+
 	saved_key = mem_calloc(sizeof(*saved_key), self->params.max_keys_per_crypt);
 	crypt_out = mem_calloc(sizeof(*crypt_out), self->params.max_keys_per_crypt);
 }
@@ -120,7 +104,7 @@ static int valid(char *ciphertext, struct fmt_main *self, int len)
 		return 0;
 
 	while(*p)
-		if(atoi16[ARCH_INDEX(*p++)]==0x7f)
+		if (atoi16[ARCH_INDEX(*p++)]==0x7f)
 			return 0;
 	return 1;
 }
@@ -142,8 +126,7 @@ static char *split(char *ciphertext, int index, struct fmt_main *self)
 		ciphertext += TAG_LENGTH;
 
 	memcpy(out, FORMAT_TAG, TAG_LENGTH);
-	strnzcpy(out + TAG_LENGTH, ciphertext, BINARY_SIZE512*2 + 1);
-	strlwr(out + TAG_LENGTH);
+	strnzcpylwr(out + TAG_LENGTH, ciphertext, BINARY_SIZE512*2 + 1);
 	return out;
 }
 
@@ -195,58 +178,52 @@ static void *get_binary_512(char *ciphertext)
 	return out;
 }
 
-static int get_hash_0(int index) { return crypt_out[index][0] & PH_MASK_0; }
-static int get_hash_1(int index) { return crypt_out[index][0] & PH_MASK_1; }
-static int get_hash_2(int index) { return crypt_out[index][0] & PH_MASK_2; }
-static int get_hash_3(int index) { return crypt_out[index][0] & PH_MASK_3; }
-static int get_hash_4(int index) { return crypt_out[index][0] & PH_MASK_4; }
-static int get_hash_5(int index) { return crypt_out[index][0] & PH_MASK_5; }
-static int get_hash_6(int index) { return crypt_out[index][0] & PH_MASK_6; }
+#define COMMON_GET_HASH_VAR crypt_out
+#include "common-get-hash.h"
 
 static int crypt_256(int *pcount, struct db_salt *salt)
 {
 	int count = *pcount;
-	int index = 0;
+	int index;
 
 #ifdef _OPENMP
 #pragma omp parallel for
-	for (index = 0; index < count; index++)
 #endif
-	{
+	for (index = 0; index < count; index++) {
 		sph_skein256_context ctx;
 
 		sph_skein256_init(&ctx);
 		sph_skein256(&ctx, saved_key[index], strlen(saved_key[index]));
 		sph_skein256_close(&ctx, (unsigned char*)crypt_out[index]);
 	}
+
 	return count;
 }
 
 static int crypt_512(int *pcount, struct db_salt *salt)
 {
 	int count = *pcount;
-	int index = 0;
+	int index;
 
 #ifdef _OPENMP
 #pragma omp parallel for
-	for (index = 0; index < count; index++)
 #endif
-	{
+	for (index = 0; index < count; index++) {
 		sph_skein512_context ctx;
 
 		sph_skein512_init(&ctx);
 		sph_skein512(&ctx, saved_key[index], strlen(saved_key[index]));
 		sph_skein512_close(&ctx, (unsigned char*)crypt_out[index]);
 	}
+
 	return count;
 }
 
 static int cmp_all(void *binary, int count)
 {
-	int index = 0;
-#ifdef _OPENMP
-	for (; index < count; index++)
-#endif
+	int index;
+
+	for (index = 0; index < count; index++)
 		if (!memcmp(binary, crypt_out[index], CMP_SIZE))
 			return 1;
 	return 0;
@@ -264,11 +241,7 @@ static int cmp_exact(char *source, int index)
 
 static void skein_set_key(char *key, int index)
 {
-	int saved_len = strlen(key);
-	if (saved_len > PLAINTEXT_LENGTH)
-		saved_len = PLAINTEXT_LENGTH;
-	memcpy(saved_key[index], key, saved_len);
-	saved_key[index][saved_len] = 0;
+	strnzcpy(saved_key[index], key, sizeof(*saved_key));
 }
 
 static char *get_key(int index)
@@ -324,20 +297,14 @@ struct fmt_main fmt_skein_256 = {
 		fmt_default_clear_keys,
 		crypt_256,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,
 		cmp_exact
 	}
 };
-
 
 struct fmt_main fmt_skein_512 = {
 	{
@@ -387,13 +354,8 @@ struct fmt_main fmt_skein_512 = {
 		fmt_default_clear_keys,
 		crypt_512,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,

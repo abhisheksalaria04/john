@@ -18,6 +18,7 @@ john_register_one(&fmt_dahua);
 #else
 
 #include <string.h>
+#include <ctype.h>
 
 #if !FAST_FORMATS_OMP
 #undef _OPENMP
@@ -25,13 +26,6 @@ john_register_one(&fmt_dahua);
 
 #ifdef _OPENMP
 #include <omp.h>
-#ifndef OMP_SCALE
-#ifdef __MIC__
-#define OMP_SCALE 512
-#else
-#define OMP_SCALE 32768		// tuned K8-dual HT
-#endif // __MIC__
-#endif // OMP_SCALE
 #endif // _OPENMP
 
 #include "arch.h"
@@ -42,8 +36,6 @@ john_register_one(&fmt_dahua);
 #include "johnswap.h"
 #include "params.h"
 #include "options.h"
-#include "memdbg.h"
-#include <ctype.h>
 
 #define FORMAT_LABEL            "dahua"
 #define FORMAT_NAME             "\"MD5 based authentication\" Dahua"
@@ -51,14 +43,22 @@ john_register_one(&fmt_dahua);
 #define TAG_LENGTH              (sizeof(FORMAT_TAG) - 1)
 #define ALGORITHM_NAME          "MD5 32/" ARCH_BITS_STR
 #define BENCHMARK_COMMENT       ""
-#define BENCHMARK_LENGTH        -1
+#define BENCHMARK_LENGTH        0x107
 #define PLAINTEXT_LENGTH        125
 #define BINARY_SIZE             8
-#define BINARY_ALIGN            sizeof(ARCH_WORD_32)
+#define BINARY_ALIGN            sizeof(uint32_t)
 #define SALT_SIZE               0
 #define SALT_ALIGN              1
 #define MIN_KEYS_PER_CRYPT      1
-#define MAX_KEYS_PER_CRYPT      1
+#define MAX_KEYS_PER_CRYPT      64
+
+#ifndef OMP_SCALE
+#ifdef __MIC__
+#define OMP_SCALE 32
+#else
+#define OMP_SCALE 16		// MKPC & scale tuned for i7
+#endif // __MIC__
+#endif // OMP_SCALE
 
 static struct fmt_tests tests[] = {
 	{"$dahua$4WzwxXxM", "888888"},  // from hashcat.net
@@ -72,17 +72,12 @@ static struct fmt_tests tests[] = {
 
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
 static int *saved_len;
-static ARCH_WORD_32 (*crypt_out)[BINARY_SIZE / sizeof(ARCH_WORD_32)];
+static uint32_t (*crypt_out)[BINARY_SIZE / sizeof(uint32_t)];
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	int omp_t = omp_get_num_threads();
+	omp_autotune(self, OMP_SCALE);
 
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
 	saved_key = mem_calloc(self->params.max_keys_per_crypt,
 	                       sizeof(*saved_key));
 	saved_len = mem_calloc(self->params.max_keys_per_crypt,
@@ -123,7 +118,7 @@ static int valid(char *ciphertext, struct fmt_main *self)
 static void *get_binary(char *ciphertext)
 {
 	static union {
-		char c[BINARY_SIZE];
+		char c[BINARY_SIZE+1];
 		ARCH_WORD dummy;
 	} buf;
 	char *p;
@@ -135,13 +130,8 @@ static void *get_binary(char *ciphertext)
 	return out;
 }
 
-static int get_hash_0(int index) { return crypt_out[index][0] & PH_MASK_0; }
-static int get_hash_1(int index) { return crypt_out[index][0] & PH_MASK_1; }
-static int get_hash_2(int index) { return crypt_out[index][0] & PH_MASK_2; }
-static int get_hash_3(int index) { return crypt_out[index][0] & PH_MASK_3; }
-static int get_hash_4(int index) { return crypt_out[index][0] & PH_MASK_4; }
-static int get_hash_5(int index) { return crypt_out[index][0] & PH_MASK_5; }
-static int get_hash_6(int index) { return crypt_out[index][0] & PH_MASK_6; }
+#define COMMON_GET_HASH_VAR crypt_out
+#include "common-get-hash.h"
 
 // from hashcat.net (alxchk)
 static void compressor(unsigned char *in, unsigned char *out)
@@ -164,12 +154,11 @@ static void compressor(unsigned char *in, unsigned char *out)
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
 	const int count = *pcount;
-	int index = 0;
+	int index;
 #ifdef _OPENMP
 #pragma omp parallel for
-	for (index = 0; index < count; index++)
 #endif
-	{
+	for (index = 0; index < count; index++) {
 		// hash is compressor(md5(password))
 		MD5_CTX ctx;
 		unsigned char *out = (unsigned char*)crypt_out[index];
@@ -181,15 +170,15 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 		compressor(hash, out);
 	}
+
 	return count;
 }
 
 static int cmp_all(void *binary, int count)
 {
-	int index = 0;
-#ifdef _OPENMP
-	for (; index < count; index++)
-#endif
+	int index;
+
+	for (index = 0; index < count; index++)
 		if (!memcmp(binary, crypt_out[index], ARCH_SIZE))
 			return 1;
 	return 0;
@@ -207,8 +196,7 @@ static int cmp_exact(char *source, int index)
 
 static void dahua_set_key(char *key, int index)
 {
-	saved_len[index] = strlen(key);
-	strncpy(saved_key[index], key, sizeof(saved_key[0]));
+	saved_len[index] = strnzcpyn(saved_key[index], key, sizeof(*saved_key));
 }
 
 static char *get_key(int index)
@@ -266,13 +254,8 @@ struct fmt_main fmt_dahua = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,

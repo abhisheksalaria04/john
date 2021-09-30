@@ -1,35 +1,46 @@
-## *John the Ripper* [![Build Status](https://travis-ci.org/magnumripper/JohnTheRipper.svg)](https://travis-ci.org/magnumripper/JohnTheRipper) [![Circle CI](https://circleci.com/gh/magnumripper/JohnTheRipper/tree/bleeding-jumbo.svg?style=shield)](https://circleci.com/gh/magnumripper/JohnTheRipper/tree/bleeding-jumbo) [![Downloads](https://img.shields.io/badge/Download-Windows%20Build-green.svg)] (http://daily-builds.appspot.com/latest) [![License](https://img.shields.io/badge/License-GPL%20v2%2B-blue.svg)] (https://github.com/magnumripper/JohnTheRipper/blob/readme/doc/LICENSE)
+[![Circle CI](https://circleci.com/gh/openwall/john/tree/bleeding-jumbo.svg?style=shield)](https://circleci.com/gh/openwall/john/tree/bleeding-jumbo)
+[![Downloads](https://img.shields.io/badge/Download-Windows%20Build-blue.svg)](https://github.com/openwall/john-packages/releases/tag/jumbo-dev)
+[![License](https://img.shields.io/badge/License-GPL%20v2%2B-blue.svg)](https://github.com/openwall/john/blob/bleeding-jumbo/doc/LICENSE)
+[![Search hit](https://img.shields.io/github/search/openwall/john/goto.svg?label=GitHub%20Hits)](https://github.com/search?utf8=%E2%9C%93&q=john%20the%20ripper&type=)
 
-This is a community-enhanced, "jumbo" version of John the Ripper.
-It has a lot of code, documentation, and data contributed by the
-user community.  This is not "official" John the Ripper code.  It is
-very easy for new code to be added to jumbo: the quality requirements
-are low.  This means that you get a lot of functionality that is not
-"mature" enough or is otherwise inappropriate for the official JtR,
-which in turn also means that bugs in this code are to be expected.
+John the Ripper
+===============
+
+This is the community-enhanced, "jumbo" version of John the Ripper.
+It has a lot of code, documentation, and data contributed by jumbo
+developers and the user community.  It is easy for new code to be added
+to jumbo, and the quality requirements are low, although lately we've
+started subjecting all contributions to quite some automated testing.
+This means that you get a lot of functionality that is not necessarily
+"mature", which in turn means that bugs in this code are to be expected.
+
+John the Ripper homepage is:
+
+https://www.openwall.com/john/
 
 If you have any comments on this release or on JtR in general, please
-join the john-users mailing list and post in there.
+join the john-users mailing list and post in there:
 
-Licensing info:
-http://openwall.info/wiki/john/licensing
+https://www.openwall.com/lists/john-users/
 
-How to contribute more code:
-http://openwall.info/wiki/how-to-make-patches
+For contributions to John the Ripper jumbo, please use pull requests on
+GitHub:
+
+https://github.com/openwall/john/blob/bleeding-jumbo/CONTRIBUTING.md
+
+Included below is basic John the Ripper core documentation.
 
 ---
 
 	John the Ripper password cracker.
 
 John the Ripper is a fast password cracker, currently available for
-many flavors of Unix (11 are officially supported, not counting
-different architectures), Windows, DOS, BeOS, and OpenVMS (the latter
+many flavors of Unix, macOS, Windows, DOS, BeOS, and OpenVMS (the latter
 requires a contributed patch).  Its primary purpose is to detect weak
 Unix passwords.  Besides several crypt(3) password hash types most
 commonly found on various Unix flavors, supported out of the box are
 Kerberos/AFS and Windows LM hashes, as well as DES-based tripcodes, plus
-many more hashes and ciphers in "community enhanced" -jumbo versions
-and/or with other contributed patches.
+hundreds of additional hashes and ciphers in "-jumbo" versions.
 
 
 	How to install.
@@ -82,7 +93,7 @@ choose the executable that fits your system best, e.g. "john-omp" to
 take advantage of multiple CPUs and/or CPU cores.
 
 
-	Features and performance.
+	Features.
 
 John the Ripper is designed to be both feature-rich and fast.  It
 combines several cracking modes in one program and is fully
@@ -115,43 +126,35 @@ proper OMPFLAGS line near the beginning of the Makefile and at runtime
 by setting the OMP_NUM_THREADS environment variable to the desired
 number of threads).
 
-John the Ripper Pro adds support for Windows NTLM (MD4-based) and Mac
-OS X 10.4+ salted SHA-1 hashes.
-
-"Community enhanced" -jumbo versions add support for many more password
-hash types, including Windows NTLM (MD4-based), Mac OS X 10.4-10.6
-salted SHA-1 hashes, Mac OS X 10.7 salted SHA-512 hashes, raw MD5 and
-SHA-1, arbitrary MD5-based "web application" password hash types, hashes
-used by SQL database servers (MySQL, MS SQL, Oracle) and by some LDAP
-servers, several hash types used on OpenVMS, password hashes of the
-Eggdrop IRC bot, and lots of other hash types, as well as many
-non-hashes such as OpenSSH private keys, S/Key skeykeys files, Kerberos
-TGTs, PDF files, ZIP (classic PKZIP and WinZip/AES) and RAR archives.
-
-Unlike older crackers, John normally does not use a crypt(3)-style
-routine.  Instead, it has its own highly optimized modules for different
-hash types and processor architectures.  Some of the algorithms used,
-such as bitslice DES, couldn't have been implemented within the crypt(3)
-API; they require a more powerful interface such as the one used in
-John.  Additionally, there are assembly language routines for several
-processor architectures, most importantly for x86-64 and x86 with SSE2.
+"-jumbo" versions add support for hundreds of additional hash and cipher
+types, including fast built-in implementations of SHA-crypt and SunMD5,
+Windows NTLM (MD4-based) password hashes, various macOS and Mac OS X
+user password hashes, fast hashes such as raw MD5, SHA-1, SHA-256, and
+SHA-512 (which many "web applications" historically misuse for
+passwords), various other "web application" password hashes, various SQL
+and LDAP server password hashes, and lots of other hash types, as well
+as many non-hashes such as SSH private keys, S/Key skeykeys files,
+Kerberos TGTs, encrypted filesystems such as macOS .dmg files and
+"sparse bundles", encrypted archives such as ZIP (classic PKZIP and
+WinZip/AES), RAR, and 7z, encrypted document files such as PDF and
+Microsoft Office's - and these are just some examples.  To load some of
+these larger files for cracking, a corresponding bundled *2john program
+should be used first, and then its output fed into JtR -jumbo.
 
 
-        Graphical User Interface (GUI).
+	Graphical User Interface (GUI).
 
 There is an official GUI for John the Ripper: Johnny.
 
-Despite the fact that Johnny is oriented onto core john, all basic
-functionality is supposed to work in all versions, even Jumbo. So,
-password could be loaded from file and cracked with different
-options.
+Despite the fact that Johnny is oriented onto JtR core, all basic
+functionality is supposed to work in all versions, including jumbo.
 
-Johnny is a separate program, therefore, you need to have John the
-Ripper installed in order to use it.
+Johnny is a separate program, therefore you need to have John the Ripper
+installed in order to use it.
 
-You could find more info about releases and Johnny on the wiki:
+More information about Johnny and its releases is on the wiki:
 
-  http://openwall.info/wiki/john/johnny
+https://openwall.info/wiki/john/johnny
 
 
 	Documentation.
@@ -174,5 +177,8 @@ the recommended order of reading:
 * COPYING - GNU GPL version 2, as referenced by LICENSE above
 
 (*) most users can safely skip these.
+
+There are a lot of additional documentation files in jumbo's "doc"
+directory, which you'll also want to explore.
 
 Happy reading!

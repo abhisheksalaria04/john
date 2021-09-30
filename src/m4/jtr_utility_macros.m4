@@ -1,12 +1,12 @@
-# This file is Copyright (C) 2014 JimF, and magnum
-# and is hereby released to the general public under the following terms:
-# Redistribution and use in source and binary forms, with or without
-# modifications, are permitted.
-#
-# Here are contained numerous utility macros
+dnl This file is Copyright (C) 2014 JimF, and magnum
+dnl and is hereby released to the general public under the following terms:
+dnl Redistribution and use in source and binary forms, with or without
+dnl modifications, are permitted.
+dnl
+dnl Here are contained numerous utility macros
 
-# JTR_LIST_ADD(variable, value(s))
-# Add space separated value(s) to variable unless already present.
+dnl JTR_LIST_ADD(variable, value(s))
+dnl Add space separated value(s) to variable unless already present.
 AC_DEFUN([JTR_LIST_ADD], [
    for i in $2; do
       jtr_list_add_dupe=0
@@ -28,50 +28,79 @@ AC_DEFUN([JTR_LIST_ADD_RESULT], [
    jtr_list_add_result=""
 ])
 
-# @synopsis JTR_FLAG_CHECK [compiler flags]
-# @summary check whether compiler supports given
-#          C flags or not. The var CFLAGS_EX is
-#          added to with each 'valid' command.
+dnl @synopsis JTR_FLAG_CHECK([compiler flags], flags)
+dnl @summary check whether compiler supports given options or not.
+dnl CFLAGS_EX is appended with each 'valid' command.
+dnl
+dnl If a second argument is 0, don't show progress
+dnl If a second argument is 1, show progress
+dnl If a second argument is 2, bails if not supported
 AC_DEFUN([JTR_FLAG_CHECK],
-[dnl
-  AS_IF([test "$2" = 1], [AC_MSG_CHECKING([if $CC supports $1])])
+ [AS_IF([test $2 -gt 0], [AC_MSG_CHECKING([if $CC supports $1])])
   AC_LANG_PUSH([C])
   ac_saved_cflags="$CFLAGS"
   CFLAGS="-Werror $1"
   AC_COMPILE_IFELSE([AC_LANG_PROGRAM([])],
-    [AS_IF([test "$2" = 1], [AC_MSG_RESULT([yes])])]
+    [AS_IF([test "$2" -gt 0], [AC_MSG_RESULT([yes])])]
       [CFLAGS_EX="$CFLAGS_EX $1"]
-    ,[AS_IF([test "$2" = 1], [AC_MSG_RESULT([no])])]
+    ,[AS_IF([test $2 -gt 0], [AC_MSG_RESULT([no])])]
+    [AS_IF([test "$2" = 2], [AC_MSG_ERROR([Not supported by compiler])])]
   )
   CFLAGS="$ac_saved_cflags"
   AC_LANG_POP([C])
 ])
 
-# @synopsis JTR_FLAG_CHECK_LINK [compiler flags]
-# @summary check whether compiler supports given
-#          C flags or not. The var CFLAGS_EX is
-#          added to with each 'valid' command.
-#          This macro adds linkage, since some
-#          functions will compile, but fail at
-#          link time (-faddress_sanitize is one)
+dnl @synopsis JTR_NOWARN_CHECK([specific-warning], flags)
+dnl @summary check whether compiler supports -Wspecific-warning and if
+dnl it does, CFLAGS_EX is appended with -Wno-specific-warning
+dnl
+dnl The reason is we can test for -Wfoo but not -Wno-foo (soft fail by design)
+dnl
+dnl If a second argument is 0, don't show progress
+dnl If a second argument is 1, show progress
+dnl If a second argument is 2, bails if not supported
+AC_DEFUN([JTR_NOWARN_CHECK],
+ warn="-W$1"
+ nowarn="-Wno-$1"
+ [AS_IF([test $2 -gt 0], [AC_MSG_CHECKING([if $CC supports $nowarn])])
+  AC_LANG_PUSH([C])
+  ac_saved_cflags="$CFLAGS"
+  CFLAGS="-Werror $warn"
+  AC_COMPILE_IFELSE([AC_LANG_PROGRAM([])],
+    [AS_IF([test "$2" -gt 0], [AC_MSG_RESULT([yes])])]
+      [CFLAGS_EX="$CFLAGS_EX $nowarn"]
+    ,[AS_IF([test $2 -gt 0], [AC_MSG_RESULT([no])])]
+    [AS_IF([test "$2" = 2], [AC_MSG_ERROR([Not supported by compiler])])]
+  )
+  CFLAGS="$ac_saved_cflags"
+  AC_LANG_POP([C])
+])
+
+dnl @synopsis JTR_FLAG_CHECK_LINK(compiler flags[, flags])
+dnl @summary check whether compiler and linker supports given options or not.
+dnl CFLAGS_EX is appended with each 'valid' command.
+dnl
+dnl If a second argument is 0, don't show progress
+dnl If a second argument is 1, show progress
+dnl If a second argument is 2, bails if not supported
 AC_DEFUN([JTR_FLAG_CHECK_LINK],
-[dnl
-  AS_IF([test "$2" = 1], [AC_MSG_CHECKING([if $CC supports $1])])
+ [AS_IF([test $2 -gt 0], [AC_MSG_CHECKING([if $CC supports $1 w/ linking])])
   AC_LANG_PUSH([C])
   ac_saved_cflags="$CFLAGS"
   CFLAGS="-Werror $1"
   AC_LINK_IFELSE([AC_LANG_PROGRAM([])],
-    [AS_IF([test "$2" = 1], [AC_MSG_RESULT([yes])])]
+    [AS_IF([test "$2" -gt 0], [AC_MSG_RESULT([yes])])]
       [CFLAGS_EX="$CFLAGS_EX $1"]
-    ,[AS_IF([test "$2" = 1], [AC_MSG_RESULT([no])])]
+    ,[AS_IF([test $2 -gt 0], [AC_MSG_RESULT([no])])]
+    [AS_IF([test "$2" = 2], [AC_MSG_ERROR([Not supported by compiler/linker])])]
   )
   CFLAGS="$ac_saved_cflags"
   AC_LANG_POP([C])
 ])
 
-# @synopsis SET_NORMAL_INCLUDES
-# @summary check and set many normal include paths
-# This might be a Bad Idea[tm] if cross compiling.
+dnl @synopsis SET_NORMAL_INCLUDES
+dnl @summary check and set many normal include paths
+dnl This might be a Bad Idea[tm] if cross compiling.
 AC_DEFUN([JTR_SET_NORMAL_INCLUDES],
 [
   AC_MSG_CHECKING([additional paths])
@@ -83,6 +112,24 @@ fi
 if test -d /usr/local/include; then
    ADD_CFLAGS="$ADD_CFLAGS -I/usr/local/include"
 fi
+dnl macOS MacPorts paths.
+if test -d /opt/local/lib; then
+   ADD_LDFLAGS="$ADD_LDFLAGS -L/opt/local/lib"
+fi
+if test -d /opt/local/include; then
+   ADD_CFLAGS="$ADD_CFLAGS -I/opt/local/include"
+fi
+dnl macOS Homebrew paths if now defined by OPENSSL_LIBS and OPENSSL_CFLAGS.
+if test -z "$OPENSSL_LIBS"; then
+  if test -d /usr/local/opt/openssl/lib; then
+     ADD_LDFLAGS="$ADD_LDFLAGS -L/usr/local/opt/openssl/lib"
+  fi
+fi
+if test -z "$OPENSSL_CFLAGS"; then
+  if test -d /usr/local/opt/openssl/include; then
+     ADD_CFLAGS="$ADD_CFLAGS -I/usr/local/opt/openssl/include"
+  fi
+fi
 JTR_LIST_ADD(CPPFLAGS, [$ADD_CFLAGS]) # no typo here
 jtr_list_add_result=""
 JTR_LIST_ADD(LDFLAGS, [$ADD_LDFLAGS])
@@ -90,9 +137,34 @@ JTR_LIST_ADD(CFLAGS, [$ADD_CFLAGS])
 JTR_LIST_ADD_RESULT
 ])
 
-# @synopsis SET_NORMAL_SSL_INCLUDES(base path)
-# @summary check and set include/library paths for OpenSSL
-# This might be a Bad Idea[tm] if cross compiling.
+dnl @synopsis SET_64_INCLUDES
+dnl @summary check and set some 64 bit includes
+dnl This might be a Bad Idea[tm] if cross compiling.
+AC_DEFUN([JTR_SET_64_INCLUDES],
+[
+  AC_MSG_CHECKING([additional paths (64 bit)])
+  ADD_LDFLAGS=""
+  ADD_CFLAGS=""
+if test -d /usr/local/lib64; then
+   ADD_LDFLAGS="$ADD_LDFLAGS -L/usr/local/lib64"
+fi
+if test -d /usr/lib64; then
+   ADD_LDFLAGS="$ADD_LDFLAGS -L/usr/lib64"
+fi
+if test -d /lib64; then
+   ADD_LDFLAGS="$ADD_LDFLAGS -L/lib64"
+fi
+JTR_LIST_ADD(CPPFLAGS, [$ADD_CFLAGS]) # no typo here
+jtr_list_add_result=""
+JTR_LIST_ADD(LDFLAGS, [$ADD_LDFLAGS])
+JTR_LIST_ADD(CFLAGS, [$ADD_CFLAGS])
+JTR_LIST_ADD_RESULT
+])
+
+
+dnl @synopsis SET_NORMAL_SSL_INCLUDES(base path)
+dnl @summary check and set include/library paths for OpenSSL
+dnl This might be a Bad Idea[tm] if cross compiling.
 AC_DEFUN([JTR_SET_NORMAL_SSL_INCLUDES],
 [
   AC_MSG_CHECKING([additional paths for OpenSSL])
@@ -111,40 +183,11 @@ JTR_LIST_ADD(CFLAGS, [$ADD_CFLAGS])
 JTR_LIST_ADD_RESULT
 ])
 
-# @synopsis JTR_SET_CUDA_INCLUDES
-# @summary check and set many normal include paths
-AC_DEFUN([JTR_SET_CUDA_INCLUDES],
-[
-   AC_ARG_VAR([NVIDIA_CUDA], [base path of CUDA installation])
-   AC_MSG_CHECKING([additional paths for CUDA])
-   ADD_LDFLAGS=""
-   ADD_CFLAGS=""
-   if test -n "$NVIDIA_CUDA"; then
-      CUDAPATH="$NVIDIA_CUDA"
-   else
-      CUDAPATH=/usr/local/cuda
-   fi
-   AC_SUBST([NVIDIA_CUDA],["$CUDAPATH"])
-   if test -d "$CUDAPATH/include"; then
-      ADD_CFLAGS="$ADD_CFLAGS -I$CUDAPATH/include"
-   fi
-   if test $CPU_BIT_STR = 64 -a -d "$CUDAPATH/lib64"; then
-      ADD_LDFLAGS="$ADD_LDFLAGS -L$CUDAPATH/lib64"
-   elif test -d "$CUDAPATH/lib"; then
-      ADD_LDFLAGS="$ADD_LDFLAGS -L$CUDAPATH/lib"
-   fi
-   JTR_LIST_ADD(CPPFLAGS, [$ADD_CFLAGS]) # no typo here
-   jtr_list_add_result=""
-   JTR_LIST_ADD(LDFLAGS, [$ADD_LDFLAGS])
-   JTR_LIST_ADD(CFLAGS, [$ADD_CFLAGS])
-   JTR_LIST_ADD_RESULT
-])
-
-# JTR_MSG_RESULT_FAILIF_FORCED(success, forced, forced_fail_msg)
-# success and forced should be xvar data, "x$enable_foobar", so they
-# will be xno, xyes, xauto, etc.  forced_fail_msg is a message that
-# will be output, and the script will abort, IF forced is xyes which
-# means the user used --enable-foobar
+dnl JTR_MSG_RESULT_FAILIF_FORCED(success, forced, forced_fail_msg)
+dnl success and forced should be xvar data, "x$enable_foobar", so they
+dnl will be xno, xyes, xauto, etc.  forced_fail_msg is a message that
+dnl will be output, and the script will abort, IF forced is xyes which
+dnl means the user used --enable-foobar
 AC_DEFUN([JTR_MSG_RESULT_FAILIF_FORCED], [
   if test "$1" == xyes; then
     AC_MSG_RESULT([yes])
@@ -156,35 +199,15 @@ AC_DEFUN([JTR_MSG_RESULT_FAILIF_FORCED], [
   fi
 ])
 
-# JTR_MSG_CHECKING_AND_RESULT_FAILIF_FORCED(chk_msg, success, forced, forced_fail_msg)
-# will output a checking 'chk_msg', then calls JTR_MSG_RESULT_FAILIF_FORCED
+dnl JTR_MSG_CHECKING_AND_RESULT_FAILIF_FORCED(chk_msg, success, forced, forced_fail_msg)
+dnl will output a checking 'chk_msg', then calls JTR_MSG_RESULT_FAILIF_FORCED
 AC_DEFUN([JTR_MSG_CHECKING_AND_RESULT_FAILIF_FORCED], [
   AC_MSG_CHECKING([$1])
   JTR_MSG_RESULT_FAILIF_FORCED($2,$3,$4)
 ])
 
-AC_DEFUN([JTR_CUDA],
-[
-  AC_ARG_VAR([NVCC], [full pathname of CUDA compiler])
-  AC_ARG_VAR([NVCC_GCC], [full pathname of CUDA compiler's gcc backend])
-  using_cuda=no
-  if test "x$enable_cuda" != xno; then
-     AS_IF([test "x$cross_compiling" = xno], [JTR_SET_CUDA_INCLUDES])
-     AC_PATH_PROG([NVCC], [nvcc], [], [$PATH$PATH_SEPARATOR$CUDAPATH])
-     AS_IF([test "x$NVCC" != "x"],
-        [AC_PATH_PROGS([NVCC_GCC],[clang-omp llvm-gcc-4.2 gcc-4.6 gcc-4.5 gcc-4.4 gcc-4.3 gcc-4.2], [], [$PATH$PATH_SEPARATOR$CUDAPATH])]
-	[AC_CHECK_HEADER([cuda.h], [AC_CHECK_LIB([cudart],[cudaGetDeviceCount],
-				   [using_cuda=yes]
-				   [AC_SUBST([HAVE_CUDA],[-DHAVE_CUDA])]
-				   [AC_SUBST(CUDA_LIBS, [-lcudart])])
-				   ])]
-     )
-     JTR_MSG_CHECKING_AND_RESULT_FAILIF_FORCED([whether CUDA usable], [x$using_cuda], [x$enable_cuda], [Could not find all required CUDA components])
-  fi
-])
-
-# @synopsis JTR_SET_OPENCL_INCLUDES
-# @summary check and set many normal include paths
+dnl @synopsis JTR_SET_OPENCL_INCLUDES
+dnl @summary check and set many normal include paths
 AC_DEFUN([JTR_SET_OPENCL_INCLUDES],
 [
    AC_MSG_CHECKING([additional paths for OpenCL])

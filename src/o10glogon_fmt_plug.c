@@ -16,6 +16,12 @@
  *
  */
 
+#if AC_BUILT
+#include "autoconfig.h"
+#endif
+
+#if HAVE_LIBCRYPTO
+
 #if FMT_EXTERNS_H
 extern struct fmt_main fmt_o10glogon;
 #elif FMT_REGISTERS_H
@@ -24,24 +30,19 @@ john_register_one(&fmt_o10glogon);
 
 #include <string.h>
 #include <openssl/des.h>
-#include <openssl/aes.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "arch.h"
 #include "misc.h"
 #include "common.h"
 #include "formats.h"
+#include "aes.h"
 #include "md5.h"
 #include "unicode.h"
 #include "base64_convert.h"
-#ifdef _OPENMP
-static int omp_t = 1;
-#include <omp.h>
-#ifndef OMP_SCALE
-#define OMP_SCALE               2048
-#endif
-#endif
-
-#include "memdbg.h"
 
 #define FORMAT_LABEL                    "o10glogon"
 #define FORMAT_NAME                     "Oracle 10g-logon protocol"
@@ -50,7 +51,7 @@ static int omp_t = 1;
 #define ALGORITHM_NAME                  "DES-AES128-MD5 32/" ARCH_BITS_STR
 
 #define BENCHMARK_COMMENT               ""
-#define BENCHMARK_LENGTH                -1
+#define BENCHMARK_LENGTH                7
 
 #define PLAINTEXT_LENGTH                32
 
@@ -60,11 +61,14 @@ static int omp_t = 1;
 #define SALT_SIZE                       (sizeof(ora10g_salt))
 #define SALT_ALIGN                      (sizeof(unsigned int))
 #define CIPHERTEXT_LENGTH               16
-
-#define MIN_KEYS_PER_CRYPT		1
-#define MAX_KEYS_PER_CRYPT		1
 #define MAX_HASH_LEN                    (FORMAT_TAG_LEN+MAX_USERNAME_LEN+1+64+1+64+1+160)
 
+#define MIN_KEYS_PER_CRYPT		1
+#define MAX_KEYS_PER_CRYPT		16
+
+#ifndef OMP_SCALE
+#define OMP_SCALE               8 // Tuned w/ MKPC for core i7
+#endif
 
 //#define DEBUG_ORACLE
 //
@@ -96,14 +100,9 @@ static DES_key_schedule desschedule1;	// key 0x0123456789abcdef
 
 static void init(struct fmt_main *self)
 {
-	DES_set_key((DES_cblock *)"\x01\x23\x45\x67\x89\xab\xcd\xef", &desschedule1);
+	omp_autotune(self, OMP_SCALE);
 
-#ifdef _OPENMP
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
+	DES_set_key((DES_cblock *)"\x01\x23\x45\x67\x89\xab\xcd\xef", &desschedule1);
 	cur_key = mem_calloc(self->params.max_keys_per_crypt,
 	                       sizeof(*cur_key));
 	plain_key = mem_calloc(self->params.max_keys_per_crypt,
@@ -189,7 +188,7 @@ static void oracle_set_key(char *key, int index) {
 	UTF16 *c;
 	int key_length;
 
-	strcpy(plain_key[index], key);
+	strnzcpy(plain_key[index], key, sizeof(*plain_key));
 	// Can't use enc_to_utf16_be() because we need to do utf16_uc later
 	key_length = enc_to_utf16(cur_key_mixedcase, PLAINTEXT_LENGTH, (unsigned char*)key, strlen(key));
 
@@ -308,12 +307,11 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 #ifdef _OPENMP
 #pragma omp parallel for
-	for (idx = 0; idx < count; idx++)
 #endif
-	{
+	for (idx = 0; idx < count; idx++) {
 		unsigned char buf[256], buf1[256];
 		unsigned int l;
-		ARCH_WORD_32 iv[2];
+		uint32_t iv[2];
 		DES_key_schedule desschedule2;
 
 		l = cur_salt->userlen + cur_key_len[idx];
@@ -364,6 +362,7 @@ static void *get_salt(char *ciphertext)
 	cp = strchr(cp+1, '$') + 1;
 	salt.auth_pass_len = strlen(cp)/2;
 	base64_convert(cp,e_b64_hex,salt.auth_pass_len*2,salt.auth_pass,e_b64_raw,salt.auth_pass_len,0,0);
+
 	return &salt;
 }
 
@@ -409,7 +408,7 @@ struct fmt_main fmt_o10glogon = {
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_8_BIT | FMT_UNICODE | FMT_UTF8 | FMT_SPLIT_UNIFIES_CASE | FMT_CASE | FMT_OMP,
+		FMT_8_BIT | FMT_UNICODE | FMT_ENC | FMT_SPLIT_UNIFIES_CASE | FMT_CASE | FMT_OMP,
 		{ NULL },
 		{ FORMAT_TAG },
 		tests
@@ -444,3 +443,4 @@ struct fmt_main fmt_o10glogon = {
 };
 
 #endif /* plugin stanza */
+#endif /* HAVE_LIBCRYPTO */

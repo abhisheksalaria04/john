@@ -41,7 +41,6 @@ john_register_one(&fmt_netsha1);
 #include "params.h"
 #include "options.h"
 
-#include "memdbg.h"
 
 #define FORMAT_LABEL            "net-sha1"
 #define FORMAT_NAME             "\"Keyed SHA1\" BFD"
@@ -49,11 +48,11 @@ john_register_one(&fmt_netsha1);
 #define TAG_LENGTH              (sizeof(FORMAT_TAG) - 1)
 #define ALGORITHM_NAME          "SHA1 32/" ARCH_BITS_STR
 #define BENCHMARK_COMMENT       ""
-#define BENCHMARK_LENGTH        0
+#define BENCHMARK_LENGTH        7
 
 #define PLAINTEXT_LENGTH        20  // get this right ;)
 #define BINARY_SIZE             20
-#define BINARY_ALIGN            sizeof(ARCH_WORD_32)
+#define BINARY_ALIGN            sizeof(uint32_t)
 #define SALT_SIZE               sizeof(struct custom_salt)
 #define SALT_ALIGN              MEM_ALIGN_WORD
 #define MIN_KEYS_PER_CRYPT      1
@@ -68,7 +67,7 @@ static struct fmt_tests tests[] = {
 };
 
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
-static ARCH_WORD_32 (*crypt_out)[BINARY_SIZE / sizeof(ARCH_WORD_32)];
+static uint32_t (*crypt_out)[BINARY_SIZE / sizeof(uint32_t)];
 static void get_ptr();
 static void init(struct fmt_main *self);
 static void done(void);
@@ -76,7 +75,7 @@ static void done(void);
 #define MAGIC 0xfe5aa5ef
 
 static struct custom_salt {
-	ARCH_WORD_32 magic;
+	uint32_t magic;
 	int length;
 	unsigned char salt[MAX_SALT_LEN]; // fixed size, but should be OK
 } *cur_salt;
@@ -202,7 +201,7 @@ static void set_salt(void *salt)
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
 	const int count = *pcount;
-	int index = 0;
+	int index;
 
 	if (cur_salt->magic != MAGIC) {
 		return pDynamicFmt->methods.crypt_all(pcount, salt);
@@ -210,8 +209,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-	for (index = 0; index < count; index++)
-	{
+	for (index = 0; index < count; index++) {
 		SHA_CTX ctx;
 
 		SHA1_Init(&ctx);
@@ -224,12 +222,13 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 static int cmp_all(void *binary, int count)
 {
-	int index = 0;
+	int index;
+
 	if (cur_salt->magic != MAGIC) {
 		return pDynamicFmt->methods.cmp_all(binary, count);
 	}
-	for (; index < count; index++)
-		if (((ARCH_WORD_32*)binary)[0] == crypt_out[index][0])
+	for (index = 0; index < count; index++)
+		if (((uint32_t*)binary)[0] == crypt_out[index][0])
 			return 1;
 	return 0;
 }
@@ -288,7 +287,7 @@ struct fmt_main fmt_netsha1 = {
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_CASE | FMT_8_BIT | FMT_OMP,
+		FMT_CASE | FMT_8_BIT | FMT_OMP | FMT_HUGE_INPUT,
 		{ NULL },
 		{ FORMAT_TAG },
 		tests
@@ -304,7 +303,7 @@ struct fmt_main fmt_netsha1 = {
 		{ NULL },
 		fmt_default_source,
 		{
-			fmt_default_binary_hash /* Not usable with $SOURCE_HASH$ */
+			fmt_default_binary_hash
 		},
 		fmt_default_salt_hash,
 		NULL,
@@ -314,7 +313,7 @@ struct fmt_main fmt_netsha1 = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			fmt_default_get_hash /* Not usable with $SOURCE_HASH$ */
+			fmt_default_get_hash
 		},
 		cmp_all,
 		cmp_one,

@@ -90,7 +90,6 @@
 
 #include "uaf_encode.h"
 #include "uaf_raw.h"
-#include "memdbg.h"
 
 /*
  * Define function, primarily used on non-VMS systems, to extract UAF data
@@ -167,6 +166,10 @@ int uaf_extract_from_raw(void *rec_vp, int rec_len,
 		acct->home_dir[i] = rec->defdev.s[i];
 	devlen = i;
 	len = rec->defdir.len;
+	if (len + devlen > sizeof(acct->home_dir)) {
+		*acct_status = "invalid defdir length";
+		return 0;
+	}
 	for (i = 0; i < len; i++)
 		acct->home_dir[i + devlen] = rec->defdir.s[i];
 	acct->home_dir[len + devlen] = '\0';
@@ -424,10 +427,11 @@ static void process_file(char *infile)
 			}
 		} else {
 			fprintf(stderr, "Error fetching UAF information, %s\n", prefix);
-			return;
+			goto bailout;
 		}
 	}
 
+bailout:
 	if (is_raw)
 		fclose(rawf);
 	else
@@ -435,7 +439,18 @@ static void process_file(char *infile)
 
 }
 
+#ifdef HAVE_LIBFUZZER
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+	return 0;
+}
+#endif
+
+#ifdef HAVE_LIBFUZZER
+int main_dummy(int argc, char **argv)
+#else
 int main(int argc, char **argv)
+#endif
 {
 	int i;
 

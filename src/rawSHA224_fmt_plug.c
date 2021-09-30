@@ -20,37 +20,20 @@ extern struct fmt_main fmt_rawSHA224;
 john_register_one(&fmt_rawSHA224);
 #else
 
+#include <stdint.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "arch.h"
 #include "sha2.h"
-#include "stdint.h"
 #include "params.h"
 #include "common.h"
 #include "johnswap.h"
 #include "formats.h"
-#include "simd-intrinsics.h"
-
-//#undef SIMD_COEF_32
-//#undef SIMD_PARA_SHA256
-
-/*
- * Only effective for SIMD.
- * Undef to disable reversing steps for benchmarking.
- */
 #define REVERSE_STEPS
-
-#ifdef _OPENMP
-#ifdef SIMD_COEF_32
-#ifndef OMP_SCALE
-#define OMP_SCALE			1024
-#endif
-#else
-#ifndef OMP_SCALE
-#define OMP_SCALE			2048
-#endif
-#endif
-#include <omp.h>
-#endif
-#include "memdbg.h"
+#include "simd-intrinsics.h"
 
 #define FORMAT_LABEL            "Raw-SHA224"
 #define FORMAT_NAME             ""
@@ -60,11 +43,11 @@ john_register_one(&fmt_rawSHA224);
 #ifdef SIMD_COEF_32
 #define ALGORITHM_NAME			SHA256_ALGORITHM_NAME
 #else
-#define ALGORITHM_NAME			"32/" ARCH_BITS_STR " " SHA2_LIB
+#define ALGORITHM_NAME			"32/" ARCH_BITS_STR
 #endif
 
 #define BENCHMARK_COMMENT		""
-#define BENCHMARK_LENGTH		-1
+#define BENCHMARK_LENGTH		0x107
 
 #ifdef SIMD_COEF_32
 #define PLAINTEXT_LENGTH		55
@@ -81,11 +64,15 @@ john_register_one(&fmt_rawSHA224);
 #define SALT_ALIGN				1
 
 #ifdef SIMD_COEF_32
-#define MIN_KEYS_PER_CRYPT		(SIMD_COEF_32*SIMD_PARA_SHA256)
-#define MAX_KEYS_PER_CRYPT      (SIMD_COEF_32*SIMD_PARA_SHA256)
+#define MIN_KEYS_PER_CRYPT      (SIMD_COEF_32*SIMD_PARA_SHA256)
+#define MAX_KEYS_PER_CRYPT      (SIMD_COEF_32*SIMD_PARA_SHA256*128)
 #else
-#define MIN_KEYS_PER_CRYPT		1
-#define MAX_KEYS_PER_CRYPT		1
+#define MIN_KEYS_PER_CRYPT      1
+#define MAX_KEYS_PER_CRYPT      128
+#endif
+
+#ifndef OMP_SCALE
+#define OMP_SCALE               2 // Tuned w/ MKPC for core i7
 #endif
 
 static struct fmt_tests tests[] = {
@@ -98,24 +85,21 @@ static struct fmt_tests tests[] = {
 };
 
 #ifdef SIMD_COEF_32
-#define GETPOS(i, index)		( (index&(SIMD_COEF_32-1))*4 + ((i)&(0xffffffff-3))*SIMD_COEF_32 + (3-((i)&3)) + (unsigned int)index/SIMD_COEF_32*SHA_BUF_SIZ*SIMD_COEF_32*4 )
+#define FMT_IS_BE
+#include "common-simd-getpos.h"
 static uint32_t (*saved_key);
 static uint32_t (*crypt_out);
 #else
 static int (*saved_len);
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
-static ARCH_WORD_32 (*crypt_out)
-    [(DIGEST_SIZE + sizeof(ARCH_WORD_32) - 1) / sizeof(ARCH_WORD_32)];
+static uint32_t (*crypt_out)
+    [(DIGEST_SIZE + sizeof(uint32_t) - 1) / sizeof(uint32_t)];
 #endif
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	int omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
+	omp_autotune(self, OMP_SCALE);
+
 #ifndef SIMD_COEF_32
 	saved_len = mem_calloc(self->params.max_keys_per_crypt,
 	                       sizeof(*saved_len));
@@ -165,8 +149,7 @@ static char *split(char *ciphertext, int index, struct fmt_main *self)
 		ciphertext += TAG_LENGTH;
 
 	memcpy(out, FORMAT_TAG, TAG_LENGTH);
-	memcpy(out + TAG_LENGTH, ciphertext, CIPHERTEXT_LENGTH + 1);
-	strlwr(out + TAG_LENGTH);
+	memcpylwr(out + TAG_LENGTH, ciphertext, CIPHERTEXT_LENGTH + 1);
 	return out;
 }
 
@@ -191,7 +174,9 @@ static void *get_binary(char *ciphertext)
 	}
 
 #ifdef SIMD_COEF_32
+#if ARCH_LITTLE_ENDIAN==1
 	alter_endianity (out, DIGEST_SIZE);
+#endif
 #ifdef REVERSE_STEPS
 	sha224_reverse(outw);
 #endif
@@ -218,92 +203,16 @@ static int get_hash_5(int index) { return crypt_out[index][3] & PH_MASK_5; }
 static int get_hash_6(int index) { return crypt_out[index][3] & PH_MASK_6; }
 #endif
 
-static int binary_hash_0(void *binary) { return ((ARCH_WORD_32*)binary)[3] & PH_MASK_0; }
-static int binary_hash_1(void *binary) { return ((ARCH_WORD_32*)binary)[3] & PH_MASK_1; }
-static int binary_hash_2(void *binary) { return ((ARCH_WORD_32*)binary)[3] & PH_MASK_2; }
-static int binary_hash_3(void *binary) { return ((ARCH_WORD_32*)binary)[3] & PH_MASK_3; }
-static int binary_hash_4(void *binary) { return ((ARCH_WORD_32*)binary)[3] & PH_MASK_4; }
-static int binary_hash_5(void *binary) { return ((ARCH_WORD_32*)binary)[3] & PH_MASK_5; }
-static int binary_hash_6(void *binary) { return ((ARCH_WORD_32*)binary)[3] & PH_MASK_6; }
+static int binary_hash_0(void *binary) { return ((uint32_t*)binary)[3] & PH_MASK_0; }
+static int binary_hash_1(void *binary) { return ((uint32_t*)binary)[3] & PH_MASK_1; }
+static int binary_hash_2(void *binary) { return ((uint32_t*)binary)[3] & PH_MASK_2; }
+static int binary_hash_3(void *binary) { return ((uint32_t*)binary)[3] & PH_MASK_3; }
+static int binary_hash_4(void *binary) { return ((uint32_t*)binary)[3] & PH_MASK_4; }
+static int binary_hash_5(void *binary) { return ((uint32_t*)binary)[3] & PH_MASK_5; }
+static int binary_hash_6(void *binary) { return ((uint32_t*)binary)[3] & PH_MASK_6; }
 
-#ifdef SIMD_COEF_32
-static void set_key(char *key, int index) {
-#if ARCH_ALLOWS_UNALIGNED
-	const ARCH_WORD_32 *wkey = (ARCH_WORD_32*)key;
-#else
-	char buf_aligned[PLAINTEXT_LENGTH + 1] JTR_ALIGN(sizeof(uint32_t));
-	const ARCH_WORD_32 *wkey = (uint32_t*)(is_aligned(key, sizeof(uint32_t)) ?
-	                                       key : strcpy(buf_aligned, key));
-#endif
-	ARCH_WORD_32 *keybuffer = &((ARCH_WORD_32 *)saved_key)[(index&(SIMD_COEF_32-1)) + (unsigned int)index/SIMD_COEF_32*SHA_BUF_SIZ*SIMD_COEF_32];
-	ARCH_WORD_32 *keybuf_word = keybuffer;
-	unsigned int len;
-	ARCH_WORD_32 temp;
-
-	len = 0;
-	while((unsigned char)(temp = *wkey++)) {
-		if (!(temp & 0xff00))
-		{
-			*keybuf_word = JOHNSWAP((temp & 0xff) | (0x80 << 8));
-			len++;
-			goto key_cleaning;
-		}
-		if (!(temp & 0xff0000))
-		{
-			*keybuf_word = JOHNSWAP((temp & 0xffff) | (0x80 << 16));
-			len+=2;
-			goto key_cleaning;
-		}
-		if (!(temp & 0xff000000))
-		{
-			*keybuf_word = JOHNSWAP(temp | (0x80U << 24));
-			len+=3;
-			goto key_cleaning;
-		}
-		*keybuf_word = JOHNSWAP(temp);
-		len += 4;
-		keybuf_word += SIMD_COEF_32;
-	}
-	*keybuf_word = 0x80000000;
-
-key_cleaning:
-	keybuf_word += SIMD_COEF_32;
-	while(*keybuf_word) {
-		*keybuf_word = 0;
-		keybuf_word += SIMD_COEF_32;
-	}
-	keybuffer[15*SIMD_COEF_32] = len << 3;
-}
-#else
-static void set_key(char *key, int index)
-{
-	int len = strlen(key);
-	saved_len[index] = len;
-	if (len > PLAINTEXT_LENGTH)
-		len = saved_len[index] = PLAINTEXT_LENGTH;
-	memcpy(saved_key[index], key, len);
-}
-#endif
-
-#ifdef SIMD_COEF_32
-static char *get_key(int index) {
-	unsigned int i,s;
-	static char out[PLAINTEXT_LENGTH+1];
-	unsigned char *wucp = (unsigned char*)saved_key;
-
-	s = ((ARCH_WORD_32 *)saved_key)[15*SIMD_COEF_32 + (index&(SIMD_COEF_32-1)) + (unsigned int)index/SIMD_COEF_32*SHA_BUF_SIZ*SIMD_COEF_32] >> 3;
-	for(i=0;i<s;i++)
-		out[i] = wucp[ GETPOS(i, index) ];
-	out[i] = 0;
-	return (char*) out;
-}
-#else
-static char *get_key(int index)
-{
-	saved_key[index][saved_len[index]] = 0;
-	return saved_key[index];
-}
-#endif
+#define NON_SIMD_SET_SAVED_LEN
+#include "common-simd-setkey32.h"
 
 #ifndef REVERSE_STEPS
 #undef SSEi_REVERSE_STEPS
@@ -313,13 +222,12 @@ static char *get_key(int index)
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
 	const int count = *pcount;
-	int index = 0;
+	int index;
 
 #ifdef _OPENMP
 #pragma omp parallel for
-	for (index = 0; index < count; index += MAX_KEYS_PER_CRYPT)
 #endif
-	{
+	for (index = 0; index < count; index += MIN_KEYS_PER_CRYPT) {
 #ifdef SIMD_COEF_32
 		SIMDSHA256body(&saved_key[(unsigned int)index/SIMD_COEF_32*SHA_BUF_SIZ*SIMD_COEF_32],
 		              &crypt_out[(unsigned int)index/SIMD_COEF_32*8*SIMD_COEF_32],
@@ -331,6 +239,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 		SHA224_Final((unsigned char *)crypt_out[index], &ctx);
 #endif
 	}
+
 	return count;
 }
 
@@ -340,9 +249,9 @@ static int cmp_all(void *binary, int count)
 
 	for (index = 0; index < count; index++)
 #ifdef SIMD_COEF_32
-		if (((ARCH_WORD_32*) binary)[3] == crypt_out[HASH_IDX])
+		if (((uint32_t*) binary)[3] == crypt_out[HASH_IDX])
 #else
-		if ( ((ARCH_WORD_32*)binary)[0] == crypt_out[index][0] )
+		if ( ((uint32_t*)binary)[0] == crypt_out[index][0] )
 #endif
 			return 1;
 	return 0;
@@ -351,25 +260,27 @@ static int cmp_all(void *binary, int count)
 static int cmp_one(void *binary, int index)
 {
 #ifdef SIMD_COEF_32
-	return ((ARCH_WORD_32*)binary)[3] == crypt_out[HASH_IDX];
+	return ((uint32_t*)binary)[3] == crypt_out[HASH_IDX];
 #else
-	return *(ARCH_WORD_32*)binary == crypt_out[index][0];
+	return *(uint32_t*)binary == crypt_out[index][0];
 #endif
 }
 
 static int cmp_exact(char *source, int index)
 {
-	ARCH_WORD_32 *binary = get_binary(source);
+	uint32_t *binary = get_binary(source);
 	char *key = get_key(index);
 	SHA256_CTX ctx;
-	ARCH_WORD_32 crypt_out[DIGEST_SIZE / sizeof(ARCH_WORD_32)];
+	uint32_t crypt_out[DIGEST_SIZE / sizeof(uint32_t)];
 
 	SHA224_Init(&ctx);
 	SHA224_Update(&ctx, key, strlen(key));
 	SHA224_Final((unsigned char*)crypt_out, &ctx);
 
 #ifdef SIMD_COEF_32
+#if ARCH_LITTLE_ENDIAN
 	alter_endianity(crypt_out, DIGEST_SIZE);
+#endif
 #ifdef REVERSE_STEPS
 	sha224_reverse(crypt_out);
 #endif

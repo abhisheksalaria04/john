@@ -21,16 +21,16 @@ john_register_one(&fmt_opencl_rakp);
 #else
 
 #include <string.h>
+#include <stdint.h>
 
 #include "path.h"
 #include "arch.h"
 #include "misc.h"
 #include "common.h"
-#include "stdint.h"
 #include "formats.h"
 #include "sha.h"
 #include "johnswap.h"
-#include "common-opencl.h"
+#include "opencl_common.h"
 #include "options.h"
 
 #define FORMAT_LABEL            "RAKP-opencl"
@@ -38,7 +38,7 @@ john_register_one(&fmt_opencl_rakp);
 #define ALGORITHM_NAME          "HMAC-SHA1 OpenCL"
 
 #define BENCHMARK_COMMENT       ""
-#define BENCHMARK_LENGTH        -1000
+#define BENCHMARK_LENGTH        7
 
 #define BLOCK_SIZE              64
 #define PAD_SIZE                BLOCK_SIZE
@@ -57,7 +57,7 @@ john_register_one(&fmt_opencl_rakp);
 #define FORMAT_TAG              "$rakp$"
 #define TAG_LENGTH              (sizeof(FORMAT_TAG) - 1)
 
-#define BINARY_ALIGN            1
+#define BINARY_ALIGN            sizeof(uint32_t)
 #define SALT_ALIGN              1
 
 #define STEP                    0
@@ -73,15 +73,14 @@ static unsigned char salt_storage[SALT_STORAGE_SIZE];
 static cl_mem salt_buffer, keys_buffer, idx_buffer, digest_buffer;
 
 static unsigned int *keys;
-static unsigned int *idx;
-static ARCH_WORD_32 (*digest);
+static uint32_t *idx;
+static uint32_t (*digest);
 static unsigned int key_idx = 0;
 static int partial_output;
 static struct fmt_main *self;
 
 //This file contains auto-tuning routine(s). Have to included after other definitions.
-#include "opencl-autotune.h"
-#include "memdbg.h"
+#include "opencl_autotune.h"
 
 static struct fmt_tests tests[] = {
 	{"$rakp$a4a3a2a03f0b000094272eb1ba576450b0d98ad10727a9fb0ab83616e099e8bf5f7366c9c03d36a3000000000000000000000000000000001404726f6f74$0ea27d6d5effaa996e5edc855b944e179a2f2434", "calvin"},
@@ -130,9 +129,12 @@ static int valid(char *ciphertext, struct fmt_main *self)
 
 static void clear_keys(void);
 static void set_key(char *key, int index);
+static void release_clobj(void);
 
 static void create_clobj(size_t gws, struct fmt_main *self)
 {
+	release_clobj();
+
 	gws *= ocl_v_width;
 
 	keys = mem_alloc((PLAINTEXT_LENGTH + 1) * gws);
@@ -184,13 +186,13 @@ static void release_clobj(void)
 
 static void done(void)
 {
-	if (autotuned) {
+	if (program[gpu_id]) {
 		release_clobj();
 
 		HANDLE_CLERROR(clReleaseKernel(crypt_kernel), "Error releasing kernel");
 		HANDLE_CLERROR(clReleaseProgram(program[gpu_id]), "Error releasing program");
 
-		autotuned--;
+		program[gpu_id] = NULL;
 	}
 }
 
@@ -217,31 +219,30 @@ static void init(struct fmt_main *_self)
 
 static void reset(struct db_main *db)
 {
-	if (!autotuned) {
-		size_t gws_limit;
+	if (!program[gpu_id]) {
 		char build_opts[64];
 
 		snprintf(build_opts, sizeof(build_opts), "-DV_WIDTH=%u", ocl_v_width);
-		opencl_init("$JOHN/kernels/rakp_kernel.cl", gpu_id, build_opts);
+		opencl_init("$JOHN/opencl/rakp_kernel.cl", gpu_id, build_opts);
 
 		// create kernel to execute
 		crypt_kernel = clCreateKernel(program[gpu_id], "rakp_kernel", &ret_code);
 		HANDLE_CLERROR(ret_code, "Error creating kernel");
-
-		// Current key_idx can only hold 26 bits of offset so
-		// we can't reliably use a GWS higher than 4M or so.
-		gws_limit = MIN((1 << 26) * 4 / (ocl_v_width * BUFFER_SIZE),
-		                get_max_mem_alloc_size(gpu_id) /
-		                (ocl_v_width * BUFFER_SIZE));
-
-		//Initialize openCL tuning (library) for this format.
-		opencl_init_auto_setup(SEED, 0, NULL, warn, 2,
-		                       self, create_clobj, release_clobj,
-		                       ocl_v_width * BUFFER_SIZE, gws_limit, db);
-
-		//Auto tune execution from shared/included code.
-		autotune_run(self, ROUNDS, gws_limit, 200);
 	}
+
+	// Current key_idx can only hold 26 bits of offset so
+	// we can't reliably use a GWS higher than 4M or so.
+	size_t gws_limit = MIN((1 << 26) * 4 / (ocl_v_width * BUFFER_SIZE),
+	                       get_max_mem_alloc_size(gpu_id) /
+	                       (ocl_v_width * BUFFER_SIZE));
+
+	//Initialize openCL tuning (library) for this format.
+	opencl_init_auto_setup(SEED, 0, NULL, warn, 2,
+	                       self, create_clobj, release_clobj,
+	                       ocl_v_width * BUFFER_SIZE, gws_limit, db);
+
+	//Auto tune execution from shared/included code.
+	autotune_run(self, ROUNDS, gws_limit, 200);
 }
 
 static void clear_keys(void)
@@ -357,16 +358,16 @@ static int cmp_one(void *binary, int index)
 
 static int cmp_exact(char *source, int index)
 {
-	ARCH_WORD_32 *b;
+	uint32_t *b;
 	int i;
 
 	if (partial_output) {
 		HANDLE_CLERROR(clEnqueueReadBuffer(queue[gpu_id], digest_buffer, CL_TRUE, 0, BINARY_SIZE * global_work_size * ocl_v_width, digest, 0, NULL, NULL), "failed reading results back");
 		partial_output = 0;
 	}
-	b = (ARCH_WORD_32*)get_binary(source);
+	b = (uint32_t*)get_binary(source);
 
-	for(i = 0; i < BINARY_SIZE / 4; i++)
+	for (i = 0; i < BINARY_SIZE / 4; i++)
 		if (digest[i * global_work_size * ocl_v_width + index] != b[i])
 			return 0;
 	return 1;
@@ -378,7 +379,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 	size_t scalar_gws;
 	size_t *lws = local_work_size ? &local_work_size : NULL;
 
-	global_work_size = GET_MULTIPLE_OR_BIGGER_VW(count, local_work_size);
+	global_work_size = GET_KPC_MULTIPLE(count, local_work_size);
 	scalar_gws = global_work_size * ocl_v_width;
 
 	//fprintf(stderr, "%s(%d) lws "Zu" gws "Zu" sgws "Zu" kidx %u\n", __FUNCTION__, count, local_work_size, global_work_size, scalar_gws, key_idx);
@@ -419,7 +420,7 @@ struct fmt_main fmt_opencl_rakp = {
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_CASE | FMT_8_BIT,
+		FMT_CASE | FMT_8_BIT | FMT_HUGE_INPUT,
 		{ NULL },
 		{ FORMAT_TAG },
 		tests
@@ -435,7 +436,7 @@ struct fmt_main fmt_opencl_rakp = {
 		{ NULL },
 		fmt_default_source,
 		{
-			fmt_default_binary_hash /* Not usable with $SOURCE_HASH$ */
+			fmt_default_binary_hash
 		},
 		fmt_default_salt_hash,
 		NULL,
@@ -445,7 +446,7 @@ struct fmt_main fmt_opencl_rakp = {
 		clear_keys,
 		crypt_all,
 		{
-			fmt_default_get_hash /* Not usable with $SOURCE_HASH$ */
+			fmt_default_get_hash
 		},
 		cmp_all,
 		cmp_one,

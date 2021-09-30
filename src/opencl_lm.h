@@ -10,8 +10,8 @@
 #define _JOHN_LM_BS_H
 
 #include "arch.h"
-#include "common-opencl.h"
-#include "opencl_lm_hst_dev_shared.h"
+#include "opencl_common.h"
+#include "../run/opencl/opencl_lm_hst_dev_shared.h"
 #include "loader.h"
 
 #define LM_OPENCL_ALGORITHM_NAME		"DES BS OpenCL"
@@ -68,9 +68,9 @@
 
 typedef unsigned WORD vtype;
 
-unsigned int CC_CACHE_ALIGN opencl_lm_index768[0x300];
+extern unsigned int CC_CACHE_ALIGN opencl_lm_index768[0x300];
 
-unsigned char opencl_lm_u[0x100];
+extern unsigned char opencl_lm_u[0x100];
 
 typedef struct {
 	unsigned char *pxkeys[LM_DEPTH]; /* Pointers into xkeys.c */

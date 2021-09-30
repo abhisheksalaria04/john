@@ -23,7 +23,7 @@ john_register_one(&fmt_opencl_rawsha512);
 #include <string.h>
 
 #include "arch.h"
-#include "common-opencl.h"
+#include "opencl_common.h"
 #include "params.h"
 #include "options.h"
 #include "common.h"
@@ -32,12 +32,9 @@ john_register_one(&fmt_opencl_rawsha512);
 #include "sha2.h"
 #include "rawSHA512_common.h"
 
-#define FORMAT_LABEL			"Raw-SHA512-free-opencl"
+#define FORMAT_LABEL			"raw-SHA512-free-opencl"
 #define FORMAT_NAME			""
 #define ALGORITHM_NAME			"SHA512 OpenCL (inefficient, development use mostly)"
-
-#define BENCHMARK_COMMENT		""
-#define BENCHMARK_LENGTH		-1
 
 #define KERNEL_NAME "kernel_sha512"
 #define CMP_KERNEL_NAME "kernel_cmp"
@@ -89,11 +86,10 @@ static struct fmt_main *self;
 #define SEED			256
 
 // This file contains auto-tuning routine(s). Has to be included after formats definitions.
-#include "opencl-autotune.h"
-#include "memdbg.h"
+#include "opencl_autotune.h"
 
-static const char * warn[] = {
-	"xfer: ",  ", crypt: "
+static const char *warn[] = {
+	"xfer: ",  ", crypt: ", ", vrf_xfer: ", ", verify: ", ", res_xfer: "
 };
 
 /* ------- Helper functions ------- */
@@ -103,8 +99,12 @@ static size_t get_task_max_work_group_size()
 			   autotune_get_task_max_work_group_size(FALSE, 0, cmp_kernel));
 }
 
+static void release_clobj(void);
+
 static void create_clobj(size_t gws, struct fmt_main *self)
 {
+	release_clobj();
+
 	gkey = mem_calloc(gws, sizeof(sha512_key));
 	ghash = mem_calloc(gws, sizeof(sha512_hash));
 
@@ -138,11 +138,15 @@ static void create_clobj(size_t gws, struct fmt_main *self)
 
 static void release_clobj(void)
 {
-	HANDLE_CLERROR(clReleaseMemObject(mem_in), "Release mem in");
-	HANDLE_CLERROR(clReleaseMemObject(mem_out), "Release mem out");
+	if (ghash) {
+		HANDLE_CLERROR(clReleaseMemObject(mem_in), "Release mem in");
+		HANDLE_CLERROR(clReleaseMemObject(mem_out), "Release mem out");
+		HANDLE_CLERROR(clReleaseMemObject(mem_binary), "Release mem binary");
+		HANDLE_CLERROR(clReleaseMemObject(mem_cmp), "Release mem cmp");
 
-	MEM_FREE(ghash);
-	MEM_FREE(gkey);
+		MEM_FREE(ghash);
+		MEM_FREE(gkey);
+	}
 }
 
 static void init(struct fmt_main *_self)
@@ -153,43 +157,43 @@ static void init(struct fmt_main *_self)
 
 static void reset(struct db_main *db)
 {
-	if (!autotuned) {
+	if (!program[gpu_id]) {
 		char build_opts[64];
 
 		snprintf(build_opts, sizeof(build_opts),
 		         "-DPLAINTEXT_LENGTH=%u", PLAINTEXT_LENGTH);
 
-		opencl_init("$JOHN/kernels/sha512_kernel.cl", gpu_id, build_opts);
+		opencl_init("$JOHN/opencl/sha512_kernel.cl", gpu_id, build_opts);
 
 		/* create kernels to execute */
 		crypt_kernel = clCreateKernel(program[gpu_id], KERNEL_NAME, &ret_code);
 		HANDLE_CLERROR(ret_code,"Error while creating crypt_kernel");
 		cmp_kernel = clCreateKernel(program[gpu_id], CMP_KERNEL_NAME, &ret_code);
 		HANDLE_CLERROR(ret_code,"Error while creating cmp_kernel");
-
-		// Initialize openCL tuning (library) for this format.
-		opencl_init_auto_setup(SEED, 0, NULL, warn, 1, self,
-		                       create_clobj, release_clobj,
-		                       sizeof(sha512_key), 0, db);
-
-		// Auto tune execution from shared/included code.
-		autotune_run(self, 1, 0, 500);
 	}
+
+	// Initialize openCL tuning (library) for this format.
+	opencl_init_auto_setup(SEED, 0, NULL, warn, 1, self,
+	                       create_clobj, release_clobj,
+	                       sizeof(sha512_key), 0, db);
+
+	// Auto tune execution from shared/included code.
+	autotune_run(self, 1, 0, 200);
 }
 
 static void done(void)
 {
-	if (autotuned) {
+	if (program[gpu_id]) {
 		release_clobj();
 
 		HANDLE_CLERROR(clReleaseKernel(crypt_kernel), "Release kernel");
 		HANDLE_CLERROR(clReleaseKernel(cmp_kernel), "Release kernel");
 		HANDLE_CLERROR(clReleaseProgram(program[gpu_id]), "Release Program");
-		autotuned--;
+		program[gpu_id] = NULL;
 	}
 }
 
-static inline void copy_hash_back()
+inline static void copy_hash_back()
 {
     if (!hash_copy_back) {
         HANDLE_CLERROR(clEnqueueReadBuffer(queue[gpu_id], mem_out, CL_TRUE, 0,outsize, ghash, 0, NULL, NULL), "Copy data back");
@@ -215,37 +219,37 @@ static char *get_key(int index)
 
 static int binary_hash_0(void *binary)
 {
-	return *((ARCH_WORD_32 *)binary+6) & PH_MASK_0;
+	return *((uint32_t *)binary+6) & PH_MASK_0;
 }
 
 static int binary_hash_1(void *binary)
 {
-	return *((ARCH_WORD_32 *)binary+6) & PH_MASK_1;
+	return *((uint32_t *)binary+6) & PH_MASK_1;
 }
 
 static int binary_hash_2(void *binary)
 {
-	return *((ARCH_WORD_32 *)binary+6) & PH_MASK_2;
+	return *((uint32_t *)binary+6) & PH_MASK_2;
 }
 
 static int binary_hash_3(void *binary)
 {
-	return *((ARCH_WORD_32 *)binary+6) & PH_MASK_3;
+	return *((uint32_t *)binary+6) & PH_MASK_3;
 }
 
 static int binary_hash_4(void *binary)
 {
-	return *((ARCH_WORD_32 *)binary+6) & PH_MASK_4;
+	return *((uint32_t *)binary+6) & PH_MASK_4;
 }
 
 static int binary_hash_5(void *binary)
 {
-	return *((ARCH_WORD_32 *)binary+6) & PH_MASK_5;
+	return *((uint32_t *)binary+6) & PH_MASK_5;
 }
 
 static int binary_hash_6(void *binary)
 {
-	return *((ARCH_WORD_32 *)binary+6) & PH_MASK_6;
+	return *((uint32_t *)binary+6) & PH_MASK_6;
 }
 
 static int get_hash_0(int index)
@@ -300,7 +304,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 	const int count = *pcount;
 	size_t *lws = local_work_size ? &local_work_size : NULL;
 
-	global_work_size = GET_MULTIPLE_OR_BIGGER(count, local_work_size);
+	global_work_size = GET_NEXT_MULTIPLE(count, local_work_size);
 
 	///Copy data to GPU memory
 	if (sha512_key_changed || ocl_autotune_running) {
@@ -325,17 +329,17 @@ static int cmp_all(void *binary, int count)
 {
 	uint32_t result;
 	///Copy binary to GPU memory
-	HANDLE_CLERROR(clEnqueueWriteBuffer(queue[gpu_id], mem_binary, CL_FALSE,
-		0, sizeof(uint64_t), ((uint64_t*)binary)+3, 0, NULL, NULL), "Copy mem_binary");
+	BENCH_CLERROR(clEnqueueWriteBuffer(queue[gpu_id], mem_binary, CL_FALSE,
+		0, sizeof(uint64_t), ((uint64_t*)binary)+3, 0, NULL, multi_profilingEvent[2]), "Copy mem_binary");
 
 	///Run kernel
-	HANDLE_CLERROR(clEnqueueNDRangeKernel
+	BENCH_CLERROR(clEnqueueNDRangeKernel
 	    (queue[gpu_id], cmp_kernel, 1, NULL, &global_work_size, &local_work_size,
-		0, NULL, NULL), "Set ND range");
+		0, NULL, multi_profilingEvent[3]), "Set ND range");
 
 	/// Copy result out
-	HANDLE_CLERROR(clEnqueueReadBuffer(queue[gpu_id], mem_cmp, CL_TRUE, 0,
-		sizeof(uint32_t), &result, 0, NULL, NULL), "Copy data back");
+	BENCH_CLERROR(clEnqueueReadBuffer(queue[gpu_id], mem_cmp, CL_TRUE, 0,
+		sizeof(uint32_t), &result, 0, NULL, multi_profilingEvent[4]), "Copy data back");
 
 	return result;
 }
@@ -360,7 +364,7 @@ static int cmp_exact(char *source, int index)
 	SHA512_Update(&ctx, gkey[index].v, gkey[index].length);
 	SHA512_Final((unsigned char *)(crypt_out), &ctx);
 #ifdef SIMD_COEF_64
-	alter_endianity_to_BE64(crypt_out, DIGEST_SIZE / sizeof(ARCH_WORD_64));
+	alter_endianity_to_BE64(crypt_out, DIGEST_SIZE / sizeof(uint64_t));
 #endif
 
 	b = (uint64_t *)sha512_common_binary(source);

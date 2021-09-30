@@ -23,19 +23,18 @@ john_register_one(&fmt_opencl_rawsha256);
 
 #include <string.h>
 
-#include "sha.h"
 #include "sha2.h"
 #include "johnswap.h"
-#include "common-opencl.h"
+#include "opencl_common.h"
 #include "config.h"
 #include "options.h"
-#include "opencl_rawsha256.h"
+#include "../run/opencl/opencl_rawsha256.h"
 #include "rawSHA256_common.h"
 
 #include "mask_ext.h"
-#include "opencl_mask_extras.h"
+#include "../run/opencl/opencl_mask_extras.h"
 
-#define FORMAT_LABEL            "Raw-SHA256-opencl"
+#define FORMAT_LABEL            "raw-SHA256-opencl"
 #define FORMAT_NAME             ""
 
 #define ALGORITHM_NAME          "SHA256 OpenCL"
@@ -75,11 +74,14 @@ static uint32_t *saved_int_key_loc, num_loaded_hashes, *hash_ids, *saved_bitmap;
 //ocl_initialized: a reference counter of the openCL objetcts (expect to be 0 or 1)
 static unsigned ocl_initialized = 0;
 
+// Keeps track of whether we should tune for this reset() call.
+static int should_tune;
+
 //Used to control partial key transfers.
 static uint32_t key_idx = 0;
 static size_t offset = 0, offset_idx = 0;
 
-static uint32_t bitmap_size;
+static uint32_t bitmap_size, previous_size;
 
 static void load_hash();
 static char *get_key(int index);
@@ -88,8 +90,7 @@ static void release_kernel();
 static void release_mask_buffers(void);
 
 //This file contains auto-tuning routine(s). It has to be included after formats definitions.
-#include "opencl-autotune.h"
-#include "memdbg.h"
+#include "opencl_autotune.h"
 
 /* ------- Helper functions ------- */
 static size_t get_task_max_work_group_size()
@@ -117,9 +118,9 @@ static uint32_t get_num_loaded_hashes()
 	return num_hashes;
 }
 
-static ARCH_WORD_32 *crypt_one(int index) {
+static uint32_t *crypt_one(int index) {
 	SHA256_CTX ctx;
-	static ARCH_WORD_32 hash[DIGEST_SIZE / sizeof(ARCH_WORD_32)];
+	static uint32_t hash[DIGEST_SIZE / sizeof(uint32_t)];
 
 	char * key = get_key(index);
 	int len = strlen(key);
@@ -128,9 +129,8 @@ static ARCH_WORD_32 *crypt_one(int index) {
 	SHA256_Update(&ctx, key, len);
 	SHA256_Final((unsigned char *) (hash), &ctx);
 
-#ifdef SIMD_COEF_32
-	alter_endianity_to_BE(hash, DIGEST_SIZE / sizeof(ARCH_WORD_32));
-#endif
+	alter_endianity_to_BE(hash, DIGEST_SIZE / sizeof(uint32_t));
+
 	return hash;
 }
 
@@ -152,7 +152,7 @@ static void create_mask_buffers()
 
 static void release_mask_buffers()
 {
- 	MEM_FREE(saved_bitmap);
+	MEM_FREE(saved_bitmap);
 
 	if (buffer_bitmap)
 		clReleaseMemObject(buffer_bitmap);
@@ -163,6 +163,8 @@ static void create_clobj(size_t gws, struct fmt_main *self)
 {
 	uint32_t hash_id_size;
 	size_t mask_cand = 1, mask_gws = 1;
+
+	release_clobj();
 
 	if (mask_int_cand.num_int_cand > 1) {
 		mask_cand = mask_int_cand.num_int_cand;
@@ -258,7 +260,7 @@ static void create_clobj(size_t gws, struct fmt_main *self)
 	//Assure buffers have no "trash data".
 	memset(plaintext, '\0', BUFFER_SIZE * gws);
 	memset(saved_idx, '\0', sizeof(uint32_t) * gws);
-	memset(saved_int_key_loc, 0x80, sizeof(uint32_t) * mask_gws);
+	memset(saved_int_key_loc, '\0', sizeof(uint32_t) * mask_gws);
 }
 
 static void release_clobj()
@@ -275,8 +277,6 @@ static void release_clobj()
 		ret_code = clEnqueueUnmapMemObject(queue[gpu_id], pinned_int_key_loc,
 							   saved_int_key_loc, 0, NULL, NULL);
 		HANDLE_CLERROR(ret_code, "Error Unmapping key locations");
-		HANDLE_CLERROR(clFinish(queue[gpu_id]),
-		               "Error releasing memory mappings");
 
 		ret_code = clReleaseMemObject(pass_buffer);
 		HANDLE_CLERROR(ret_code, "Error Releasing pass_buffer");
@@ -298,7 +298,8 @@ static void release_clobj()
 		ret_code = clReleaseMemObject(pinned_int_key_loc);
 		HANDLE_CLERROR(ret_code, "Error Releasing pinned_int_key_loc");
 
-		ocl_initialized--;
+		ocl_initialized = 0;
+		HANDLE_CLERROR(clFinish(queue[gpu_id]), "Error releasing memory");
 	}
 }
 
@@ -307,10 +308,10 @@ static void tune(struct db_main *db)
 {
 	char *tmp_value;
 	size_t gws_limit;
-	unsigned long long autotune_limit = 500ULL;
+	int autotune_limit = 500;
 
 	if ((tmp_value = getenv("_GPU_AUTOTUNE_LIMIT")))
-		autotune_limit = (unsigned long long)atoll(tmp_value);
+		autotune_limit = atoi(tmp_value);
 
 	// Auto-tune / Benckmark / Self-test.
 	gws_limit = MIN((0xf << 22) * 4 / BUFFER_SIZE,
@@ -332,14 +333,9 @@ static void tune(struct db_main *db)
 
 static void reset(struct db_main *db)
 {
-	static size_t saved_lws, saved_gws;
-
 	offset = 0;
 	offset_idx = 0;
 	key_idx = 0;
-
-	if (!db)
-		return;
 
 	main_db = db;
 	num_loaded_hashes = get_num_loaded_hashes();
@@ -347,35 +343,8 @@ static void reset(struct db_main *db)
 	//Adjust kernel parameters and rebuild (if necessary).
 	build_kernel();
 
-	if (!autotuned) {
-		/* Read LWS/GWS prefs from config or environment */
-		opencl_get_user_preferences(FORMAT_LABEL);
+	tune(db);
 
-		//Save the local and global work sizes.
-		saved_lws = local_work_size;
-		saved_gws = global_work_size;
-
-		//GPU mask mode in use, do not auto tune for self test.
-		//Instead, use sane defauts. Real tune is going to be made below.
-		if ((options.flags & FLG_MASK_CHK) &&
-		   !((options.flags & FLG_TEST_CHK) || (options.flags & FLG_NOTESTS)))
-			opencl_get_sane_lws_gws_values();
-
-		tune(db);
-
-	} else if ((options.flags & FLG_MASK_CHK)) {
-		//Tune for mask mode.
-		local_work_size = saved_lws;
-		global_work_size = saved_gws;
-
-		tune(db);
-	} else {
-		//Since it might re-compiled the kernel after tuning.
-		if (ocl_initialized > 0)
-			release_clobj();
-
-		create_clobj(global_work_size, self);
-	}
 	hash_ids[0] = 0;
 	load_hash();
 }
@@ -391,7 +360,7 @@ static void clear_keys(void)
 static void set_key(char *_key, int index)
 {
 
-	const ARCH_WORD_32 *key = (ARCH_WORD_32 *) _key;
+	const uint32_t *key = (uint32_t *) _key;
 	int len = strlen(_key);
 
 	saved_idx[index] = (key_idx << 6) | len;
@@ -467,8 +436,8 @@ static char *get_key(int index)
 	memcpy(ret, ((char *)&plaintext[saved_idx[t] >> 6]), PLAINTEXT_LENGTH);
 	ret[saved_idx[t] & 63] = '\0';
 
-	if (mask_skip_ranges && mask_int_cand.num_int_cand > 1) {
-
+	if (saved_idx[t] & 63 &&
+	    mask_skip_ranges && mask_int_cand.num_int_cand > 1) {
 		for (i = 0; i < MASK_FMT_INT_PLHDR && mask_skip_ranges[i] != -1; i++)
 			ret[(saved_int_key_loc[t] & (0xff << (i * 8))) >> (i * 8)] =
 			    mask_int_cand.int_cand[int_index].x[i];
@@ -481,9 +450,9 @@ static char *get_key(int index)
 /* ------- Initialization  ------- */
 static void build_kernel()
 {
-	static int previous_size, num_int_cand;
+	static int num_int_cand;
 
-	char *task = "$JOHN/kernels/sha256_kernel.cl";
+	char *task = "$JOHN/opencl/sha256_kernel.cl";
 	char opt[MAX_OCLINFO_STRING_LEN];
 
 	bitmap_size = get_bitmap_size_bits(num_loaded_hashes, gpu_id);
@@ -492,13 +461,12 @@ static void build_kernel()
 		previous_size = bitmap_size;
 		num_int_cand = mask_int_cand.num_int_cand;
 
-		if (prepare_kernel)
-			release_kernel();
+		release_kernel();
 
 		snprintf(opt, sizeof(opt), "-DBITMAP_SIZE_MINUS1=%u", bitmap_size - 1U);
 
 		if (mask_int_cand.num_int_cand > 1)
-			strncat(opt, " -DGPU_MASK_MODE=1", 64U);
+			strncat(opt, " -DGPU_MASK_MODE", 64U);
 
 		opencl_build_kernel(task, gpu_id, opt, 0);
 
@@ -519,11 +487,13 @@ static void build_kernel()
 
 static void release_kernel()
 {
-	HANDLE_CLERROR(clReleaseKernel(crypt_kernel), "Release kernel");
-	HANDLE_CLERROR(clReleaseKernel(prepare_kernel), "Release kernel");
-	HANDLE_CLERROR(clReleaseProgram(program[gpu_id]), "Release Program");
+	if (program[gpu_id]) {
+		HANDLE_CLERROR(clReleaseKernel(crypt_kernel), "Release kernel");
+		HANDLE_CLERROR(clReleaseKernel(prepare_kernel), "Release kernel");
+		HANDLE_CLERROR(clReleaseProgram(program[gpu_id]), "Release Program");
 
-	prepare_kernel = NULL;
+		program[gpu_id] = NULL;
+	}
 }
 
 static void init(struct fmt_main *_self)
@@ -533,6 +503,7 @@ static void init(struct fmt_main *_self)
 	self = _self;
 	opencl_prepare_dev(gpu_id);
 	mask_int_cand_target = opencl_speed_index(gpu_id) / 300;
+	previous_size = 0;
 
 	if ((tmp_value = getenv("_GPU_MASK_CAND")))
 		mask_int_cand_target = atoi(tmp_value);
@@ -540,13 +511,13 @@ static void init(struct fmt_main *_self)
 
 static void done(void)
 {
-	if (autotuned) {
+	if (program[gpu_id]) {
 		release_clobj();
 		release_kernel();
 		release_mask_buffers();
-
-		autotuned = 0;
 	}
+	should_tune = 0;
+	ocl_initialized = 0;
 }
 
 static void prepare_bit_array()
@@ -608,10 +579,10 @@ static int crypt_all(int *pcount, struct db_salt *_salt)
 {
 	const int count = *pcount;
 	const struct db_salt *salt = _salt;
-	size_t gws, initial = 128;
-	size_t *lws = local_work_size ? &local_work_size : &initial;
+	size_t gws;
+	size_t *lws = local_work_size ? &local_work_size : NULL;
 
-	gws = GET_MULTIPLE_OR_BIGGER(count, local_work_size);
+	gws = GET_NEXT_MULTIPLE(count, local_work_size);
 
 	//Check if any password was cracked and reload (if necessary)
 	if (num_loaded_hashes != salt->count)
@@ -697,12 +668,12 @@ static int cmp_one(void *binary, int index)
 static int cmp_exact(char *source, int index)
 {
 	uint32_t *binary;
-	ARCH_WORD_32 *full_hash;
+	uint32_t *full_hash;
 
 #ifdef DEBUG
 	fprintf(stderr, "Stressing CPU\n");
 #endif
-	binary = (uint32_t *) sha256_common_binary(source);
+	binary = (uint32_t *) sha256_common_binary_BE(source);
 
 	full_hash = crypt_one(index);
 	return !memcmp(binary, (void *) full_hash, BINARY_SIZE);
@@ -760,7 +731,7 @@ struct fmt_main fmt_opencl_rawsha256 = {
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_CASE | FMT_8_BIT | FMT_SPLIT_UNIFIES_CASE,
+		FMT_CASE | FMT_8_BIT | FMT_SPLIT_UNIFIES_CASE | FMT_MASK,
 		{NULL},
 		{
 			HEX_TAG,
@@ -774,7 +745,7 @@ struct fmt_main fmt_opencl_rawsha256 = {
 		sha256_common_prepare,
 		sha256_common_valid,
 		sha256_common_split,
-		sha256_common_binary,
+		sha256_common_binary_BE,
 		fmt_default_salt,
 		{NULL},
 		fmt_default_source,

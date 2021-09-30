@@ -9,6 +9,12 @@
  * modification, is permitted.
  */
 
+#if AC_BUILT
+#include "autoconfig.h"
+#endif
+
+#if HAVE_LIBCRYPTO
+
 #if FMT_EXTERNS_H
 extern struct fmt_main fmt_oracle;
 #elif FMT_REGISTERS_H
@@ -18,41 +24,37 @@ john_register_one(&fmt_oracle);
 #include <string.h>
 #include <openssl/des.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "arch.h"
 #include "misc.h"
 #include "common.h"
 #include "formats.h"
 #include "unicode.h"
-#ifdef _OPENMP
-static int omp_t = 1;
-#include <omp.h>
+
+#define FORMAT_LABEL            "oracle"
+#define FORMAT_NAME             "Oracle 10"
+#define FORMAT_TAG              "O$"
+#define FORMAT_TAG_LEN          (sizeof(FORMAT_TAG)-1)
+#define ALGORITHM_NAME          "DES 32/" ARCH_BITS_STR
+#define BENCHMARK_COMMENT       ""
+#define BENCHMARK_LENGTH        7
+#define PLAINTEXT_LENGTH        120 // worst case UTF-8 is 40 characters of Unicode, that'll do
+#define BINARY_SIZE             8
+#define BINARY_ALIGN            4
+#define MAX_USERNAME_LEN        30
+#define SALT_SIZE               (MAX_USERNAME_LEN*2 + 4)  // also contain the NULL
+#define SALT_ALIGN              2
+#define CIPHERTEXT_LENGTH       16
+#define MAX_INPUT_LEN           (CIPHERTEXT_LENGTH + 3 + MAX_USERNAME_LEN * (options.input_enc == UTF_8 ? 3 : 1))
+#define MIN_KEYS_PER_CRYPT      1
+#define MAX_KEYS_PER_CRYPT      64
+
 #ifndef OMP_SCALE
-#define OMP_SCALE              512
+#define OMP_SCALE               64 // Tuned w/ MKPC for core i7
 #endif
-#endif
-
-#include "memdbg.h"
-
-#define FORMAT_LABEL			"oracle"
-#define FORMAT_NAME			"Oracle 10"
-#define FORMAT_TAG           "O$"
-#define FORMAT_TAG_LEN       (sizeof(FORMAT_TAG)-1)
-#define ALGORITHM_NAME			"DES 32/" ARCH_BITS_STR
-
-#define BENCHMARK_COMMENT		""
-#define BENCHMARK_LENGTH		-1
-
-#define PLAINTEXT_LENGTH		120 // worst case UTF-8 is 40 characters of Unicode, that'll do
-
-#define BINARY_SIZE			8
-#define BINARY_ALIGN			4
-#define MAX_USERNAME_LEN    30
-#define SALT_SIZE			(MAX_USERNAME_LEN*2 + 4)  // also contain the NULL
-#define SALT_ALIGN			2
-#define CIPHERTEXT_LENGTH		16
-
-#define MIN_KEYS_PER_CRYPT		1
-#define MAX_KEYS_PER_CRYPT		1
 
 //#define DEBUG_ORACLE
 
@@ -97,7 +99,7 @@ static UTF16 cur_salt[SALT_SIZE / 2 + PLAINTEXT_LENGTH];
 static UTF16 (*cur_key)[PLAINTEXT_LENGTH + 1];
 static char (*plain_key)[PLAINTEXT_LENGTH + 1];
 static int (*key_length);
-static ARCH_WORD_32 (*crypt_key)[2];
+static uint32_t (*crypt_key)[2];
 
 static DES_key_schedule desschedule_static;
 
@@ -114,8 +116,7 @@ static int valid(char *ciphertext, struct fmt_main *self)
 	 * 2 - it comes from memory, and has got O$ + salt + # + blah
 	 */
 
-	if (strlen(ciphertext) > CIPHERTEXT_LENGTH + 3 +
-	    MAX_USERNAME_LEN * (options.input_enc == UTF_8 ? 3 : 1))
+	if (strnlen(ciphertext, MAX_INPUT_LEN + 1) > MAX_INPUT_LEN)
 		return 0;
 
 	if (!memcmp(ciphertext, FORMAT_TAG, FORMAT_TAG_LEN))
@@ -149,7 +150,7 @@ static int valid(char *ciphertext, struct fmt_main *self)
 	}
 	else
 	{
-		if(strlen(ciphertext)!=CIPHERTEXT_LENGTH)
+		if (strlen(ciphertext)!=CIPHERTEXT_LENGTH)
 			return 0;
 		l = 0;
 	}
@@ -167,33 +168,34 @@ static char *prepare(char *split_fields[10], struct fmt_main *self)
 {
 	char *cp;
 
-	if (!strncmp(split_fields[1], FORMAT_TAG, FORMAT_TAG_LEN))
-		return split_fields[1];
 	if (!split_fields[0])
 		return split_fields[1];
-	cp = mem_alloc(strlen(split_fields[0]) + strlen(split_fields[1]) + 4);
-	sprintf (cp, "%s%s#%s", FORMAT_TAG, split_fields[0], split_fields[1]);
-	if (valid(cp, self))
-	{
-		UTF8 tmp8[MAX_USERNAME_LEN * 3 + 1];
-		int utf8len;
+	if (!strncmp(split_fields[1], FORMAT_TAG, FORMAT_TAG_LEN))
+		return split_fields[1];
+	if (strnlen(split_fields[1], CIPHERTEXT_LENGTH + 1) == CIPHERTEXT_LENGTH) {
+		cp = mem_alloc(strlen(split_fields[0]) + strlen(split_fields[1]) + 4);
+		sprintf(cp, "%s%s#%s", FORMAT_TAG, split_fields[0], split_fields[1]);
+		if (valid(cp, self)) {
+			UTF8 tmp8[MAX_USERNAME_LEN * 3 + 1];
+			int utf8len;
 
-		// we no longer need this.  It was just used for valid().   We will recompute
-		// all lengths, after we do an upcase, since upcase can change the length of the
-		// utf8 string.
-		MEM_FREE(cp);
+			// we no longer need this.  It was just used for valid().   We will recompute
+			// all lengths, after we do an upcase, since upcase can change the length of the
+			// utf8 string.
+			MEM_FREE(cp);
 
-		// Upcase user name, --encoding aware
-		utf8len = enc_uc(tmp8, sizeof(tmp8), (unsigned char*)split_fields[0], strlen(split_fields[0]));
+			// Upcase user name, --encoding aware
+			utf8len = enc_uc(tmp8, sizeof(tmp8), (unsigned char*)split_fields[0], strlen(split_fields[0]));
 
-		cp = mem_alloc_tiny(utf8len + strlen(split_fields[1]) + 4, MEM_ALIGN_NONE);
-		sprintf (cp, "%s%s#%s", FORMAT_TAG, tmp8, split_fields[1]);
+			cp = mem_alloc_tiny(utf8len + strlen(split_fields[1]) + 4, MEM_ALIGN_NONE);
+			sprintf(cp, "%s%s#%s", FORMAT_TAG, tmp8, split_fields[1]);
 #ifdef DEBUG_ORACLE
-		printf ("tmp8         : %s\n", tmp8);
+			printf("tmp8         : %s\n", tmp8);
 #endif
-		return cp;
+			return cp;
+		}
+		MEM_FREE(cp);
 	}
-	MEM_FREE(cp);
 	return split_fields[1];
 }
 
@@ -212,14 +214,9 @@ static char *split(char *ciphertext, int index, struct fmt_main *self)
 
 static void init(struct fmt_main *self)
 {
-	DES_set_key((DES_cblock *)"\x01\x23\x45\x67\x89\xab\xcd\xef", &desschedule_static);
+	omp_autotune(self, OMP_SCALE);
 
-#ifdef _OPENMP
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
+	DES_set_key((DES_cblock *)"\x01\x23\x45\x67\x89\xab\xcd\xef", &desschedule_static);
 	cur_key = mem_calloc(self->params.max_keys_per_crypt,
 	                       sizeof(*cur_key));
 	plain_key = mem_calloc(self->params.max_keys_per_crypt,
@@ -247,7 +244,7 @@ static void oracle_set_key(char *key, int index) {
 	UTF16 cur_key_mixedcase[PLAINTEXT_LENGTH+1];
 	UTF16 *c;
 
-	strcpy(plain_key[index], key);
+	strnzcpy(plain_key[index], key, sizeof(*plain_key));
 	// Can't use enc_to_utf16_be() because we need to do utf16_uc later
 	key_length[index] = enc_to_utf16((UTF16 *)cur_key_mixedcase, PLAINTEXT_LENGTH, (unsigned char*)key, strlen(key));
 
@@ -288,9 +285,8 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 #ifdef _OPENMP
 #pragma omp parallel for
-	for (idx = 0; idx < count; idx++)
 #endif
-	{
+	for (idx = 0; idx < count; idx++) {
 		unsigned char buf[sizeof(cur_salt)];
 		unsigned char buf2[SALT_SIZE + PLAINTEXT_LENGTH*2];
 		DES_key_schedule sched_local;
@@ -328,11 +324,11 @@ static void * get_binary(char *ciphertext)
 	if (!out3) out3 = mem_alloc_tiny(BINARY_SIZE, MEM_ALIGN_WORD);
 
 	l = strlen(ciphertext) - CIPHERTEXT_LENGTH;
-	for(i=0;i<BINARY_SIZE;i++)
-	{
+	for (i = 0; i < BINARY_SIZE; i++) {
 		out3[i] = atoi16[ARCH_INDEX(ciphertext[i*2+l])]*16
 			+ atoi16[ARCH_INDEX(ciphertext[i*2+l+1])];
 	}
+
 	return out3;
 }
 
@@ -375,20 +371,16 @@ static int salt_hash(void *salt)
 	return hash & (SALT_HASH_SIZE - 1);
 }
 
-static int get_hash_0(int idx) { return crypt_key[idx][0] & PH_MASK_0; }
-static int get_hash_1(int idx) { return crypt_key[idx][0] & PH_MASK_1; }
-static int get_hash_2(int idx) { return crypt_key[idx][0] & PH_MASK_2; }
-static int get_hash_3(int idx) { return crypt_key[idx][0] & PH_MASK_3; }
-static int get_hash_4(int idx) { return crypt_key[idx][0] & PH_MASK_4; }
-static int get_hash_5(int idx) { return crypt_key[idx][0] & PH_MASK_5; }
-static int get_hash_6(int idx) { return crypt_key[idx][0] & PH_MASK_6; }
+#define COMMON_GET_HASH_VAR crypt_key
+#include "common-get-hash.h"
 
 static int cmp_all(void *binary, int count)
 {
 	int i;
-	ARCH_WORD_32 b = *(ARCH_WORD_32*)binary;
+	uint32_t b = *(uint32_t*)binary;
+
 	for (i = 0; i < count; ++i)
-		if (b == *((ARCH_WORD_32*)(crypt_key[i])) )
+		if (b == *((uint32_t*)(crypt_key[i])) )
 			return 1;
 	return 0;
 }
@@ -418,7 +410,7 @@ struct fmt_main fmt_oracle = {
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_8_BIT | FMT_UNICODE | FMT_UTF8 | FMT_SPLIT_UNIFIES_CASE | FMT_OMP,
+		FMT_8_BIT | FMT_UNICODE | FMT_ENC | FMT_SPLIT_UNIFIES_CASE | FMT_OMP,
 		{ NULL },
 		{ FORMAT_TAG },
 		tests
@@ -450,13 +442,8 @@ struct fmt_main fmt_oracle = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,
@@ -465,3 +452,4 @@ struct fmt_main fmt_oracle = {
 };
 
 #endif /* plugin stanza */
+#endif /* HAVE_LIBCRYPTO */

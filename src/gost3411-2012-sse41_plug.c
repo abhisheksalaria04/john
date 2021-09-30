@@ -7,20 +7,19 @@
 #include "gost3411-tables.h"
 #include "gost3411-2012-sse41.h"
 #include "arch.h"
-#include "memdbg.h"
 
 #if ARCH_BITS == 32
 #undef _mm_cvtsi64_si128
 #define _mm_cvtsi64_si128 my__mm_cvtsi64_si128
 
-static inline __m128i _mm_cvtsi64_si128(long long a) {
+inline static __m128i _mm_cvtsi64_si128(long long a) {
 	return _mm_set_epi32(0, 0, (unsigned int)(a >> 32), (unsigned int)a);
 }
 
 #undef _mm_insert_epi64
 #define _mm_insert_epi64 my__mm_insert_epi64
 
-static inline __m128i _mm_insert_epi64(__m128i a, uint64_t b, int c) {
+inline static __m128i _mm_insert_epi64(__m128i a, uint64_t b, int c) {
 //	c <<= 1;
 //	a = _mm_insert_epi32(a, (unsigned int)b, c);
 //	return _mm_insert_epi32(a, (unsigned int)(b >> 32), c + 1);
@@ -32,7 +31,7 @@ static inline __m128i _mm_insert_epi64(__m128i a, uint64_t b, int c) {
 }
 #endif
 
-static inline void add512(const union uint512_u* x, const union uint512_u* y, union uint512_u* r)
+inline static void add512(const union uint512_u* x, const union uint512_u* y, union uint512_u* r)
 {
 	uint_fast8_t i, CF;
 
@@ -46,7 +45,7 @@ static inline void add512(const union uint512_u* x, const union uint512_u* y, un
 	}
 }
 
-static inline __m128i extract0(__m128i xmm0, __m128i xmm1, __m128i xmm2, __m128i xmm3)
+inline static __m128i extract0(__m128i xmm0, __m128i xmm1, __m128i xmm2, __m128i xmm3)
 {
 	uint64_t r0, r1;
 
@@ -71,7 +70,7 @@ static inline __m128i extract0(__m128i xmm0, __m128i xmm1, __m128i xmm2, __m128i
 	return _mm_insert_epi64(_mm_cvtsi64_si128(r0), r1, 1);
 }
 
-static inline __m128i extract2(__m128i xmm0, __m128i xmm1, __m128i xmm2, __m128i xmm3)
+inline static __m128i extract2(__m128i xmm0, __m128i xmm1, __m128i xmm2, __m128i xmm3)
 {
 	uint64_t r0, r1;
 
@@ -96,7 +95,7 @@ static inline __m128i extract2(__m128i xmm0, __m128i xmm1, __m128i xmm2, __m128i
 	return _mm_insert_epi64(_mm_cvtsi64_si128(r0), r1, 1);
 }
 
-static inline __m128i extract4(__m128i xmm0, __m128i xmm1, __m128i xmm2, __m128i xmm3)
+inline static __m128i extract4(__m128i xmm0, __m128i xmm1, __m128i xmm2, __m128i xmm3)
 {
 	uint64_t r0, r1;
 
@@ -121,7 +120,7 @@ static inline __m128i extract4(__m128i xmm0, __m128i xmm1, __m128i xmm2, __m128i
 	return _mm_insert_epi64(_mm_cvtsi64_si128(r0), r1, 1);
 }
 
-static inline __m128i extract6(__m128i xmm0, __m128i xmm1, __m128i xmm2, __m128i xmm3)
+inline static __m128i extract6(__m128i xmm0, __m128i xmm1, __m128i xmm2, __m128i xmm3)
 {
 	uint64_t r0, r1;
 
@@ -146,7 +145,7 @@ static inline __m128i extract6(__m128i xmm0, __m128i xmm1, __m128i xmm2, __m128i
 	return _mm_insert_epi64(_mm_cvtsi64_si128(r0), r1, 1);
 }
 
-static inline void g(union uint512_u* h, const union uint512_u* N, const unsigned char* m)
+inline static void g(union uint512_u* h, const union uint512_u* N, const unsigned char* m)
 {
 	__m128i xmm0, xmm2, xmm4, xmm6;
 	__m128i xmm1, xmm3, xmm5, xmm7;
@@ -296,7 +295,7 @@ void GOST34112012Init(void* ctx, const unsigned int digest_size)
 }
 
 
-static inline void stage2(GOST34112012Context* CTX, const unsigned char* data)
+inline static void stage2(GOST34112012Context* CTX, const unsigned char* data)
 {
 	g(&CTX->h, &CTX->N, data);
 
@@ -369,7 +368,9 @@ void GOST34112012Final(void* ctx, unsigned char* digest)
 		memcpy(digest, &(CTX->hash.QWORD[0]), 64);
 	}
 
+#if 0
 	memset(CTX, 0, sizeof(GOST34112012Context));
+#endif
 	_mm_empty();
 }
 

@@ -24,167 +24,187 @@
 #include "list.h"
 #include "loader.h"
 #include "getopt.h"
+#include "john_mpi.h"
 
-/*
- * Core Option flags bitmasks (low 32 bits):
- */
 /* An action requested */
-#define FLG_ACTION			0x00000001
+#define FLG_ACTION			0x0000000000000001ULL
 /* Password files specified */
-#define FLG_PASSWD			0x00000002
+#define FLG_PASSWD			0x0000000000000002ULL
 /* An option supports password files */
-#define FLG_PWD_SUP			0x00000004
+#define FLG_PWD_SUP			0x0000000000000004ULL
 /* An option requires password files */
-#define FLG_PWD_REQ			(0x00000008 | FLG_PWD_SUP)
-/* Some option that doesn't have its own flag is specified */
-#define FLG_NONE			0x00000010
+#define FLG_PWD_REQ			(0x0000000000000008ULL | FLG_PWD_SUP)
+/*
+ * getopt.h defines FLG_MULTI to 0x0000000000000010
+ */
 /* A cracking mode enabled */
-#define FLG_CRACKING_CHK		0x00000020
-#define FLG_CRACKING_SUP		0x00000040
+#define FLG_CRACKING_CHK		0x0000000000000020ULL
+#define FLG_CRACKING_SUP		0x0000000000000040ULL
 #define FLG_CRACKING_SET \
 	(FLG_CRACKING_CHK | FLG_CRACKING_SUP | FLG_ACTION | FLG_PWD_REQ)
 /* Wordlist mode enabled, options.wordlist is set to the file name, or
  * we get it from john.conf */
-#define FLG_WORDLIST_CHK		0x00000080
+#define FLG_WORDLIST_CHK		0x0000000000000080ULL
 #define FLG_WORDLIST_SET \
 	(FLG_WORDLIST_CHK | FLG_CRACKING_SET | FLG_RULES_ALLOW)
 /* Wordlist mode enabled, reading from stdin */
-#define FLG_STDIN_CHK			0x00000100
+#define FLG_STDIN_CHK			0x0000000000000100ULL
 #define FLG_STDIN_SET			(FLG_STDIN_CHK | FLG_WORDLIST_SET)
 /* Wordlist rules enabled */
-#define FLG_RULES			0x00000200
+#define FLG_RULES_CHK			0x0000000000000200ULL
+#define FLG_RULES_SET			(FLG_RULES_CHK | FLG_RULES_IN_USE)
 /* "Single crack" mode enabled */
-#define FLG_SINGLE_CHK			0x00000400
+#define FLG_SINGLE_CHK			0x0000000000000400ULL
 #define FLG_SINGLE_SET			(FLG_SINGLE_CHK | FLG_CRACKING_SET)
 /* Incremental mode enabled */
-#define FLG_INC_CHK			0x00000800
+#define FLG_INC_CHK			0x0000000000000800ULL
 #define FLG_INC_SET			(FLG_INC_CHK | FLG_CRACKING_SET)
 /* Mask mode enabled (might be hybrid) */
-#define FLG_MASK_CHK			0x00001000
+#define FLG_MASK_CHK			0x0000000000001000ULL
 #define FLG_MASK_SET \
 	(FLG_MASK_CHK | FLG_ACTION | FLG_CRACKING_SUP | FLG_PWD_SUP)
 /* External mode or word filter enabled */
-#define FLG_EXTERNAL_CHK		0x00002000
+#define FLG_EXTERNAL_CHK		0x0000000000002000ULL
 #define FLG_EXTERNAL_SET \
 	(FLG_EXTERNAL_CHK | FLG_ACTION | FLG_CRACKING_SUP | FLG_PWD_SUP)
 /* Batch cracker */
-#define FLG_BATCH_CHK			0x00004000
+#define FLG_BATCH_CHK			0x0000000000004000ULL
 #define FLG_BATCH_SET			(FLG_BATCH_CHK | FLG_CRACKING_SET)
 /* Stdout mode */
-#define FLG_STDOUT			0x00008000
+#define FLG_STDOUT			0x0000000000008000ULL
 /* Restoring an interrupted session */
-#define FLG_RESTORE_CHK			0x00010000
+#define FLG_RESTORE_CHK			0x0000000000010000ULL
 #define FLG_RESTORE_SET			(FLG_RESTORE_CHK | FLG_ACTION)
 /* A session name is set */
-#define FLG_SESSION			0x00020000
+#define FLG_SESSION			0x0000000000020000ULL
 /* Print status of a session */
-#define FLG_STATUS_CHK			0x00040000
+#define FLG_STATUS_CHK			0x0000000000040000ULL
 #define FLG_STATUS_SET			(FLG_STATUS_CHK | FLG_ACTION)
 /* Make a charset */
-#define FLG_MAKECHR_CHK			0x00100000
+#define FLG_MAKECHR_CHK			0x0000000000080000ULL
 #define FLG_MAKECHR_SET \
 	(FLG_MAKECHR_CHK | FLG_ACTION | FLG_PWD_SUP)
 /* Show cracked passwords */
-#define FLG_SHOW_CHK			0x00200000
+#define FLG_SHOW_CHK			0x0000000000100000
 #define FLG_SHOW_SET \
 	(FLG_SHOW_CHK | FLG_ACTION | FLG_PWD_REQ)
 /* Perform a benchmark */
-#define FLG_TEST_CHK			0x00400000
+#define FLG_TEST_CHK			0x0000000000200000ULL
 #define FLG_TEST_SET \
 	(FLG_TEST_CHK | FLG_CRACKING_SUP | FLG_ACTION)
 #ifdef HAVE_FUZZ
 /* Perform a fuzzing */
-#define FLG_FUZZ_CHK			0x08000000
+#define FLG_FUZZ_CHK			0x0000000000400000ULL
 #define FLG_FUZZ_SET \
 	(FLG_FUZZ_CHK | FLG_CRACKING_SUP | FLG_ACTION)
 /* Dump fuzzed hashes */
-#define FLG_FUZZ_DUMP_CHK		0x40000000
+#define FLG_FUZZ_DUMP_CHK		0x0000000000800000ULL
 #define FLG_FUZZ_DUMP_SET \
 	(FLG_FUZZ_DUMP_CHK | FLG_CRACKING_SUP | FLG_ACTION)
 #endif
-/* Passwords per salt requested */
-#define FLG_SALTS			0x01000000
 /* Ciphertext format forced */
-#define FLG_FORMAT			0x02000000
+#define FLG_FORMAT			0x0000000001000000ULL
 /* Memory saving enabled */
-#define FLG_SAVEMEM			0x04000000
-/* Node number(s) specified */
-#define FLG_NODE			0x10000000
+#define FLG_SAVEMEM			0x0000000002000000ULL
 /* fork() requested, and process count specified */
-#define FLG_FORK			0x20000000
-
-/* Note that 0x80000000 is taken for OPT_REQ_PARAM, see getopt.h */
-
-/*
- * Jumbo Options flags bitmasks (high 32 bits)
- *
- * Tip: For your private patches, pick first free from MSB. When
- * sharing your patch, pick first free from LSB of high 32 bits.
- *
- * In Jumbo, the combination flg_set == FLG_ZERO and req_clr == OPT_REQ_PARAM
- * gets dupe checking automatically, without a specific flag.
- */
-#define FLG_ZERO			0x0
+#define FLG_FORK			0x0000000004000000ULL
 
 /* .pot file used as wordlist, options.wordlist is set to the file name, or
  * we use the active .pot file */
-#define FLG_LOOPBACK_CHK		0x0000000100000000ULL
+#define FLG_LOOPBACK_CHK		0x0000000008000000ULL
 #define FLG_LOOPBACK_SET	  \
 	(FLG_LOOPBACK_CHK | FLG_WORDLIST_SET | FLG_CRACKING_SET | FLG_DUPESUPP)
 /* pipe mode enabled, reading from stdin with rules support */
-#define FLG_PIPE_CHK			0x0000000200000000ULL
+#define FLG_PIPE_CHK			0x0000000010000000ULL
 #define FLG_PIPE_SET			(FLG_PIPE_CHK | FLG_WORDLIST_SET)
-/* Dynamic load of foreign format module */
-#define FLG_DYNFMT			0x0000000400000000ULL
-/* Turn off logging */
-#define FLG_NOLOG			0x0000000800000000ULL
-/* Log to stderr */
-#define FLG_LOG_STDERR			0x0000001000000000ULL
+
+/*
+ * Note that 0x0000000020000000 is taken for OPT_BOOL,
+ *           0x0000000040000000 is taken for OPT_TRISTATE, and
+ *           0x0000000080000000 is taken for OPT_REQ_PARAM, see getopt.h
+ *
+ * These are available for using!
+ *		0x0000100000000000ULL
+ *		0x0000200000000000ULL
+ */
+
+/* Subsets prefer finishing shorter lengths */
+#define FLG_SUBSETS_SHORT		0x0000000100000000ULL
+/* Subsets prefer finishing smaller sets */
+#define FLG_SUBSETS_SMALL		0x0000000200000000ULL
 /* Markov mode enabled */
-#define FLG_MKV_CHK			0x0000002000000000ULL
+#define FLG_MKV_CHK			0x0000000400000000ULL
 #define FLG_MKV_SET			(FLG_MKV_CHK | FLG_CRACKING_SET)
-/* Emit a status line for every password cracked */
-#define FLG_CRKSTAT			0x0000004000000000ULL
 /* Wordlist dupe suppression */
-#define FLG_DUPESUPP			0x0000008000000000ULL
+#define FLG_DUPESUPP			0x0000000800000000ULL
 /* Force scalar mode */
-#define FLG_SCALAR			0x0000010000000000ULL
-#define FLG_VECTOR			0x0000020000000000ULL
+#define FLG_SCALAR			0x0000001000000000ULL
+#define FLG_VECTOR			0x0000002000000000ULL
 /* Reject printable binaries */
-#define FLG_REJECT_PRINTABLE		0x0000040000000000ULL
+#define FLG_REJECT_PRINTABLE		0x0000004000000000ULL
 /* Skip self tests */
-#define FLG_NOTESTS			0x0000080000000000ULL
+#define FLG_NOTESTS			0x0000008000000000ULL
 /* Regex cracking mode */
-#define FLG_REGEX_CHK			0x0000100000000000ULL
+#define FLG_REGEX_CHK			0x0000010000000000ULL
 #define FLG_REGEX_SET	  \
 	(FLG_REGEX_CHK | FLG_ACTION | FLG_CRACKING_SUP | FLG_PWD_SUP)
 /* Encodings. You can only give one of --internal-enc or --target-enc */
-#define FLG_INPUT_ENC			0x0000200000000000ULL
-#define FLG_SECOND_ENC			0x0000400000000000ULL
+#define FLG_INPUT_ENC			0x0000020000000000ULL
+#define FLG_SECOND_ENC			0x0000040000000000ULL
 /* --verbosity */
-#define FLG_VERBOSITY			0x0000800000000000ULL
-/* Sets FMT_NOT_EXACT, searching for cleartext collisions */
-#define FLG_KEEP_GUESSING		0x0001000000000000ULL
+#define FLG_VERBOSITY			0x0000080000000000ULL
 /* Loops self-test forever */
-#define FLG_LOOPTEST			0x0002000000000000ULL
+#define FLG_LOOPTEST_CHK		0x0000400000000000ULL
+#define FLG_LOOPTEST_SET		(FLG_LOOPTEST_CHK | FLG_TEST_SET)
 /* Mask mode is stacked */
-#define FLG_MASK_STACKED		0x0004000000000000ULL
+#define FLG_MASK_STACKED		0x0000800000000000ULL
 /* Stacking modes */
 #define FLG_STACKING			(FLG_MASK_CHK | FLG_REGEX_CHK)
 /* Any stacking mode is active */
 #define FLG_STACKED			(FLG_MASK_STACKED | FLG_REGEX_STACKED)
 /* PRINCE mode enabled, options.wordlist is set to the file name, or
  * we get it from john.conf */
-#define FLG_PRINCE_CHK			0x0008000000000000ULL
+#define FLG_PRINCE_CHK			0x0001000000000000ULL
 #define FLG_PRINCE_SET \
 	(FLG_PRINCE_CHK | FLG_CRACKING_SET | FLG_RULES_ALLOW)
-#define FLG_PRINCE_DIST			0x0010000000000000ULL
-#define FLG_PRINCE_KEYSPACE		0x0020000000000000ULL
-#define FLG_PRINCE_CASE_PERMUTE		0x0040000000000000ULL
-#define FLG_PRINCE_LOOPBACK		0x0080000000000000ULL
-#define FLG_PRINCE_MMAP			0x0100000000000000ULL
-#define FLG_RULES_ALLOW			0x0200000000000000ULL
-#define FLG_REGEX_STACKED		0x0400000000000000ULL
+#define FLG_PRINCE_DIST			0x0002000000000000ULL
+#define FLG_PRINCE_KEYSPACE		0x0004000000000000ULL
+#define FLG_PRINCE_CASE_PERMUTE		0x0008000000000000ULL
+#define FLG_PRINCE_LOOPBACK		0x0010000000000000ULL
+#define FLG_PRINCE_MMAP			0x0020000000000000ULL
+#define FLG_RULES_ALLOW			0x0040000000000000ULL
+#define FLG_REGEX_STACKED		0x0080000000000000ULL
+/* Subsets cracking mode */
+#define FLG_SUBSETS_CHK			0x0100000000000000ULL
+#define FLG_SUBSETS_SET			(FLG_SUBSETS_CHK | FLG_CRACKING_SET)
+#define FLG_RULES_STACK_CHK		0x0200000000000000ULL
+#define FLG_RULES_STACK_SET		(FLG_RULES_STACK_CHK | FLG_RULES_IN_USE)
+#define FLG_RULES_IN_USE		0x0400000000000000ULL
+/* Ignore NOP rules */
+#define FLG_RULE_SKIP_NOP		0x0800000000000000ULL
+#define FLG_NO_MASK_BENCH		0x1000000000000000ULL
+/* Configure terminal for reading keystrokes even if we're not the foreground process */
+#define FLG_FORCE_TTY			0x2000000000000000ULL
+/* Turn off logging */
+#define FLG_NOLOG			0x4000000000000000ULL
+
+/*
+ * Macro for getting correct node number regardless of if MPI or not
+ */
+#if HAVE_MPI
+#define NODE (mpi_p > 1 ? mpi_id + 1 : options.node_min)
+#else
+#define NODE options.node_min
+#endif
+
+/*
+ * Macro for getting correct total processes regardless of if MPI or fork
+ */
+#if HAVE_MPI
+#define NODES (mpi_p > 1 ? mpi_p : options.fork ? options.fork : 1)
+#else
+#define NODES (options.fork ? options.fork : 1)
+#endif
 
 /*
  * Structure with option flags and all the parameters.
@@ -205,11 +225,14 @@ struct options_main {
 /* Ciphertext format name */
 	char *format;
 
+/* Ciphertext format list, as a comma-separated string */
+	char *format_list;
+
 /* Wordlist file name */
 	char *wordlist;
 
 /* Incremental mode name or charset file name */
-	char *charset;
+	const char *charset;
 
 /* External mode or word filter name */
 	char *external;
@@ -230,6 +253,31 @@ struct options_main {
 /* Ciphertext subformat name */
 	char *subformat;
 
+/* Single mode global seed word(s) (--single-seed) */
+	char *seed_word;
+
+/* Single mode global seed wordlist file name(s) (--single-wordlist) */
+	struct list_main *seed_files;
+
+/* Single mode wordlist per username (--single-user-seed) */
+	char *seed_per_user;
+
+/*
+ * Override words_pair_max (--single-pair-max=N tri-state). The actual negated
+ * version is --no-single-pair-max but we list it as --no-single-pair to avoid
+ * confusion.
+ */
+	int single_pair_max;
+/*
+ * --[no]-single-retest-guess tri-state option (vs. deprecated config option)
+ */
+	char *single_retest_guess;
+
+/*
+ * --no-loader-dupecheck option tri-state option (vs. deprecated config option)
+ */
+	int loader_dupecheck;
+
 /* Configuration file name */
 	char *config;
 
@@ -245,8 +293,11 @@ struct options_main {
 	char *fuzz_dump;
 #endif
 
-/* Mask mode's mask */
+/* Mask mode's requested mask (as given) */
 	char *mask;
+
+/* Mask mode's effective mask (as used, may be default from john.conf etc.) */
+	char *eff_mask;
 
 /* Can't use HAVE_WINDOWS_H here so the below need to be maintained */
 #if defined (_MSC_VER) || defined (__MINGW32__) || defined (__CYGWIN32__)
@@ -274,14 +325,20 @@ struct options_main {
 /* Input encoding for word lists, and/or pot file clear-texts. */
 	int input_enc;
 
+/* Replacement character for "EmulateBrokenEncoding" feature. */
+	unsigned char replacement_character;
+
 /* True if encoding was set from john.conf as opposed to command line. */
 	int default_enc;
 	int default_target_enc;
 
 /* Output encoding. This must match what the hash origin used. An exception
-   is UTF-16 formats like NT, which can use any codepage (or UTF-8) if FMT_UTF8
-   is set, or ISO-8859-1 only if FMT_UTF8 is false. */
+   is UTF-16 formats like NT, which can use any codepage (or UTF-8) if FMT_ENC
+   is set, or ISO-8859-1 only if FMT_ENC is false. */
 	int target_enc;
+
+/* Terminal encoding, as parsed from LC_ALL or LC_CTYPE */
+	int terminal_enc;
 
 /* If different from target_enc, this is an intermediate encoding only
    used within rules/mask processing. This is only applicable for the case
@@ -301,31 +358,29 @@ struct options_main {
 	char *activepot;
 
 /* the wordlist rules section (default if none entered is Wordlist) */
-	char *activewordlistrules;
+	const char *activewordlistrules;
 
 /* the 'single' rules section (default if none entered is Single) */
-	char *activesinglerules;
+	const char *activesinglerules;
 
-/* This is a 'special' flag.  It causes john to add 'extra' code to search for
- * some salted types, when we have only the hashes.  The only type supported is
- * PHPS (at this time.).  So PHPS will set this to a 1. OTherwise it will
- * always be zero.  LIKELY we will add the same type logic for the OSC
- * (mscommerse) type, which has only a 2 byte salt.  That will set this field
- * to be a 2.  If we add other types, then we will have other values which can
- * be assigned to this variable.  This var is set by the undocummented
- * --regen_lost_salts=#   */
+/* Stacked rules applied within cracker.c for any mode */
+	char *rule_stack;
+
+/* Salt brute-force */
 	int regen_lost_salts;
 
 /* Requested max_keys_per_crypt (for testing purposes) */
 	int force_maxkeys;
 
-/* Requested MinLen (min plaintext_length) */
-	int req_minlength;
+/* Requested min/max plaintext_length. if options weren't used, req_min == -1
+ * and/or req_maxlength == 0. req_length is used for both or 0 if not used */
+	int req_minlength, req_maxlength, req_length;
 
-/* Requested MaxLen (max plaintext_length) */
-	int req_maxlength;
+/* Effective min/max plaintext_length. Always set. If hybrid mask is used,
+ * mask_add_len is subtracted from them so parents should use these as-is */
+	int eff_minlength, eff_maxlength;
 
-/* Forced MaxLen (we will reject candidates longer than this) */
+/* Forced MaxLen (if set, we will reject longer candidates unless FMT_TRUNC) */
 	int force_maxlength;
 
 /*
@@ -333,6 +388,12 @@ struct options_main {
  * negative, we exit after that many seconds of not cracking anything.
  */
 	int max_run_time;
+
+/*
+ * Graceful exit after this many candidates tried. If the number is
+ * negative, we reset the count on any successful crack.
+ */
+	long long max_cands;
 
 /* Emit a status line every N seconds */
 	int status_interval;
@@ -344,8 +405,8 @@ struct options_main {
 	int reload_at_crack;
 
 /* Pause/abort on trigger files */
-	char *pause_file;
-	char *abort_file;
+	const char *pause_file;
+	const char *abort_file;
 
 /* Force dynamic format to always treat bare hashes as valid. If not set
    then dynamic format only uses bare hashes if -form=dynamic_xxx is used.
@@ -356,9 +417,13 @@ struct options_main {
 #ifdef HAVE_OPENCL
 /* Vector width of OpenCL kernel */
 	unsigned int v_width;
+
+/* GPU Worksizes */
+	size_t lws, gws;
 #endif
-#if defined(HAVE_OPENCL) || defined(HAVE_CUDA)
-	struct list_main *gpu_devices;
+#if defined(HAVE_OPENCL) || defined(HAVE_ZTEX)
+/* Allow to set and select OpenCL device(s) or ztex boards */
+	struct list_main *acc_devices;
 #endif
 /* -list=WHAT Get a config list (eg. a list of incremental modes available) */
 	char *listconf;
@@ -372,6 +437,26 @@ struct options_main {
 	char *regex;
 /* Custom masks */
 	char *custom_mask[MAX_NUM_CUST_PLHDR];
+/* Tune options */
+	char *tune;
+/* Incremental CharCount override */
+	int charcount;
+/* Subsets full charset */
+	char *subset_full;
+/* Subsets, required first partition */
+	int subset_must;
+/* Subsets, min. diff */
+	int subset_min_diff;
+/* Subsets, max. diff */
+	int subset_max_diff;
+/* --[no-]keep-guessing tri-state option (vs. format's FMT_NOT_EXACT) */
+	int keep_guessing;
+/* --log-stderr */
+	int log_stderr;
+/* Emit a status line for every password cracked */
+	int crack_status;
+/* --catch-up=oldsession */
+	char *catchup;
 };
 
 extern struct options_main options;
@@ -379,11 +464,7 @@ extern struct options_main options;
 /*
  * Initializes the options structure.
  */
-extern void opt_init(char *name, int argc, char **argv, int show_usage);
-
-/*
- * Prints the "hidden" options usage
- */
-extern void opt_print_hidden_usage(void);
+extern void opt_init(char *name, int argc, char **argv);
+extern void opt_usage();
 
 #endif

@@ -16,7 +16,6 @@
 #include "common.h"
 #include "options.h"
 #include "opencl_bf_std.h"
-#include "memdbg.h"
 
 #define INDEX				[index]
 #define pos_S(row,col)			\
@@ -179,10 +178,11 @@ void BF_select_device(struct fmt_main *fmt) {
 
 	if ((get_device_type(gpu_id) == CL_DEVICE_TYPE_CPU) ||
 	    amd_vliw5(device_info[gpu_id]) ||
-	    (get_local_memory_size(gpu_id) < local_work_size * lmem_per_th))
+	    (get_local_memory_size(gpu_id) < local_work_size * lmem_per_th) ||
+	    (gpu_intel(device_info[gpu_id]) && platform_apple(platform_id)))
 	{
-	        if(CHANNEL_INTERLEAVE == 1)
-		        opencl_init("$JOHN/kernels/bf_cpu_kernel.cl",
+	        if (CHANNEL_INTERLEAVE == 1)
+		        opencl_init("$JOHN/opencl/bf_cpu_kernel.cl",
 			             gpu_id, NULL);
 	        else {
 			fprintf(stderr, "Please set NUM_CHANNELS and "
@@ -193,7 +193,7 @@ void BF_select_device(struct fmt_main *fmt) {
 	else {
 		snprintf(buildopts, sizeof(buildopts),
 		         "-DWORK_GROUP_SIZE="Zu, local_work_size);
-		opencl_init("$JOHN/kernels/bf_kernel.cl",
+		opencl_init("$JOHN/opencl/bf_kernel.cl",
 		            gpu_id, buildopts);
 	}
 
@@ -241,8 +241,6 @@ void BF_select_device(struct fmt_main *fmt) {
 	HANDLE_CLERROR(clSetKernelArg(krnl[gpu_id], 4, sizeof(cl_mem), &buffers[gpu_id].BF_current_P_gpu), "Set Kernel Arg FAILED arg4");
 	HANDLE_CLERROR(clSetKernelArg(krnl[gpu_id], 6, sizeof(cl_mem), &buffers[gpu_id].S_box_gpu), "Set Kernel Arg FAILED arg6") ;
 
-	fmt->params.min_keys_per_crypt = local_work_size;
-
 	if (global_work_size) {
 		global_work_size =
 			global_work_size / local_work_size * local_work_size;
@@ -252,8 +250,13 @@ void BF_select_device(struct fmt_main *fmt) {
 	} else
 		find_best_gws(fmt);
 
-	if (options.verbosity > VERB_LEGACY)
-		fprintf(stderr, "Local worksize (LWS) %d, Global worksize (GWS) %d\n", (int)local_work_size, (int)global_work_size);
+	if ((!self_test_running && options.verbosity >= VERB_DEFAULT) ||
+	    ocl_always_show_ws)
+		fprintf(stderr, "LWS="Zu" GWS="Zu"%s", local_work_size,
+		        global_work_size, benchmark_running ? " " : "\n");
+
+	fmt->params.min_keys_per_crypt = opencl_calc_min_kpc(local_work_size,
+	                                                     global_work_size, 1);
 }
 
 void opencl_BF_std_set_key(char *key, int index, int sign_extension_bug) {
@@ -335,13 +338,13 @@ void opencl_BF_std_crypt(BF_salt *salt, int n)
 {
 	int 			index=0,j ;
 	static unsigned int 	salt_api[4] ;
-	unsigned int 		rounds = salt -> rounds ;
+	unsigned int 		rounds = salt->rounds ;
 	static unsigned int 	BF_out[2*BF_N] ;
 
-	salt_api[0] = salt -> salt[0] ;
-	salt_api[1] = salt -> salt[1] ;
-	salt_api[2] = salt -> salt[2] ;
-	salt_api[3] = salt -> salt[3] ;
+	salt_api[0] = salt->salt[0] ;
+	salt_api[1] = salt->salt[1] ;
+	salt_api[2] = salt->salt[2] ;
+	salt_api[3] = salt->salt[3] ;
 
 	exec_bf(salt_api, BF_out, rounds, n) ;
 

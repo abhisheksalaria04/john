@@ -1,4 +1,5 @@
-/* Panama cracker patch for JtR. Hacked together during May of 2013 by Dhiru
+/*
+ * Panama cracker patch for JtR. Hacked together during May of 2013 by Dhiru
  * Kholia <dhiru at openwall.com>.
  *
  * This software is Copyright (c) 2013 Dhiru Kholia <dhiru at openwall.com> and
@@ -15,6 +16,11 @@ john_register_one(&fmt_panama_);
 #else
 
 #include <string.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "arch.h"
 #include "sph_panama.h"
 #include "misc.h"
@@ -22,25 +28,6 @@ john_register_one(&fmt_panama_);
 #include "formats.h"
 #include "params.h"
 #include "options.h"
-#ifdef _OPENMP
-static int omp_t = 1;
-#include <omp.h>
-// OMP_SCALE tuned on core i7 quad core HT
-// 1   -  217k
-// 64  - 1930k
-// 128 - 2099k
-// 256 - 2204k *** set to this level
-// 512 - 2203k
-// 1k  - 2124k
-#ifndef OMP_SCALE
-#ifdef __MIC__
-#define OMP_SCALE  8
-#else
-#define OMP_SCALE  256
-#endif // __MIC__
-#endif // OMP_SCALE
-#endif // _OPENMP
-#include "memdbg.h"
 
 #define FORMAT_LABEL		"Panama"
 #define FORMAT_NAME		""
@@ -48,14 +35,18 @@ static int omp_t = 1;
 #define TAG_LENGTH		(sizeof(FORMAT_TAG)-1)
 #define ALGORITHM_NAME		"Panama 32/" ARCH_BITS_STR
 #define BENCHMARK_COMMENT	""
-#define BENCHMARK_LENGTH	-1
+#define BENCHMARK_LENGTH	0x107
 #define PLAINTEXT_LENGTH	125
 #define BINARY_SIZE		32
 #define SALT_SIZE		0
 #define BINARY_ALIGN		4
 #define SALT_ALIGN		1
 #define MIN_KEYS_PER_CRYPT	1
-#define MAX_KEYS_PER_CRYPT	1
+#define MAX_KEYS_PER_CRYPT	32
+
+#ifndef OMP_SCALE
+#define OMP_SCALE  64 // Tuned w/ MKPC for core i7
+#endif
 
 static struct fmt_tests panama__tests[] = {
 	{"049d698307d8541f22870dfa0a551099d3d02bc6d57c610a06a4585ed8d35ff8", "T"},
@@ -69,17 +60,13 @@ static struct fmt_tests panama__tests[] = {
 	{NULL}
 };
 
-static char (*saved_key)[PLAINTEXT_LENGTH + 1];
-static ARCH_WORD_32 (*crypt_out)[BINARY_SIZE / sizeof(ARCH_WORD_32)];
+static char (*saved_key)[((PLAINTEXT_LENGTH + 4)/4)*4];  // PANAMA implementation expects 32-bit alignment
+static uint32_t (*crypt_out)[BINARY_SIZE / sizeof(uint32_t)];
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
+	omp_autotune(self, OMP_SCALE);
+
 	saved_key = mem_calloc(sizeof(*saved_key), self->params.max_keys_per_crypt);
 	crypt_out = mem_calloc(sizeof(*crypt_out), self->params.max_keys_per_crypt);
 }
@@ -123,13 +110,9 @@ static void *get_binary(char *ciphertext)
 		ARCH_WORD dummy;
 	} buf;
 	unsigned char *out = buf.c;
-	char *p;
+	char *p = ciphertext + TAG_LENGTH;
 	int i;
 
-	if (!strncmp(ciphertext, FORMAT_TAG, TAG_LENGTH))
-		p = strrchr(ciphertext, '$') + 1;
-	else
-		p = ciphertext;
 	for (i = 0; i < BINARY_SIZE; i++) {
 		out[i] =
 		    (atoi16[ARCH_INDEX(*p)] << 4) |
@@ -140,39 +123,33 @@ static void *get_binary(char *ciphertext)
 	return out;
 }
 
-static int get_hash_0(int index) { return crypt_out[index][0] & PH_MASK_0; }
-static int get_hash_1(int index) { return crypt_out[index][0] & PH_MASK_1; }
-static int get_hash_2(int index) { return crypt_out[index][0] & PH_MASK_2; }
-static int get_hash_3(int index) { return crypt_out[index][0] & PH_MASK_3; }
-static int get_hash_4(int index) { return crypt_out[index][0] & PH_MASK_4; }
-static int get_hash_5(int index) { return crypt_out[index][0] & PH_MASK_5; }
-static int get_hash_6(int index) { return crypt_out[index][0] & PH_MASK_6; }
+#define COMMON_GET_HASH_VAR crypt_out
+#include "common-get-hash.h"
 
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
 	const int count = *pcount;
-	int index = 0;
+	int index;
 
 #ifdef _OPENMP
 #pragma omp parallel for
-	for (index = 0; index < count; index++)
 #endif
-	{
+	for (index = 0; index < count; index++) {
 		sph_panama_context ctx;
 
 		sph_panama_init(&ctx);
 		sph_panama(&ctx, saved_key[index], strlen(saved_key[index]));
 		sph_panama_close(&ctx, (unsigned char*)crypt_out[index]);
 	}
+
 	return count;
 }
 
 static int cmp_all(void *binary, int count)
 {
-	int index = 0;
-#ifdef _OPENMP
-	for (; index < count; index++)
-#endif
+	int index;
+
+	for (index = 0; index < count; index++)
 		if (!memcmp(binary, crypt_out[index], ARCH_SIZE))
 			return 1;
 	return 0;
@@ -190,11 +167,7 @@ static int cmp_exact(char *source, int index)
 
 static void panama_set_key(char *key, int index)
 {
-	int saved_len = strlen(key);
-	if (saved_len > PLAINTEXT_LENGTH)
-		saved_len = PLAINTEXT_LENGTH;
-	memcpy(saved_key[index], key, saved_len);
-	saved_key[index][saved_len] = 0;
+	strnzcpy(saved_key[index], key, sizeof(*saved_key));
 }
 
 static char *get_key(int index)
@@ -249,13 +222,8 @@ struct fmt_main fmt_panama_ = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,

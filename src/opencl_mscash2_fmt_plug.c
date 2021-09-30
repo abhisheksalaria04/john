@@ -29,12 +29,7 @@ john_register_one(&fmt_opencl_mscash2);
 #include "config.h"
 #include "mscash_common.h"
 
-#include "memdbg.h"
 
-#define INIT_MD4_A                  0x67452301
-#define INIT_MD4_B                  0xefcdab89
-#define INIT_MD4_C                  0x98badcfe
-#define INIT_MD4_D                  0x10325476
 #define SQRT_2                      0x5a827999
 #define SQRT_3                      0x6ed9eba1
 
@@ -49,7 +44,7 @@ john_register_one(&fmt_opencl_mscash2);
 #define GPU_BINARY_SIZE           4
 #define SALT_SIZE                 sizeof(ms_cash2_salt)
 
-# define SWAP(n) \
+ #define SWAP(n) \
     (((n) << 24) | (((n) & 0xff00) << 8) | (((n) >> 8) & 0xff00) | ((n) >> 24))
 
 typedef struct {
@@ -60,6 +55,7 @@ typedef struct {
 
 static cl_uint 		*dcc_hash_host ;
 static cl_uint 		*dcc2_hash_host ;
+static unsigned int    initialized;
 static unsigned char 	(*key_host)[MAX_PLAINTEXT_LENGTH + 1] ;
 static ms_cash2_salt 	currentsalt ;
 static cl_uint          *hmac_sha1_out ;
@@ -70,7 +66,7 @@ static void set_key(char*, int) ;
 static void init(struct fmt_main *__self)
 {
 	//Prepare OpenCL environment.
-	opencl_preinit();
+	opencl_load_environment();
 
 	/* Read LWS/GWS prefs from config or environment */
 	opencl_get_user_preferences(FORMAT_LABEL);
@@ -89,23 +85,21 @@ static void init(struct fmt_main *__self)
 
 static void reset(struct db_main *db)
 {
-	static unsigned int initialized;
-
 	if (!initialized) {
 		unsigned int i;
 		self->params.max_keys_per_crypt = 0;
 
-		for( i=0; i < get_number_of_devices_in_use(); i++)
-			self->params.max_keys_per_crypt += selectDevice(gpu_device_list[i], self);
+		for ( i=0; i < get_number_of_devices_in_use(); i++)
+			self->params.max_keys_per_crypt += selectDevice(engaged_devices[i], self);
 
 		///Allocate memory
-		key_host = mem_calloc(self -> params.max_keys_per_crypt, sizeof(*key_host));
-		dcc_hash_host = (cl_uint*)mem_alloc(4 * sizeof(cl_uint) * self -> params.max_keys_per_crypt);
-		dcc2_hash_host = (cl_uint*)mem_alloc(4 * sizeof(cl_uint) * self -> params.max_keys_per_crypt);
-		hmac_sha1_out  = (cl_uint*)mem_alloc(5 * sizeof(cl_uint) * self -> params.max_keys_per_crypt);
+		key_host = mem_calloc(self->params.max_keys_per_crypt, sizeof(*key_host));
+		dcc_hash_host = (cl_uint*)mem_alloc(4 * sizeof(cl_uint) * self->params.max_keys_per_crypt);
+		dcc2_hash_host = (cl_uint*)mem_alloc(4 * sizeof(cl_uint) * self->params.max_keys_per_crypt);
+		hmac_sha1_out  = (cl_uint*)mem_alloc(5 * sizeof(cl_uint) * self->params.max_keys_per_crypt);
 
-		memset(dcc_hash_host, 0, 4 * sizeof(cl_uint) * self -> params.max_keys_per_crypt);
-		memset(dcc2_hash_host, 0, 4 * sizeof(cl_uint) * self -> params.max_keys_per_crypt);
+		memset(dcc_hash_host, 0, 4 * sizeof(cl_uint) * self->params.max_keys_per_crypt);
+		memset(dcc2_hash_host, 0, 4 * sizeof(cl_uint) * self->params.max_keys_per_crypt);
 
 		initialized++;
 	}
@@ -150,6 +144,7 @@ static void done(void) {
 	MEM_FREE(key_host) ;
 	MEM_FREE(hmac_sha1_out);
 	releaseAll();
+	initialized = 0;
 }
 
 static int valid(char *ciphertext, struct fmt_main *self)
@@ -202,7 +197,7 @@ static void pbkdf2_iter0(unsigned int *input_dcc_hash,unsigned char *salt_buffer
 	memset(&ipad[4], 0x36, SHA_CBLOCK-16);
 	memset(&opad[4], 0x5C, SHA_CBLOCK-16);
 
-	for(k = 0; k < count; k++) {
+	for (k = 0; k < count; k++) {
 		i = k * 4;
 		ipad[0] = dcc_hash_host[i]^0x36363636;
 		opad[0] = dcc_hash_host[i++]^0x5C5C5C5C;
@@ -251,7 +246,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 	DCC((unsigned char*)salt_host, salt_len, dcc_hash_host, count) ;
 
-	if(salt_len > 22)
+	if (salt_len > 22)
 		pbkdf2_iter0(dcc_hash_host,(unsigned char*)salt_host, (salt_len << 1) , count);
 
 #ifdef _DEBUG
@@ -366,7 +361,7 @@ struct fmt_main fmt_opencl_mscash2 = {
 		FORMAT_NAME,
 		ALGORITHM_NAME,
 		BENCHMARK_COMMENT,
-		BENCHMARK_LENGTH,
+		BENCHMARK_LENGTH | 0x100,
 		0,
 		MAX_PLAINTEXT_LENGTH,
 		GPU_BINARY_SIZE,
@@ -375,7 +370,7 @@ struct fmt_main fmt_opencl_mscash2 = {
 		SALT_ALIGN,
 		MAX_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_CASE | FMT_8_BIT | FMT_SPLIT_UNIFIES_CASE | FMT_UNICODE | FMT_UTF8,
+		FMT_CASE | FMT_8_BIT | FMT_SPLIT_UNIFIES_CASE | FMT_UNICODE | FMT_ENC,
 		{ NULL },
 		{ FORMAT_TAG2 },
 		mscash2_common_tests

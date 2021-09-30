@@ -12,12 +12,12 @@
 #ifndef _JOHN_LOADER_H
 #define _JOHN_LOADER_H
 
+#include <stdint.h>
 #include "params.h"
 #ifndef BENCH_BUILD
 #include "list.h"
 #include "formats.h"
 #endif
-#include "stdint.h"
 
 /*
  * Password hash list entry (with a fixed salt).
@@ -26,7 +26,9 @@ struct db_password {
 /* Pointer to next password hash with the same salt */
 	struct db_password *next;
 
-/* Hot portion of or full binary ciphertext for fast comparison (aligned) */
+/* Hot portion of or full binary ciphertext for fast comparison (aligned).
+ * Alternatively, for non-hash formats: Non-salt data (that we used to
+ * incorrectly store in a "salt"). */
 	void *binary;
 
 /* After loading is completed: pointer to next password hash with the same salt
@@ -55,10 +57,10 @@ struct db_password {
  */
 struct db_keys_hash_entry {
 /* Index of next key with the same hash, or -1 if none */
-	short next;
+	SINGLE_KEYS_TYPE next;
 
 /* Byte offset of this key in the buffer */
-	unsigned short offset;
+	SINGLE_KEYS_UTYPE offset;
 };
 
 /*
@@ -66,7 +68,7 @@ struct db_keys_hash_entry {
  */
 struct db_keys_hash {
 /* The hash table, maps to indices for the list below; -1 means empty bucket */
-	short hash[SINGLE_HASH_SIZE];
+	SINGLE_KEYS_TYPE hash[SINGLE_HASH_SIZE];
 
 /* List of keys with the same hash, allocated as min_keys_per_crypt entries */
 	struct db_keys_hash_entry list[1];
@@ -94,8 +96,8 @@ struct db_keys {
  * guesses for testing against this salt's hashes. */
 	int have_words;
 
-/* Number of last processed rule */
-	int rule;
+/* Number of last processed rule ([0]) and stacked rule ([1]) */
+	int rule[2];
 
 /* Number of recursive calls for this salt */
 	int lock;
@@ -139,8 +141,11 @@ struct db_salt {
 /* Number of passwords with this salt */
 	int count;
 
-/* Sequential id for a given salt. Sequential id does not change even if some
- * salts are removed during cracking */
+/*
+ * Sequential id for a given salt. Sequential id does not change even if some
+ * salts are removed during cracking (except possibly if a FMT_REMOVE format
+ * renumbers the salts while re-iterating them).
+ */
 	int sequential_id;
 
 #ifndef BENCH_BUILD
@@ -192,8 +197,11 @@ struct db_options {
 /* Filters to use while loading */
 	struct list_main *users, *groups, *shells;
 
-/* Requested passwords per salt */
+/* Requested passwords per salt (load salts having at least [M:]N hashes) */
 	int min_pps, max_pps;
+
+/* If this is true, min/max_pps refers to "best counts" (load the [M-]N most used salts) */
+	int best_pps;
 
 #ifndef BENCH_BUILD
 /* Requested cost values */
@@ -204,8 +212,11 @@ struct db_options {
 /* if --show=left is used, john dumps the non-cracked hashes */
 	int showuncracked;
 
+/* if --show=formats is used, show all hashes in JSON form */
+	int showformats;
+
 /* if --show=types is used, john shows all hashes in machine readable form */
-	int showtypes;
+	int showformats_old;
 
 /* if --show=invalid is used, john shows all hashes which fail valid() */
 	int showinvalid;
@@ -304,9 +315,9 @@ extern struct db_main *ldr_init_test_db(struct fmt_main *format,
                                         struct db_main *real);
 
 /*
- * Destroy a fake database.
+ * Destroy a database. If 'base' is true, then also frees the db pointer
  */
-extern void ldr_free_test_db(struct db_main *db);
+extern void ldr_free_db(struct db_main *db, int base);
 
 /*
  * Loads cracked passwords into the database.
@@ -335,5 +346,10 @@ extern int ldr_isa_pot_source(const char *ciphertext);
 
 /* Common code for determining valid when loading a chopped .pot line */
 extern int ldr_trunc_valid(char *ciphertext, struct fmt_main *format);
+
+/*
+ * This function is for ldr_split_line(), and shared for showformats_regular()
+ */
+extern void ldr_set_encoding(struct fmt_main *format);
 
 #endif

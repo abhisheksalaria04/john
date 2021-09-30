@@ -9,8 +9,14 @@
  *
  * This is generic PBKDF2-HMAC-RipeMD160. To use this simple interface,
  * simply include this header file, and then call the pbkdf2_ripemd160()
- * function, filling in all params.  This format is same as the EVP_digest
+ * function, filling in all params.  This format is same as the EVPdigest
  * ripemd160 algorithm within OpenSSL.
+ *
+ * skip_bytes means "skip leading output bytes" and can be given in
+ * multiples of underlying hash size (in this case 20). So to calculate only
+ * byte 21-40 (second chunk) you can say "outlen=20 skip_bytes=20"
+ * for a 2x boost. The 1st byte of output array will then be 1st byte of second
+ * chunk so its actual size can be 20 as opposed to 40.
  */
 
 #ifndef JOHN_PBKDF2_HMAC_RIPEMD160_H
@@ -46,7 +52,7 @@ static void _pbkdf2_ripemd160_load_hmac(const unsigned char *K, int KL, sph_ripe
 		KL = RIPEMD160_DIGEST_LENGTH;
 		K = k0;
 	}
-	for(i = 0; i < KL; i++) {
+	for (i = 0; i < KL; i++) {
 		ipad[i] ^= K[i];
 		opad[i] ^= K[i];
 	}
@@ -58,7 +64,7 @@ static void _pbkdf2_ripemd160_load_hmac(const unsigned char *K, int KL, sph_ripe
 	sph_ripemd160(pOpad, opad, RIPEMD160_CBLOCK);
 }
 
-static void _pbkdf2_ripemd160(const unsigned char *S, int SL, int R, ARCH_WORD_32 *out,
+static void _pbkdf2_ripemd160(const unsigned char *S, int SL, int R, uint32_t *out,
 	                     unsigned char loop, const sph_ripemd160_context *pIpad, const sph_ripemd160_context *pOpad) {
 	sph_ripemd160_context ctx;
 	unsigned char tmp_hash[RIPEMD160_DIGEST_LENGTH];
@@ -77,7 +83,7 @@ static void _pbkdf2_ripemd160(const unsigned char *S, int SL, int R, ARCH_WORD_3
 
 	memcpy(out, tmp_hash, RIPEMD160_DIGEST_LENGTH);
 
-	for(i = 1; i < R; i++) {
+	for (i = 1; i < R; i++) {
 		memcpy(&ctx, pIpad, sizeof(sph_ripemd160_context));
 		sph_ripemd160(&ctx, tmp_hash, RIPEMD160_DIGEST_LENGTH);
 		sph_ripemd160_close(&ctx, tmp_hash);
@@ -85,15 +91,15 @@ static void _pbkdf2_ripemd160(const unsigned char *S, int SL, int R, ARCH_WORD_3
 		memcpy(&ctx, pOpad, sizeof(sph_ripemd160_context));
 		sph_ripemd160(&ctx, tmp_hash, RIPEMD160_DIGEST_LENGTH);
 		sph_ripemd160_close(&ctx, tmp_hash);
-		for(j = 0; j < RIPEMD160_DIGEST_LENGTH/sizeof(ARCH_WORD_32); j++) {
-			out[j] ^= ((ARCH_WORD_32*)tmp_hash)[j];
+		for (j = 0; j < RIPEMD160_DIGEST_LENGTH/sizeof(uint32_t); j++) {
+			out[j] ^= ((uint32_t*)tmp_hash)[j];
 		}
 	}
 }
 static void pbkdf2_ripemd160(const unsigned char *K, int KL, const unsigned char *S, int SL, int R, unsigned char *out, int outlen, int skip_bytes)
 {
 	union {
-		ARCH_WORD_32 x32[RIPEMD160_DIGEST_LENGTH/sizeof(ARCH_WORD_32)];
+		uint32_t x32[RIPEMD160_DIGEST_LENGTH/sizeof(uint32_t)];
 		unsigned char out[RIPEMD160_DIGEST_LENGTH];
 	} tmp;
 	int loop, loops, i, accum=0;
@@ -103,9 +109,11 @@ static void pbkdf2_ripemd160(const unsigned char *K, int KL, const unsigned char
 
 	loops = (skip_bytes + outlen + (RIPEMD160_DIGEST_LENGTH-1)) / RIPEMD160_DIGEST_LENGTH;
 	loop = skip_bytes / RIPEMD160_DIGEST_LENGTH + 1;
+	skip_bytes %= RIPEMD160_DIGEST_LENGTH;
+
 	while (loop <= loops) {
 		_pbkdf2_ripemd160(S,SL,R,tmp.x32,loop,&ipad,&opad);
-		for (i = skip_bytes%RIPEMD160_DIGEST_LENGTH; i < RIPEMD160_DIGEST_LENGTH && accum < outlen; i++) {
+		for (i = skip_bytes; i < RIPEMD160_DIGEST_LENGTH && accum < outlen; i++) {
 			out[accum++] = ((uint8_t*)tmp.out)[i];
 		}
 		loop++;

@@ -11,14 +11,14 @@ john_register_one(&fmt_lotus5);
 
 #include <stdio.h>
 #include <string.h>
-#include "misc.h"
-#include "formats.h"
-#include "common.h"
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
 
-#include "memdbg.h"
+#include "misc.h"
+#include "formats.h"
+#include "common.h"
 
 #ifdef __x86_64__
 #define LOTUS_N 3
@@ -33,16 +33,20 @@ john_register_one(&fmt_lotus5);
 #define FORMAT_NAME                    "Lotus Notes/Domino 5"
 #define ALGORITHM_NAME                 "8/" ARCH_BITS_STR LOTUS_N_STR
 #define BENCHMARK_COMMENT              ""
-#define BENCHMARK_LENGTH               -1
+#define BENCHMARK_LENGTH               0x107
 #define PLAINTEXT_LENGTH               16
 #define CIPHERTEXT_LENGTH              32
 #define BINARY_SIZE                    16
 #define SALT_SIZE                      0
-#define BINARY_ALIGN			sizeof(ARCH_WORD_32)
+#define BINARY_ALIGN			sizeof(uint32_t)
 #define SALT_ALIGN				1
 #define MIN_KEYS_PER_CRYPT             LOTUS_N
 /* Must be divisible by any LOTUS_N (thus, by 2 and 3) */
-#define MAX_KEYS_PER_CRYPT             0x900
+#define MAX_KEYS_PER_CRYPT             (64 * LOTUS_N)
+
+#ifndef OMP_SCALE
+#define OMP_SCALE               16 // MKPC and scale tuned for i7
+#endif
 
 /*A struct used for JTR's benchmarks*/
 static struct fmt_tests tests[] = {
@@ -96,20 +100,12 @@ static const unsigned char lotus_magic_table[] = {
 };
 
 /*Some more JTR variables*/
-static ARCH_WORD_32 (*crypt_key)[BINARY_SIZE / 4];
+static uint32_t (*crypt_key)[BINARY_SIZE / 4];
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	int n = omp_get_max_threads();
-	if (n < 1)
-		n = 1;
-	n *= 2;
-	if (n > self->params.max_keys_per_crypt)
-		n = self->params.max_keys_per_crypt;
-	self->params.min_keys_per_crypt = n;
-#endif
+	omp_autotune(self, OMP_SCALE);
 
 	crypt_key = mem_calloc_align(sizeof(*crypt_key),
 	    self->params.max_keys_per_crypt, MEM_ALIGN_CACHE);
@@ -126,7 +122,7 @@ static void done(void)
 /*Utility function to convert hex to bin */
 static void * get_binary(char *ciphertext)
 {
-  static ARCH_WORD_32 out[BINARY_SIZE/4];
+  static uint32_t out[BINARY_SIZE/4];
   char *realcipher = (char*)out;
   int i;
 
@@ -186,7 +182,7 @@ static int cmp_exact (char *source, int index)
 /*Beginning of private functions*/
 /* Takes the plaintext password and generates the second row of our
  * working matrix for the final call to the mixing function*/
-static void MAYBE_INLINE
+MAYBE_INLINE static void
 #if LOTUS_N == 3
 lotus_transform_password (unsigned char *i0, unsigned char *o0,
     unsigned char *i1, unsigned char *o1,
@@ -349,20 +345,8 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 	return count;
 }
 
-static int get_hash_0(int index) { return crypt_key[index][0] & PH_MASK_0; }
-static int get_hash_1(int index) { return crypt_key[index][0] & PH_MASK_1; }
-static int get_hash_2(int index) { return crypt_key[index][0] & PH_MASK_2; }
-static int get_hash_3(int index) { return crypt_key[index][0] & PH_MASK_3; }
-static int get_hash_4(int index) { return crypt_key[index][0] & PH_MASK_4; }
-static int get_hash_5(int index) { return crypt_key[index][0] & PH_MASK_5; }
-static int get_hash_6(int index) { return crypt_key[index][0] & PH_MASK_6; }
-static int binary_hash_0(void * binary) { return *(ARCH_WORD_32 *)binary & PH_MASK_0; }
-static int binary_hash_1(void * binary) { return *(ARCH_WORD_32 *)binary & PH_MASK_1; }
-static int binary_hash_2(void * binary) { return *(ARCH_WORD_32 *)binary & PH_MASK_2; }
-static int binary_hash_3(void * binary) { return *(ARCH_WORD_32 *)binary & PH_MASK_3; }
-static int binary_hash_4(void * binary) { return *(ARCH_WORD_32 *)binary & PH_MASK_4; }
-static int binary_hash_5(void * binary) { return *(ARCH_WORD_32 *)binary & PH_MASK_5; }
-static int binary_hash_6(void * binary) { return *(ARCH_WORD_32 *)binary & PH_MASK_6; }
+#define COMMON_GET_HASH_VAR crypt_key
+#include "common-get-hash.h"
 
 /* C's version of a class specifier */
 struct fmt_main fmt_lotus5 = {
@@ -396,13 +380,13 @@ struct fmt_main fmt_lotus5 = {
 		{ NULL },
 		fmt_default_source,
 		{
-			binary_hash_0,
-			binary_hash_1,
-			binary_hash_2,
-			binary_hash_3,
-			binary_hash_4,
-			binary_hash_5,
-			binary_hash_6
+			fmt_default_binary_hash_0,
+			fmt_default_binary_hash_1,
+			fmt_default_binary_hash_2,
+			fmt_default_binary_hash_3,
+			fmt_default_binary_hash_4,
+			fmt_default_binary_hash_5,
+			fmt_default_binary_hash_6
 		},
 		fmt_default_salt_hash,
 		NULL,
@@ -412,13 +396,8 @@ struct fmt_main fmt_lotus5 = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,

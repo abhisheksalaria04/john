@@ -1,6 +1,6 @@
 /*
  * This file is part of John the Ripper password cracker,
- * Copyright (c) 1996-99,2003,2004,2006,2009,2013 by Solar Designer
+ * Copyright (c) 1996-99,2003,2004,2006,2009,2013,2017 by Solar Designer
  *
  * Heavily modified by JimF, magnum and maybe by others.
  *
@@ -9,9 +9,6 @@
  *
  * There's ABSOLUTELY NO WARRANTY, express or implied.
  */
-
-#include <stdio.h>
-#include <sys/stat.h>
 
 #if AC_BUILT
 #include "autoconfig.h"
@@ -22,46 +19,39 @@
 #endif
 #endif
 
-#include "os.h"
+#include <stdint.h>
+#include <stdio.h>
+#include <sys/stat.h>
 
 #if (!AC_BUILT || HAVE_UNISTD_H) && !_MSC_VER
 #include <unistd.h>
 #endif
 
+#include "os.h"
+
 #if !AC_BUILT
-# include <string.h>
-# ifndef _MSC_VER
-#  include <strings.h>
-# endif
+ #include <string.h>
+ #ifndef _MSC_VER
+  #include <strings.h>
+ #endif
 #else
-# if STRING_WITH_STRINGS
-#  include <string.h>
-#  include <strings.h>
-# elif HAVE_STRING_H
-#  include <string.h>
-# elif HAVE_STRINGS_H
-#  include <strings.h>
-# endif
-#endif
-
-#if _MSC_VER || __MINGW32__ || __MINGW64__ || __CYGWIN__ || HAVE_WINDOWS_H
-#include "win32_memmap.h"
-#undef MEM_FREE
-#if !defined(__CYGWIN__) && !defined(__MINGW64__)
-#include "mmap-windows.c"
-#endif /* __CYGWIN */
-#endif /* _MSC_VER ... */
-
-#if defined(HAVE_MMAP)
-#include <sys/mman.h>
+ #if STRING_WITH_STRINGS
+  #include <string.h>
+  #include <strings.h>
+ #elif HAVE_STRING_H
+  #include <string.h>
+ #elif HAVE_STRINGS_H
+  #include <strings.h>
+ #endif
 #endif
 
 #include <errno.h>
 
 #include "arch.h"
+#include "mem_map.h"
+#include "memory.h"
 #include "jumbo.h"
 #include "misc.h"
-#include "math.h"
 #include "params.h"
 #include "common.h"
 #include "path.h"
@@ -76,21 +66,11 @@
 #include "external.h"
 #include "cracker.h"
 #include "john.h"
-#include "memory.h"
 #include "unicode.h"
 #include "regex.h"
 #include "mask.h"
 #include "pseudo_intrinsics.h"
-#include "memdbg.h"
-
-#define _STR_VALUE(arg)         #arg
-#define STR_MACRO(n)            _STR_VALUE(n)
-
-#if defined(SIMD_COEF_32)
-#define VSCANSZ                 (SIMD_COEF_32 * 4)
-#else
-#define VSCANSZ                 0
-#endif
+#include "mgetl.h"
 
 static int dist_rules;
 
@@ -109,19 +89,14 @@ static int64_t line_number, loop_line_no;
 static int length;
 static struct rpp_context *rule_ctx;
 
-// used for memory map of file
-static char *mem_map, *map_pos, *map_end, *map_scan_end;
-
 // used for file in 'memory buffer' mode (ready to use array)
 static char *word_file_str, **words;
 static int64_t nWordFileLines;
 
-extern int rpp_real_run; /* set to 1 when we really get into wordlist mode */
-
 static void save_state(FILE *file)
 {
-	fprintf(file, "%d\n" LLd "\n" LLd "\n",
-	        rec_rule, (long long)rec_pos, (long long)rec_line);
+	fprintf(file, "%d\n%" PRId64 "\n%" PRId64 "\n",
+	        rec_rule, (int64_t)rec_pos, (int64_t)rec_line);
 }
 
 static int restore_rule_number(void)
@@ -137,132 +112,14 @@ static int restore_rule_number(void)
 	return 0;
 }
 
-/* Like fgetl() but for the memory-mapped file. */
-static MAYBE_INLINE char *mgetl(char *res)
-{
-	char *pos = res;
-
-#if defined(vcmpeq_epi8_mask) && !defined(_MSC_VER) && \
-	!VLOADU_EMULATED && !VSTOREU_EMULATED
-
-	/* 16/32/64 chars at a time with known remainder. */
-	const vtype vnl = vset1_epi8('\n');
-
-	if (map_pos >= map_end)
-		return NULL;
-
-	while (map_pos < map_scan_end &&
-	       pos < res + LINE_BUFFER_SIZE - (VSCANSZ + 1)) {
-		vtype x = vloadu((vtype const *)map_pos);
-		uint64_t v = vcmpeq_epi8_mask(vnl, x);
-
-		vstoreu((vtype*)pos, x);
-		if (v) {
-#ifdef __GNUC__
-			unsigned int r = __builtin_ctzl(v);
-#else
-			unsigned int r = ffs(v) - 1;
-#endif
-			map_pos += r;
-			pos += r;
-			break;
-		}
-		map_pos += VSCANSZ;
-		pos += VSCANSZ;
-	}
-
-	if (*map_pos != '\n')
-	while (map_pos < map_end && pos < res + LINE_BUFFER_SIZE - 1 &&
-	       *map_pos != '\n')
-		*pos++ = *map_pos++;
-
-	map_pos++;
-
-#elif ARCH_SIZE >= 8 && ARCH_ALLOWS_UNALIGNED /* Eight chars at a time */
-
-	unsigned long long *ss = (unsigned long long*)map_pos;
-	unsigned long long *dd = (unsigned long long*)pos;
-	unsigned int *s = (unsigned int*)map_pos;
-	unsigned int *d = (unsigned int*)pos;
-
-	if (map_pos >= map_end)
-		return NULL;
-
-	while ((char*)ss < map_scan_end &&
-	       (char*)dd < res + LINE_BUFFER_SIZE - 9 &&
-	       !((((*ss ^ 0x0a0a0a0a0a0a0a0a) - 0x0101010101010101) &
-	          ~(*ss ^ 0x0a0a0a0a0a0a0a0a)) & 0x8080808080808080))
-		*dd++ = *ss++;
-
-	s = (unsigned int*)ss;
-	d = (unsigned int*)dd;
-	if ((char*)s < map_scan_end &&
-	    (char*)d < res + LINE_BUFFER_SIZE - 5 &&
-	    !((((*s ^ 0x0a0a0a0a) - 0x01010101) &
-	       ~(*s ^ 0x0a0a0a0a)) & 0x80808080))
-		*d++ = *s++;
-
-	map_pos = (char*)s;
-	pos = (char*)d;
-
-	while (map_pos < map_end && pos < res + LINE_BUFFER_SIZE - 1 &&
-	       *map_pos != '\n')
-		*pos++ = *map_pos++;
-	map_pos++;
-
-#elif ARCH_ALLOWS_UNALIGNED /* Four chars at a time */
-
-	unsigned int *s = (unsigned int*)map_pos;
-	unsigned int *d = (unsigned int*)pos;
-
-	if (map_pos >= map_end)
-		return NULL;
-
-	while ((char*)s < map_scan_end &&
-	       (char*)d < res + LINE_BUFFER_SIZE - 5 &&
-	       !((((*s ^ 0x0a0a0a0a) - 0x01010101) &
-	          ~(*s ^ 0x0a0a0a0a)) & 0x80808080))
-		*d++ = *s++;
-
-	map_pos = (char*)s;
-	pos = (char*)d;
-	while (map_pos < map_end && pos < res + LINE_BUFFER_SIZE - 1 &&
-	       *map_pos != '\n')
-		*pos++ = *map_pos++;
-	map_pos++;
-
-#else /* One char at a time */
-
-	if (map_pos >= map_end)
-		return NULL;
-
-	while (map_pos < map_end && pos < res + LINE_BUFFER_SIZE - 1 &&
-	       *map_pos != '\n')
-		*pos++ = *map_pos++;
-	map_pos++;
-
-#endif
-
-	/* Replace LF with NULL */
-	*pos = 0;
-
-	/* Handle CRLF too */
-	if (pos > res)
-	if (*--pos == '\r')
-		*pos = 0;
-
-	return res;
-}
-
-static MAYBE_INLINE int skip_lines(unsigned long n, char *line)
+static MAYBE_INLINE int skip_lines(int64_t n, char *line)
 {
 	if (n) {
 		line_number += n;
 
 		if (!nWordFileLines)
 		do {
-			if (mem_map ? !mgetl(line) :
-			    !fgetl(line, LINE_BUFFER_SIZE, word_file))
+			if (!GET_LINE(line, word_file))
 				return 1;
 		} while (--n);
 	}
@@ -272,8 +129,17 @@ static MAYBE_INLINE int skip_lines(unsigned long n, char *line)
 
 static void restore_line_number(void)
 {
-	char line[LINE_BUFFER_SIZE];
-	if (skip_lines((unsigned long)rec_pos, line)) {
+	union {
+		char buffer[LINE_BUFFER_SIZE];
+#if MGETL_HAS_SIMD
+		vtype dummy;
+#else
+		ARCH_WORD dummy;
+#endif
+	} aligned;
+	char *line = aligned.buffer;
+
+	if (skip_lines(rec_pos, line)) {
 		if (ferror(word_file))
 			pexit("fgets");
 		fprintf(stderr, "fgets: Unexpected EOF\n");
@@ -283,15 +149,15 @@ static void restore_line_number(void)
 
 static int restore_state(FILE *file)
 {
-	long long rule, line, pos;
+	int64_t rule, line, pos;
 
-	if (fscanf(file, LLd"\n"LLd"\n", &rule, &pos) != 2)
+	if (fscanf(file, "%"PRId64"\n%"PRId64"\n", &rule, &pos) != 2)
 		return 1;
 	rec_rule = rule;
 	rec_pos = pos;
 	rec_line = 0;
 	if (rec_version >= 4) {
-		if (fscanf(file, LLd"\n", &line) != 1)
+		if (fscanf(file, "%"PRId64"\n", &line) != 1)
 			return 1;
 		rec_line = line;
 	}
@@ -306,7 +172,16 @@ static int restore_state(FILE *file)
 	} else
 	if (!nWordFileLines) {
 		if (mem_map) {
-			char line[LINE_BUFFER_SIZE];
+			union {
+				char buffer[LINE_BUFFER_SIZE];
+#if MGETL_HAS_SIMD
+				vtype dummy;
+#else
+				ARCH_WORD dummy;
+#endif
+			} aligned;
+			char *line = aligned.buffer;
+
 			skip_lines(rec_line, line);
 			rec_pos = 0;
 		} else if (rec_line && !rec_pos) {
@@ -329,8 +204,6 @@ static int restore_state(FILE *file)
 	return 0;
 }
 
-static int fix_state_delay;
-
 static void fix_state(void)
 {
 	if (hybrid_rec_rule || hybrid_rec_line || hybrid_rec_pos) {
@@ -344,10 +217,6 @@ static void fix_state(void)
 
 	if (options.flags & FLG_REGEX_CHK)
 		return;
-
-	if (++fix_state_delay < options.max_fix_state_delay)
-		return;
-	fix_state_delay=0;
 
 	rec_rule = rule_number;
 	rec_line = line_number;
@@ -387,8 +256,10 @@ void wordlist_hybrid_fix_state(void)
 
 static double get_progress(void)
 {
-	int64_t pos, size;
-	unsigned long long mask_mult = mask_tot_cand ? mask_tot_cand : 1;
+	struct stat file_stat;
+	int64_t pos;
+	uint64_t size;
+	uint64_t mask_mult = mask_tot_cand ? mask_tot_cand : 1;
 
 	emms();
 
@@ -405,13 +276,13 @@ static double get_progress(void)
 		pos = map_pos - mem_map;
 		size = map_end - mem_map;
 	} else {
+		if (fstat(fileno(word_file), &file_stat))
+			pexit("fstat");
 		pos = jtr_ftell64(word_file);
 		jtr_fseek64(word_file, 0, SEEK_END);
 		size = jtr_ftell64(word_file);
 		jtr_fseek64(word_file, pos, SEEK_SET);
-#if 0
-		fprintf (stderr, "pos="LLd"  size="LLd"  percent=%0.4f\n", (long long)pos, (long long)size, (100.0 * ((rule_number * (double)size) + pos) /(rule_count * (double)size)));
-#endif
+
 		if (pos < 0) {
 #ifdef __DJGPP__
 			if (pos != -1)
@@ -421,10 +292,7 @@ static double get_progress(void)
 				pexit(STR_MACRO(jtr_ftell64));
 		}
 	}
-#if 0
-	fprintf(stderr, "rule %d/%d mask "LLu" pos "LLu"/"LLu"\n",
-	        rule_number, rule_count, mask_mult, pos, size);
-#endif
+
 	return (100.0 * ((rule_number * size * mask_mult) + pos * mask_mult) /
 	        (rule_count * size * mask_mult));
 }
@@ -434,15 +302,30 @@ static char *dummy_rules_apply(char *word, char *rule, int split, char *last)
 	return word;
 }
 
-static MAYBE_INLINE void clean_bom(char *line)
+/*
+ * There should be legislation against adding a BOM to UTF-8, not to
+ * mention calling UTF-16 a "text file".
+ */
+static MAYBE_INLINE void check_bom(char *line)
 {
-	static int checkbomfirst = 1;
+	if (((unsigned char*)line)[0] < 0xef)
+		return;
 
-	if (line_number == 0 && checkbomfirst && options.input_enc == UTF_8) {
-		if (!strncmp("\xEF\xBB\xBF", line, 3)) {
+	if (!memcmp(line, "\xEF\xBB\xBF", 3)) {
+		static int warned;
+
+		if (options.input_enc == UTF_8)
 			memmove(line, line + 3, strlen(line) - 2);
-		}
-		checkbomfirst = 0;
+		else if (!warned++)
+			fprintf(stderr, "Warning: UTF-8 BOM seen in wordlist. You probably want --input-encoding=UTF8\n");
+	}
+
+	if (options.input_enc == UTF_8  && (!memcmp(line, "\xFE\xFF", 2) || !memcmp(line, "\xFF\xFE", 2))) {
+		static int warned;
+
+		if (!warned++)
+			fprintf(stderr,
+			        "Warning: UTF-16 BOM seen in wordlist. File may not be read properly unless you re-encode it\n");
 	}
 }
 
@@ -505,9 +388,10 @@ static MAYBE_INLINE unsigned int line_hash(char *line)
 		goto out;
 
 	while (*p) {
-		hash <<= 3; extra <<= 2;
+		hash <<= 5;
 		hash += (unsigned char)p[0];
 		if (!p[1]) break;
+		extra *= hash | 1812433253;
 		extra += (unsigned char)p[1];
 		p += 2;
 		if (hash & 0xe0000000) {
@@ -566,11 +450,15 @@ static MAYBE_INLINE int wbuf_unique(char *line)
 	return 1;
 }
 
-void do_wordlist_crack(struct db_main *db, char *name, int rules)
+void do_wordlist_crack(struct db_main *db, const char *name, int rules)
 {
 	union {
 		char buffer[2][LINE_BUFFER_SIZE + CACHE_BANK_SHIFT];
+#if MGETL_HAS_SIMD
+		vtype dummy;
+#else
 		ARCH_WORD dummy;
+#endif
 	} aligned;
 	char *line = aligned.buffer[0];
 	char *last = aligned.buffer[1];
@@ -578,49 +466,44 @@ void do_wordlist_crack(struct db_main *db, char *name, int rules)
 	char *prerule="", *rule="", *word="";
 	char *(*apply)(char *word, char *rule, int split, char *last) = NULL;
 	int dist_switch=0;
-	unsigned long my_words=0, their_words=0, my_words_left=0;
-	int64_t file_len = 0;
-	int i, pipe_input = 0, max_pipe_words = 0, rules_keep = 0;
+	uint64_t my_words=0, their_words=0, my_words_left=0;
+	int64_t i, file_len = 0;
+	int pipe_input = 0, max_pipe_words = 0, rules_keep = 0;
 	int init_once = 1;
 #if HAVE_WINDOWS_H
 	IPC_Item *pIPC=NULL;
 #endif
 	char msg_buf[128];
-	int forceLoad = 0;
+	int forceLoad = 0, default_wordlist = 0;
 	int dupeCheck = (options.flags & FLG_DUPESUPP) ? 1 : 0;
 	int loopBack = (options.flags & FLG_LOOPBACK_CHK) ? 1 : 0;
 	int do_lmloop = loopBack && db->plaintexts->head;
-	long my_size = 0;
-	unsigned int myWordFileLines = 0;
-	int maxlength = options.force_maxlength;
-	int minlength = (options.req_minlength >= 0) ?
-		options.req_minlength : 0;
-	int rules_length;
+	uint64_t my_size = 0;
+	uint64_t myWordFileLines = 0;
+	int skip_length = options.force_maxlength;
+	int min_length = options.eff_minlength;
 #if HAVE_REXGEN
 	char *regex_alpha = 0;
 	int regex_case = 0;
 	char *regex = 0;
 #endif
 
-	log_event("Proceeding with %s mode",
-	          loopBack ? "loopback" : "wordlist");
+	if (john_main_process)
+		log_event("Proceeding with %s mode",
+		          loopBack ? "loopback" : "wordlist");
 
-	if (options.activewordlistrules)
+	if (options.activewordlistrules && john_main_process) {
+		if (loopBack)
+			fprintf(stderr, "Permutation rules: %s\n",
+			        options.activewordlistrules);
 		log_event("- Rules: %.100s", options.activewordlistrules);
+	}
 
 #if HAVE_REXGEN
 	regex = prepare_regex(options.regex, &regex_case, &regex_alpha);
 #endif
 
-	length = db->format->params.plaintext_length - mask_add_len;
-	if (mask_num_qw > 1)
-		length /= mask_num_qw;
-
-	/* rules.c honors -min/max-len options on its own */
-	rules_length = length;
-
-	if (maxlength && maxlength < length)
-		length = maxlength;
+	length = options.eff_maxlength;
 
 	/* If we did not give a name for loopback mode,
 	   we use the active pot file */
@@ -630,35 +513,59 @@ void do_wordlist_crack(struct db_main *db, char *name, int rules)
 	/* These will ignore --save-memory */
 	if (loopBack || dupeCheck ||
 	    (!options.max_wordfile_memory &&
-	     (options.flags & FLG_RULES)))
+	     (options.flags & FLG_RULES_CHK)))
 		forceLoad = 1;
 
 	/* If we did not give a name for wordlist mode,
 	   we use the "batch mode" one from john.conf */
-	if (!name && !(options.flags & (FLG_STDIN_CHK | FLG_PIPE_CHK)))
-	if (!(name = cfg_get_param(SECTION_OPTIONS, NULL, "Wordlist")))
-	if (!(name = cfg_get_param(SECTION_OPTIONS, NULL, "Wordfile")))
-		name = options.wordlist = WORDLIST_NAME;
+	if (!name && !(options.flags & (FLG_STDIN_CHK | FLG_PIPE_CHK))) {
+		/* Print what file --wordlist mode uses when it runs using the
+		   pre-configured wordlist (optional parameter not informed) */
+		default_wordlist = 1;
+		if (!(name = cfg_get_param(SECTION_OPTIONS, NULL, "Wordlist")))
+		if (!(name = cfg_get_param(SECTION_OPTIONS, NULL, "Wordfile")))
+			name = options.wordlist = WORDLIST_NAME;
+	}
 
-	if (rec_restored && john_main_process)
-		fprintf(stderr,
-		        "Proceeding with wordlist:%s and rules:%s\n",
-		        loopBack ? "loopback" : path_expand(name),
-		        options.activewordlistrules ?
-		        options.activewordlistrules : "none");
-
-	if (options.flags & FLG_STACKED)
-		options.max_fix_state_delay = 0;
+	if (((options.flags & FLG_BATCH_CHK) || rec_restored || default_wordlist) && john_main_process) {
+		fprintf(stderr, "Proceeding with wordlist:%s",
+		        loopBack ? "loopback" :
+		        name ? path_expand(name) : "stdin");
+		if (options.flags & FLG_RULES_CHK) {
+			if (options.rule_stack)
+				fprintf(stderr, ", rules:(%s x %s)",
+				        options.activewordlistrules, options.rule_stack);
+			else
+				fprintf(stderr, ", rules:%s", options.activewordlistrules);
+		} else if (options.rule_stack)
+			fprintf(stderr, ", rules-stack:%s", options.rule_stack);
+		if (options.flags & FLG_MASK_CHK)
+			fprintf(stderr, ", hybrid mask:%s", options.mask ?
+			        options.mask : options.eff_mask);
+		if (options.req_minlength >= 0 || options.req_maxlength)
+			fprintf(stderr, ", lengths: %d-%d",
+			        options.eff_minlength + mask_add_len,
+			        options.eff_maxlength + mask_add_len);
+		fprintf(stderr, "\n");
+	}
 
 	if (name) {
 		char *cp, csearch;
 		int64_t ourshare = 0;
+#ifdef HAVE_MMAP
+		int mmap_max =
+			cfg_get_int(SECTION_OPTIONS, NULL,
+			            "WordlistMemoryMapMaxSize");
 
+		if (mmap_max == -1)
+			mmap_max = 1 << 20;
+#endif
 		if (!(word_file = jtr_fopen(path_expand(name), "rb")))
 			pexit(STR_MACRO(jtr_fopen)": %s", path_expand(name));
-		log_event("- %s file: %.100s",
-		          loopBack ? "Loopback pot" : "Wordlist",
-		          path_expand(name));
+		if (john_main_process)
+			log_event("- %s file: %.100s",
+			          loopBack ? "Loopback pot" : "Wordlist",
+			          path_expand(name));
 
 		jtr_fseek64(word_file, 0, SEEK_END);
 		if ((file_len = jtr_ftell64(word_file)) == -1)
@@ -672,10 +579,10 @@ void do_wordlist_crack(struct db_main *db, char *name, int rules)
 		}
 
 #ifdef HAVE_MMAP
-		if (cfg_get_bool(SECTION_OPTIONS, NULL, "WordlistMemoryMap", 1))
-		{
-			log_event("- memory mapping wordlist ("LLd" bytes)",
-			          (long long)file_len);
+		if (mmap_max && mmap_max >= (file_len >> 20)) {
+			if (john_main_process)
+				log_event("- memory mapping wordlist (%"PRId64" bytes)",
+				          (int64_t)file_len);
 #if (SIZEOF_SIZE_T < 8)
 /*
  * Now even though we are 64 bit file size, we must still deal with some
@@ -710,7 +617,7 @@ void do_wordlist_crack(struct db_main *db, char *name, int rules)
 
 		if (ourshare < options.max_wordfile_memory &&
 		    mem_saving_level < 2 &&
-		    (options.flags & FLG_RULES))
+		    (options.flags & FLG_RULES_CHK))
 			forceLoad = 1;
 
 		/* If it's worth it we make a ready-to-use buffer with the
@@ -733,6 +640,7 @@ void do_wordlist_crack(struct db_main *db, char *name, int rules)
 
 					if (!mgetl(line))
 						break;
+					check_bom(line);
 					if (!strncmp(line, "#!comment", 9))
 						continue;
 					lp = convert(line);
@@ -759,6 +667,7 @@ void do_wordlist_crack(struct db_main *db, char *name, int rules)
 
 					if (!mgetl(line))
 						break;
+					check_bom(line);
 					if (!strncmp(line, "#!comment", 9))
 						continue;
 					lp = convert(line);
@@ -778,18 +687,18 @@ void do_wordlist_crack(struct db_main *db, char *name, int rules)
 					}
 				}
 				if (nWordFileLines != myWordFileLines)
-				fprintf(stderr, "Warning: wordlist changed as"
-				        " we read it\n");
+					fprintf(stderr, "Warning: wordlist changed as"
+					        " we read it\n");
 				log_event("- loaded this node's share of "
 				          "wordfile %s into memory "
-				          "(%lu bytes of "LLd", max_size="Zu
+				          "(%"PRIu64" bytes of %"PRId64", max_size="Zu
 				          " avg/node)", name, my_size,
-				          (long long)file_len,
+				          (int64_t)file_len,
 				          options.max_wordfile_memory);
 				if (john_main_process)
 				fprintf(stderr,"Each node loaded 1/%d "
 				        "of wordfile to memory (about "
-				        "%lu %s/node)\n",
+				        "%"PRIu64" %s/node)\n",
 				        options.node_count,
 				        my_size > 1<<23 ?
 				        my_size >> 20 : my_size >> 10,
@@ -797,13 +706,15 @@ void do_wordlist_crack(struct db_main *db, char *name, int rules)
 				file_len = my_size;
 			}
 			else {
-				log_event("- loading wordfile %s into memory "
-				          "("LLd" bytes, max_size="Zu")",
-				          name, (long long)file_len,
-				          options.max_wordfile_memory);
-				if (options.node_count > 1 && john_main_process)
-				fprintf(stderr,"Each node loaded the whole "
-				        "wordfile to memory\n");
+				if (john_main_process) {
+					log_event("- loading wordfile %s into memory "
+					          "(%"PRId64" bytes, max_size="Zu")",
+					          name, (int64_t)file_len,
+					          options.max_wordfile_memory);
+					if (options.node_count > 1)
+						fprintf(stderr,"Each node loaded the whole "
+						        "wordfile to memory\n");
+				}
 				word_file_str =
 					mem_alloc_tiny((size_t)file_len +
 					               LINE_BUFFER_SIZE + 1,
@@ -817,10 +728,10 @@ void do_wordlist_crack(struct db_main *db, char *name, int rules)
 					error();
 				}
 				if (memchr(word_file_str, 0, (size_t)file_len)) {
-					fprintf(stderr,
-					        "Error: wordlist contains NULL"
-					        " bytes - aborting\n");
-					error();
+					static int warned;
+
+					if (!warned++)
+						fprintf(stderr, "Warning: Wordlist contains NUL bytes, lines may be truncated.\n");
 				}
 			}
 			aep = word_file_str + file_len;
@@ -838,10 +749,10 @@ void do_wordlist_crack(struct db_main *db, char *name, int rules)
 			if (aep[-1] != csearch)
 				++nWordFileLines;
 			words = mem_alloc((nWordFileLines + 1) * sizeof(char*));
-			log_event("- wordfile had "LLd" lines and required "LLd
+			log_event("- wordfile had %"PRId64" lines and required %"PRId64
 			          " bytes for index.",
-			          (long long)nWordFileLines,
-			          (long long)(nWordFileLines * sizeof(char*)));
+			          (int64_t)nWordFileLines,
+			          (int64_t)(nWordFileLines * sizeof(char*)));
 
 			i = 0;
 			cp = word_file_str;
@@ -857,10 +768,10 @@ void do_wordlist_crack(struct db_main *db, char *name, int rules)
 				hash_size = (1 << hash_log);
 				hash_mask = (hash_size - 1);
 				log_event("- dupe suppression: hash size %u, "
-					"temporarily allocating "LLd" bytes",
+					"temporarily allocating %"PRId64" bytes",
 					hash_size,
 					(hash_size * sizeof(unsigned int)) +
-					((long long)nWordFileLines *
+					((int64_t)nWordFileLines *
 					 sizeof(element_st)));
 				buffer.hash = mem_alloc(hash_size *
 				                        sizeof(unsigned int));
@@ -884,8 +795,10 @@ void do_wordlist_crack(struct db_main *db, char *name, int rules)
 					i--;
 					break;
 				}
-				if (!myWordFileLines)
+				if (!myWordFileLines) {
+					check_bom(cp);
 					cp = convert(cp);
+				}
 				ep = cp;
 				while ((ep < aep) && *ep && *ep != '\n' && *ep != '\r')
 					ep++;
@@ -893,11 +806,13 @@ void do_wordlist_crack(struct db_main *db, char *name, int rules)
 				*ep = 0;
 				if (strncmp(cp, "#!comment", 9)) {
 					if (!rules) {
-						if (minlength && ep - cp < minlength)
+						if (min_length && ep - cp < min_length)
 							goto skip;
-						/* Over --max-length are skipped,
-						   while over format's length are truncated. */
-						if (maxlength && ep - cp > maxlength)
+						/*
+						 * Over --max-length are always skipped, while over
+						 * format's length are truncated if FMT_TRUNC.
+						 */
+						if (skip_length && ep - cp > skip_length)
 							goto skip;
 						if (ep - cp >= length)
 							cp[length] = 0;
@@ -921,10 +836,10 @@ skip:
 				if (ec == '\r' && *cp == '\n') cp++;
 				if (ec == '\n' && *cp == '\r') cp++;
 			} while (cp < aep);
-			if ((long long)nWordFileLines - i > 0)
-				log_event("- suppressed "LLd" duplicate lines "
+			if ((int64_t)nWordFileLines - i > 0)
+				log_event("- suppressed %"PRId64" duplicate lines "
 				          "and/or comments from wordlist.",
-				          (long long)nWordFileLines - i);
+				          (int64_t)nWordFileLines - i);
 			MEM_FREE(buffer.hash);
 			MEM_FREE(buffer.data);
 			nWordFileLines = i;
@@ -981,7 +896,7 @@ GRAB_NEXT_PIPE_LOAD:
 			{
 				char *cpi, *cpe;
 
-				if (options.verbosity == VERB_MAX)
+				if (options.verbosity >= VERB_DEBUG)
 				log_event("- Reading next block of candidate passwords from stdin pipe");
 
 				rules = rules_keep;
@@ -993,19 +908,22 @@ GRAB_NEXT_PIPE_LOAD:
 						pipe_input = 0;
 						break;
 					}
+					check_bom(cpi);
 					cpi = convert(cpi);
 					if (strncmp(cpi, "#!comment", 9)) {
 						int len = strlen(cpi);
 						if (!rules) {
-							if (minlength && len < minlength) {
+							if (min_length && len < min_length) {
 								cpi += (len + 1);
 								if (cpi > cpe)
 									break;
 								continue;
 							}
-							/* Over --max-length are skipped,
-							   while over format's length are truncated. */
-							if (maxlength && len > maxlength) {
+							/*
+							 * Over --max-length are always skipped, while over
+							 * format's length are truncated if FMT_TRUNC.
+							 */
+							if (skip_length && len > skip_length) {
 								cpi += (len + 1);
 								if (cpi > cpe)
 									break;
@@ -1026,10 +944,10 @@ GRAB_NEXT_PIPE_LOAD:
 						}
 					}
 				}
-				if (options.verbosity == VERB_MAX) {
-					sprintf(msg_buf, "- Read block of "LLd" "
+				if (options.verbosity >= VERB_DEBUG) {
+					sprintf(msg_buf, "- Read block of %"PRId64" "
 					        "candidate passwords from pipe",
-					        (long long)nWordFileLines);
+					        (int64_t)nWordFileLines);
 					log_event("%s", msg_buf);
 				}
 			}
@@ -1038,7 +956,7 @@ GRAB_NEXT_PIPE_LOAD:
 MEM_MAP_LOAD:
 			rules = rules_keep;
 			nWordFileLines = 0;
-			if (options.verbosity == VERB_MAX)
+			if (options.verbosity == VERB_DEBUG)
 				log_event("- Reading next block of candidate from the memory mapped file");
 			release_sharedmem_object(pIPC);
 			pIPC = next_sharedmem_object();
@@ -1065,27 +983,35 @@ REDO_AFTER_LMLOOP:
 
 	if (rules) {
 		if (rpp_init(rule_ctx = &ctx, options.activewordlistrules)) {
-			log_event("! No \"%s\" mode rules found",
-			          options.activewordlistrules);
-			if (john_main_process)
-				fprintf(stderr,
-				        "No \"%s\" mode rules found in %s\n",
+			if (john_main_process) {
+				log_event("! No \"%s\" mode rules found",
+				          options.activewordlistrules);
+				fprintf(stderr, "No \"%s\" mode rules found in %s\n",
 				        options.activewordlistrules, cfg_name);
+			}
 			error();
 		}
 
-		rules_init(rules_length);
+		rules_init(db, length);
 		rule_count = rules_count(&ctx, -1);
 
-		if (do_lmloop || !db->plaintexts->head)
-		log_event("- %d preprocessed word mangling rules", rule_count);
+		if (do_lmloop || !db->plaintexts->head) {
+			if (rules_stacked_after)
+				log_event("- Total %u (%d x %u) preprocessed word mangling rules",
+				          rule_count * crk_stacked_rule_count,
+				          rule_count, crk_stacked_rule_count);
+			else
+				log_event("- %d preprocessed word mangling rules", rule_count);
+		}
+
 
 		apply = rules_apply;
 	} else {
 		rule_ctx = NULL;
 		rule_count = 1;
 
-		log_event("- No word mangling rules");
+		if (john_main_process)
+			log_event("- No word mangling rules");
 
 		apply = dummy_rules_apply;
 	}
@@ -1138,7 +1064,8 @@ REDO_AFTER_LMLOOP:
 			their_words = options.node_count - my_words;
 			now = "words";
 		}
-		log_event("- Will distribute %s across nodes%s", now, later);
+		if (john_main_process)
+			log_event("- Will distribute %s across nodes%s", now, later);
 	}
 
 	my_words_left = my_words;
@@ -1170,7 +1097,7 @@ REDO_AFTER_LMLOOP:
 		struct list_entry *joined;
 
 		if (rules) {
-			if (dist_rules) {
+			if (dist_rules && strncmp(prerule, "!!", 2)) {
 				int for_node =
 				    rule_number % options.node_count + 1;
 				if (for_node < options.node_min ||
@@ -1179,20 +1106,20 @@ REDO_AFTER_LMLOOP:
 			}
 			if ((rule = rules_reject(prerule, -1, last, db))) {
 				if (strcmp(prerule, rule)) {
-					if (options.verbosity >= VERB_LEGACY)
+					if (!rules_mute)
 					log_event("- Rule #%d: '%.100s'"
 						" accepted as '%.100s'",
 						rule_number + 1, prerule, rule);
 				} else {
-					if (options.verbosity >= VERB_LEGACY)
+					if (!rules_mute)
 					log_event("- Rule #%d: '%.100s'"
 						" accepted",
 						rule_number + 1, prerule);
 				}
 			} else {
-				if (options.verbosity >= VERB_LEGACY)
-				log_event("- Rule #%d: '%.100s' rejected",
-					rule_number + 1, prerule);
+				if (!rules_mute && strncmp(prerule, "!!", 2))
+					log_event("- Rule #%d: '%.100s' rejected",
+					          rule_number + 1, prerule);
 				goto next_rule;
 			}
 		}
@@ -1241,7 +1168,7 @@ REDO_AFTER_LMLOOP:
 					}
 					wordlist_hybrid_fix_state();
 				} else
-				if (options.mask) {
+				if (options.flags & FLG_MASK_CHK) {
 					if (do_mask_crack(word)) {
 						rule = NULL;
 						rules = 0;
@@ -1279,8 +1206,6 @@ REDO_AFTER_LMLOOP:
 #else
 			strcpy(line, words[line_number]);
 #endif
-			clean_bom(line);
-
 			line_number++;
 
 			if ((word = apply(line, rule, -1, last))) {
@@ -1310,7 +1235,7 @@ REDO_AFTER_LMLOOP:
 					}
 					wordlist_hybrid_fix_state();
 				} else
-				if (options.mask) {
+				if (options.flags & FLG_MASK_CHK) {
 					if (do_mask_crack(word)) {
 						rule = NULL;
 						rules = 0;
@@ -1328,12 +1253,10 @@ REDO_AFTER_LMLOOP:
 		}
 
 		else if (rule)
-		while (mem_map ? mgetl(line) :
-		       fgetl(line, LINE_BUFFER_SIZE, word_file)) {
-
-			clean_bom(line);
+		while (GET_LINE(line, word_file)) {
 
 			line_number++;
+			check_bom(line);
 
 			if (line[0] != '#') {
 process_word:
@@ -1344,12 +1267,15 @@ process_word:
 					memmove(line, conv, len + 1);
 				}
 				if (!rules) {
-					if (minlength || maxlength) {
+					if (min_length || skip_length) {
 						int len = strlen(line);
-						if (minlength && len < minlength)
+						if (min_length && len < min_length)
 							goto next_word;
-						/* --max-length skips */
-						if (maxlength && len > maxlength)
+						/*
+						 * Over --max-length are always skipped, while over
+						 * format's length are truncated if FMT_TRUNC.
+						 */
+						if (skip_length && len > skip_length)
 							goto next_word;
 					}
 					line[length] = 0;
@@ -1387,7 +1313,7 @@ process_word:
 						}
 						wordlist_hybrid_fix_state();
 					} else
-					if (options.mask) {
+					if (options.flags & FLG_MASK_CHK) {
 						if (do_mask_crack(word)) {
 							rule = NULL;
 							rules = 0;

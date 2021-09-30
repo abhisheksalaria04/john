@@ -17,6 +17,10 @@ john_register_one(&fmt_rawSHA3);
 
 #include <string.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "arch.h"
 #include "params.h"
 #include "common.h"
@@ -24,20 +28,12 @@ john_register_one(&fmt_rawSHA3);
 #include "options.h"
 #include "KeccakHash.h"
 
-#ifdef _OPENMP
-#ifndef OMP_SCALE
-#define OMP_SCALE			2048
-#endif
-#include <omp.h>
-#endif
-#include "memdbg.h"
-
 #define FORMAT_LABEL			"Raw-SHA3"
 #define FORMAT_NAME			""
 #define ALGORITHM_NAME			"32/" ARCH_BITS_STR
 
 #define BENCHMARK_COMMENT		""
-#define BENCHMARK_LENGTH		-1
+#define BENCHMARK_LENGTH		0x107
 
 #define PLAINTEXT_LENGTH		125
 #define CIPHERTEXT_LENGTH		128
@@ -49,7 +45,11 @@ john_register_one(&fmt_rawSHA3);
 #define SALT_ALIGN			1
 
 #define MIN_KEYS_PER_CRYPT		1
-#define MAX_KEYS_PER_CRYPT		1
+#define MAX_KEYS_PER_CRYPT		512
+
+#ifndef OMP_SCALE
+#define OMP_SCALE			32 // Tuned w/ MKPC for core i7
+#endif
 
 static struct fmt_tests tests[] = {
 	{"a69f73cca23a9ac5c8b567dc185a756e97c982164fe25859e0d1dcc1475c80a615b2123af1f5f94c11e3e9402c3ac558f500199d95b6d3e301758586281dcd26", ""},
@@ -62,19 +62,13 @@ static int (*saved_len);
 // the Keccak function can read up to next even 8 byte offset.
 // making the buffer larger avoid reading past end of buffer
 static char (*saved_key)[(((PLAINTEXT_LENGTH+1)+7)/8)*8];
-static ARCH_WORD_32 (*crypt_out)
-    [(BINARY_SIZE + sizeof(ARCH_WORD_32) - 1) / sizeof(ARCH_WORD_32)];
+static uint32_t (*crypt_out)
+    [(BINARY_SIZE + sizeof(uint32_t) - 1) / sizeof(uint32_t)];
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	int omp_t;
+	omp_autotune(self, OMP_SCALE);
 
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
 	saved_len = mem_calloc(self->params.max_keys_per_crypt, sizeof(*saved_len));
 	saved_key = mem_calloc(self->params.max_keys_per_crypt, sizeof(*saved_key));
 	crypt_out = mem_calloc(self->params.max_keys_per_crypt, sizeof(*crypt_out));
@@ -109,8 +103,7 @@ static char *split(char *ciphertext, int index, struct fmt_main *pFmt)
 		ciphertext += 8;
 
 	memcpy(out, "$keccak$", 8);
-	memcpy(out + 8, ciphertext, CIPHERTEXT_LENGTH + 1);
-	strlwr(out + 8);
+	memcpylwr(out + 8, ciphertext, CIPHERTEXT_LENGTH + 1);
 	return out;
 }
 
@@ -131,49 +124,12 @@ static void *get_binary(char *ciphertext)
 	return out;
 }
 
-static int get_hash_0(int index)
-{
-	return crypt_out[index][0] & PH_MASK_0;
-}
-
-static int get_hash_1(int index)
-{
-	return crypt_out[index][0] & PH_MASK_1;
-}
-
-static int get_hash_2(int index)
-{
-	return crypt_out[index][0] & PH_MASK_2;
-}
-
-static int get_hash_3(int index)
-{
-	return crypt_out[index][0] & PH_MASK_3;
-}
-
-static int get_hash_4(int index)
-{
-	return crypt_out[index][0] & PH_MASK_4;
-}
-
-static int get_hash_5(int index)
-{
-	return crypt_out[index][0] & PH_MASK_5;
-}
-
-static int get_hash_6(int index)
-{
-	return crypt_out[index][0] & PH_MASK_6;
-}
+#define COMMON_GET_HASH_VAR crypt_out
+#include "common-get-hash.h"
 
 static void set_key(char *key, int index)
 {
-	int len = strlen(key);
-	saved_len[index] = len;
-	if (len > PLAINTEXT_LENGTH)
-		len = saved_len[index] = PLAINTEXT_LENGTH;
-	saved_key[index][len] = 0;
-	memcpy(saved_key[index], key, len);
+	saved_len[index] = strnzcpyn(saved_key[index], key, sizeof(*saved_key));
 }
 
 static char *get_key(int index)
@@ -185,24 +141,26 @@ static char *get_key(int index)
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
 	const int count = *pcount;
-	int index = 0;
+	int index;
+
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-	for (index = 0; index < count; index++)
-	{
+	for (index = 0; index < count; index++) {
 		Keccak_HashInstance hash;
 		Keccak_HashInitialize(&hash, 576, 1024, 512, 0x06);
 		Keccak_HashUpdate(&hash, (unsigned char*)saved_key[index], saved_len[index] * 8);
 		Keccak_HashFinal(&hash, (unsigned char*)crypt_out[index]);
 	}
+
 	return count;
 }
 
 static int cmp_all(void *binary, int count)
 {
-	int index = 0;
-	for (; index < count; index++)
+	int index;
+
+	for (index = 0; index < count; index++)
 		if (!memcmp(binary, crypt_out[index], ARCH_SIZE))
 			return 1;
 	return 0;
@@ -265,13 +223,8 @@ struct fmt_main fmt_rawSHA3 = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,

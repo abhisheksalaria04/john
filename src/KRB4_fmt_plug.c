@@ -32,6 +32,12 @@
   ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
+#if AC_BUILT
+#include "autoconfig.h"
+#endif
+
+#if HAVE_LIBCRYPTO
+
 #if FMT_EXTERNS_H
 extern struct fmt_main fmt_KRB4;
 #elif FMT_REGISTERS_H
@@ -48,7 +54,6 @@ john_register_one(&fmt_KRB4);
 #include "misc.h"
 #include "common.h"
 #include "formats.h"
-#include "memdbg.h"
 
 #define TGT_LENGTH		16	/* 2 des_cblock's */
 
@@ -60,7 +65,7 @@ john_register_one(&fmt_KRB4);
 
 #define ALGORITHM_NAME		"DES 32/" ARCH_BITS_STR
 #define BENCHMARK_COMMENT	""
-#define BENCHMARK_LENGTH	-1
+#define BENCHMARK_LENGTH	0x208
 #define PLAINTEXT_LENGTH	32
 #define BINARY_SIZE		0
 #define BINARY_ALIGN		MEM_ALIGN_NONE
@@ -220,7 +225,7 @@ static int krb4_check_parity(DES_cblock *key)
 		if ((*key)[i] != odd_parity[(*key)[i]])
 			return (0);
 	}
-	return (1);
+	return 1;
 }
 
 static int cmp_all(void *binary, int count)
@@ -249,7 +254,7 @@ static int cmp_one(void *binary, int count)
 
 static int cmp_exact(char *source, int index)
 {
-	return (1);
+	return 1;
 }
 
 struct fmt_main fmt_KRB4 = {
@@ -310,3 +315,4 @@ struct fmt_main fmt_KRB4 = {
 };
 
 #endif /* plugin stanza */
+#endif /* HAVE_LIBCRYPTO */

@@ -11,29 +11,61 @@
 #include "autoconfig.h"
 #endif
 
+#define _GNU_SOURCE 1 /* Try to elicit RTLD_DEFAULT */
+
 #if HAVE_OPENCL
 #define _BSD_SOURCE 1
 #define _DEFAULT_SOURCE 1
 #endif
-#define NEED_OS_FLOCK
-#include "os.h"
 
-#if !AC_BUILT
-# include <string.h>
-# ifndef _MSC_VER
-#  include <strings.h>
-# endif
-#else
-# if STRING_WITH_STRINGS
-#  include <string.h>
-#  include <strings.h>
-# elif HAVE_STRING_H
-#  include <string.h>
-# elif HAVE_STRINGS_H
-#  include <strings.h>
-# endif
+#include <unistd.h>
+#include <fcntl.h>
+#if HAVE_SYS_TIME_H
+#include <sys/time.h>
 #endif
+#if HAVE_SYS_TIMES_H
+#include <sys/times.h>
+#endif
+#if !AC_BUILT
+ #include <string.h>
+ #ifndef _MSC_VER
+  #include <strings.h>
+ #endif
+#else
+ #if STRING_WITH_STRINGS
+  #include <string.h>
+  #include <strings.h>
+ #elif HAVE_STRING_H
+  #include <string.h>
+ #elif HAVE_STRINGS_H
+  #include <strings.h>
+ #endif
+#endif
+
+#if HAVE_LIBCRYPTO
+#include <openssl/opensslv.h>
 #include <openssl/crypto.h>
+#endif
+
+#if HAVE_LIBDL
+#include <dlfcn.h>
+#elif HAVE_WINDOWS_H
+#define JTR_DLSYM_ONLY 1
+#include "Win32-dlfcn-port.h"
+#define HAVE_LIBDL 1
+#endif
+
+#if HAVE_LIBGMP && !__MIC__
+#if HAVE_GMP_GMP_H
+#include <gmp/gmp.h>
+#else
+#include <gmp.h>
+#endif
+#endif
+
+#if __GLIBC__
+#include <gnu/libc-version.h>
+#endif
 
 #include "arch.h"
 #include "simd-intrinsics.h"
@@ -46,20 +78,15 @@
 #include "dynamic.h"
 #include "dynamic_types.h"
 #include "config.h"
-
-#if HAVE_LIBGMP
-#if HAVE_GMP_GMP_H
-#include <gmp/gmp.h>
-#else
-#include <gmp.h>
-#endif
-#endif
-
-#if __GLIBC__
-#include <gnu/libc-version.h>
-#endif
-
+#include "bench.h"
+#include "timer.h"
+#include "misc.h"
 #include "regex.h"
+#include "opencl_common.h"
+#include "mask_ext.h"
+#include "john.h"
+#include "version.h"
+#include "listconf.h" /* must be included after version.h */
 
 #ifdef NO_JOHN_BLD
 #define JOHN_BLD "unk-build-type"
@@ -67,16 +94,11 @@
 #include "john_build_rule.h"
 #endif
 
-#if HAVE_CUDA
-extern char *get_cuda_header_version();
-extern void cuda_device_list();
+#if CPU_DETECT
+extern char CPU_req_name[];
 #endif
-#if HAVE_OPENCL
-#include "common-opencl.h"
-#endif
-#include "version.h"
-#include "listconf.h" /* must be included after version.h */
-#include "memdbg.h"
+
+#define SINGLE_MAX_WORDS(len) MIN(SINGLE_IDX_MAX, SINGLE_BUF_MAX / len + 1)
 
 /*
  * FIXME: Should all the listconf_list_*() functions get an additional stream
@@ -86,16 +108,11 @@ extern void cuda_device_list();
 static void listconf_list_options()
 {
 	puts("help[:WHAT], subformats, inc-modes, rules, externals, ext-modes, ext-hybrids,");
-	puts("ext-filters, ext-filters-only, build-info, hidden-options, encodings,");
-	puts("formats, format-details, format-all-details, format-methods[:WHICH],");
-	// With "opencl-devices, cuda-devices, <conf section name>" added,
-	// the resulting line will get too long
-	puts("format-tests, sections, parameters:SECTION, list-data:SECTION,");
+	puts("ext-filters, ext-filters-only, build-info, encodings, formats, format-classes,");
+	puts("format-details, format-all-details, format-methods[:WHICH], format-tests,");
+	printf("sections, parameters:SECTION, list-data:SECTION, ");
 #if HAVE_OPENCL
-	printf("opencl-devices, ");
-#endif
-#if HAVE_CUDA
-	printf("cuda-devices, ");
+	puts("opencl-devices,");
 #endif
 	/* NOTE: The following must end the list. Anything listed after
 	   <conf section name> will be ignored by current
@@ -126,7 +143,7 @@ static void listconf_list_build_info(void)
 	int gmp_major, gmp_minor, gmp_patchlevel;
 #endif
 	puts("Version: " JTR_GIT_VERSION);
-	puts("Build: " JOHN_BLD _MP_VERSION DEBUG_STRING MEMDBG_STRING ASAN_STRING UBSAN_STRING);
+	puts("Build: " JOHN_BLD _MP_VERSION DEBUG_STRING ASAN_STRING UBSAN_STRING);
 #ifdef SIMD_COEF_32
 	printf("SIMD: %s, interleaving: MD4:%d MD5:%d SHA1:%d SHA256:%d SHA512:%d\n",
 	       SIMD_TYPE,
@@ -137,6 +154,9 @@ static void listconf_list_build_info(void)
 	puts("System-wide exec: " JOHN_SYSTEMWIDE_EXEC);
 	puts("System-wide home: " JOHN_SYSTEMWIDE_HOME);
 	puts("Private home: " JOHN_PRIVATE_HOME);
+#endif
+#if CPU_REQ
+	printf("CPU tests: %s\n", CPU_req_name);
 #endif
 #if CPU_FALLBACK
 	puts("CPU fallback binary: " CPU_FALLBACK_BINARY);
@@ -153,6 +173,17 @@ static void listconf_list_build_info(void)
 	printf("CHARSET_MAX: %d (0x%02x)\n", CHARSET_MAX, CHARSET_MAX);
 	printf("CHARSET_LENGTH: %d\n", CHARSET_LENGTH);
 	printf("SALT_HASH_SIZE: %u\n", SALT_HASH_SIZE);
+	printf("SINGLE_IDX_MAX: %u\n", SINGLE_IDX_MAX);
+	printf("SINGLE_BUF_MAX: %u\n", SINGLE_BUF_MAX);
+	printf("Effective limit: ");
+	if (sizeof(SINGLE_KEYS_TYPE) < 4 || sizeof(SINGLE_KEYS_UTYPE) < 4) {
+		if (SINGLE_MAX_WORDS(125) < SINGLE_MAX_WORDS(16))
+			printf("Max. KPC %d at length 16, down to %d at length 125\n",
+			       SINGLE_MAX_WORDS(16), SINGLE_MAX_WORDS(125));
+		else
+			printf("Max. KPC %d\n", SINGLE_MAX_WORDS(125));
+	} else
+		printf("Number of salts vs. SingleMaxBufferSize\n");
 	printf("Max. Markov mode level: %d\n", MAX_MKV_LVL);
 	printf("Max. Markov mode password length: %d\n", MAX_MKV_LEN);
 
@@ -193,30 +224,56 @@ static void listconf_list_build_info(void)
 #endif
 #endif
 
-#if HAVE_CUDA
-	printf("CUDA headers version: %s\n",get_cuda_header_version());
-#endif
 #if HAVE_OPENCL
 	printf("OpenCL headers version: %s\n",get_opencl_header_version());
 #endif
-#if HAVE_LIBSSL
+#if HAVE_LIBCRYPTO
 	printf("Crypto library: OpenSSL\n");
+#else
+	printf("Crypto library: None\n");
 #endif
-#if HAVE_COMMONCRYPTO
-	printf("Crypto library: CommonCrypto\n");
+
+#if HAVE_LIBDL && defined(RTLD_DEFAULT)
+
+#if defined SSLEAY_VERSION && !defined OPENSSL_VERSION
+#define OPENSSL_VERSION SSLEAY_VERSION
+#elif defined OPENSSL_VERSION && !defined SSLEAY_VERSION
+#define SSLEAY_VERSION OPENSSL_VERSION
 #endif
+
 #ifdef OPENSSL_VERSION_NUMBER
 	printf("OpenSSL library version: %09lx", (unsigned long)OPENSSL_VERSION_NUMBER);
-	if (OPENSSL_VERSION_NUMBER != SSLeay())
-		printf("\t(loaded: %09lx)", (unsigned long)SSLeay());
+	if (dlsym(RTLD_DEFAULT, "OpenSSL_version_num")) {
+		unsigned long (*OpenSSL_version_num)(void) =
+			dlsym(RTLD_DEFAULT, "OpenSSL_version_num");
+
+		if (OPENSSL_VERSION_NUMBER != OpenSSL_version_num())
+			printf("\t(loaded: %09lx)", OpenSSL_version_num());
+	} else if (dlsym(RTLD_DEFAULT, "SSLeay")) {
+		unsigned long (*SSLeay)(void) = dlsym(RTLD_DEFAULT, "SSLeay");
+
+		if (OPENSSL_VERSION_NUMBER != SSLeay())
+			printf("\t(loaded: %09lx)", SSLeay());
+	}
 	printf("\n");
 #endif
 #ifdef OPENSSL_VERSION_TEXT
 	printf("%s", OPENSSL_VERSION_TEXT);
-	if (strcmp(OPENSSL_VERSION_TEXT, SSLeay_version(SSLEAY_VERSION)))
-		printf("\t(loaded: %s)", SSLeay_version(SSLEAY_VERSION));
+	if (dlsym(RTLD_DEFAULT, "OpenSSL_version")) {
+		const char* (*OpenSSL_version)(int) =
+			dlsym(RTLD_DEFAULT, "OpenSSL_version");
+
+		if (strcmp(OPENSSL_VERSION_TEXT, OpenSSL_version(OPENSSL_VERSION)))
+			printf("\t(loaded: %s)", OpenSSL_version(OPENSSL_VERSION));
+	} else if (dlsym(RTLD_DEFAULT, "SSLeay_version")) {
+		const char* (*SSLeay_version)(int) = dlsym(RTLD_DEFAULT, "SSLeay_version");
+		if (strcmp(OPENSSL_VERSION_TEXT, SSLeay_version(SSLEAY_VERSION)))
+			printf("\t(loaded: %s)", SSLeay_version(SSLEAY_VERSION));
+	}
 	printf("\n");
 #endif
+#endif /* HAVE_LIBDL && defined(RTLD_DEFAULT) */
+
 #ifdef __GNU_MP_VERSION
 	printf("GMP library version: %d.%d.%d",
 	       __GNU_MP_VERSION, __GNU_MP_VERSION_MINOR, __GNU_MP_VERSION_PATCHLEVEL);
@@ -238,11 +295,9 @@ static void listconf_list_build_info(void)
 	       JS_REGEX_MAJOR_VERSION, JS_REGEX_MINOR_VERSION,
 	       rexgen_version());
 #endif
-
-#if FCNTL_LOCKS
+#if defined(F_SETLK) && defined(F_SETLKW) && defined(F_UNLCK)	  \
+	&& defined(F_RDLCK) && defined(F_WRLCK)
 	puts("File locking: fcntl()");
-#elif OS_FLOCK
-	puts("File locking: flock()");
 #else
 	puts("File locking: NOT supported by this build - do not run concurrent sessions!");
 #endif
@@ -256,16 +311,42 @@ static void listconf_list_build_info(void)
 #endif
 	printf("memmem(): " memmem_func "\n");
 
+	clk_tck_init();
+#if defined(_SC_CLK_TCK) || !defined(CLK_TCK)
+	printf("times(2) sysconf(_SC_CLK_TCK) is %ld\n", clk_tck);
+#else
+	printf("times(2) CLK_TCK is %ld\n", clk_tck);
+#endif
+#if defined (__MINGW32__) || defined (_MSC_VER)
+	printf("Using clock(3) for timers, resolution %ss\n", human_prefix_small(1.0 / CLOCKS_PER_SEC));
+#else
+	printf("Using times(2) for timers, resolution %ss\n", human_prefix_small(1.0 / clk_tck));
+#endif
+	int latency;
+	uint64_t precision = john_timer_stats(&latency);
+
+	printf("HR timer: %s, %s %ss\n", john_nano_clock, latency ? "latency" : "resolution",
+	       human_prefix_small(precision / 1000000000.0));
+
+	int64_t total_mem = host_total_mem();
+
+	if (total_mem >= 0)
+		printf("Total physical host memory: %sB\n", human_prefix(total_mem));
+	else
+		puts("Total physical host memory: unknown");
+
+	int64_t avail_mem = host_avail_mem();
+
+	if (avail_mem >= 0)
+		printf("Available physical host memory: %sB\n", human_prefix(avail_mem));
+	else
+		puts("Available physical host memory: unknown");
+
+	printf("Terminal locale string: %s\n", john_terminal_locale);
+	printf("Parsed terminal locale: %s\n", cp_id2name(options.terminal_enc));
+
 // OK, now append debugging options, BUT only output  something if
 // one or more of them is set. IF none set, be silent.
-#if defined (MEMDBG_ON)
-	cpdbg += sprintf(cpdbg, "\tmemdbg=");
-	#ifdef MEMDBG_EXTRA_CHECKS
-		cpdbg += sprintf(cpdbg, "extra_memory_checks\n");
-	#else
-		cpdbg += sprintf(cpdbg, "on\n");
-	#endif
-#endif
 #if defined (DEBUG)
 	cpdbg += sprintf(cpdbg, "\t'#define DEBUG' set\n");
 #endif
@@ -317,9 +398,10 @@ void listconf_parse_early(void)
 			exit(EXIT_FAILURE);
 		}
 	}
+
 	if (!strcasecmp(options.listconf, "hidden-options"))
 	{
-		opt_print_hidden_usage();
+		opt_usage();
 		exit(EXIT_SUCCESS);
 	}
 
@@ -331,16 +413,17 @@ void listconf_parse_early(void)
 
 	if (!strcasecmp(options.listconf, "encodings"))
 	{
+		if (options.format)
+			error_msg("--format not allowed with \"--list=%s\"\n", options.listconf);
+
 		listEncodings(stdout);
 		exit(EXIT_SUCCESS);
 	}
-#if HAVE_CUDA
-	if (!strcasecmp(options.listconf, "cuda-devices"))
+	if (!strcasecmp(options.listconf, "format-classes"))
 	{
-		cuda_device_list();
+		puts(fmt_class_list);
 		exit(EXIT_SUCCESS);
 	}
-#endif
 }
 
 /*
@@ -353,7 +436,7 @@ void list_tunable_cost_names(struct fmt_main *format, char *separator)
 	int i;
 
 	for (i = 0; i < FMT_TUNABLE_COSTS; ++i) {
-		if(format->params.tunable_cost_name[i]) {
+		if (format->params.tunable_cost_name[i]) {
 			if (i)
 				printf("%s", separator);
 			printf("%s", format->params.tunable_cost_name[i]);
@@ -406,6 +489,9 @@ void listconf_parse_late(void)
 	if ((options.subformat && !strcasecmp(options.subformat, "list")) ||
 	    (options.listconf && !strcasecmp(options.listconf, "subformats")))
 	{
+		if (options.format)
+			error_msg("--format not allowed with \"--list=subformats\"\n");
+
 		dynamic_DISPLAY_ALL_FORMATS();
 /* NOTE if we have other 'generics', like sha1, sha2, rc4... then EACH of them
    should have a DISPLAY_ALL_FORMATS() function and we can call them here. */
@@ -415,7 +501,6 @@ void listconf_parse_late(void)
 #if HAVE_OPENCL
 	if (!strcasecmp(options.listconf, "opencl-devices"))
 	{
-		opencl_preinit();
 		opencl_list_devices();
 		exit(EXIT_SUCCESS);
 	}
@@ -473,7 +558,6 @@ void listconf_parse_late(void)
 	if (!strcasecmp(options.listconf, "ext-modes"))
 	{
 		cfg_print_subsections("List.External", "generate", NULL, 0);
-		cfg_print_subsections("List.External", "new", NULL, 0);
 		exit(EXIT_SUCCESS);
 	}
 	if (!strcasecmp(options.listconf, "ext-hybrids"))
@@ -485,30 +569,45 @@ void listconf_parse_late(void)
 	if (!strcasecmp(options.listconf, "formats")) {
 		struct fmt_main *format;
 		int column = 0, dynamics = 0;
-		int grp_dyna;
+		int grp_dyna, total = 0, add_comma = 0;
+		char *format_option = options.format ? options.format : options.format_list;
 
-		grp_dyna = options.format ?
-			strcmp(options.format, "dynamic") ?
-			0 : strstr(options.format, "*") != 0 : 1;
+		grp_dyna = !format_option || (!strcasestr(format_option, "disabled") && !strcasestr(format_option, "dynamic"));
 
 		format = fmt_list;
 		do {
 			int length;
-			char *label = format->params.label;
+			const char *label = format->params.label;
+
+			total++;
+
 			if (grp_dyna && !strncmp(label, "dynamic", 7)) {
 				if (dynamics++)
 					continue;
 				else
 					label = "dynamic_n";
 			}
+
 			length = strlen(label) + 2;
 			column += length;
+			if (add_comma)
+				printf(", ");
+			else
+				add_comma = 1;
 			if (column > 78) {
 				printf("\n");
 				column = length;
 			}
-			printf("%s%s", label, format->next ? ", " : "\n");
+			printf("%s", label);
 		} while ((format = format->next));
+		printf("\n");
+
+		fflush(stdout);
+		fprintf(stderr, "%d formats", total);
+		if (dynamics)
+			fprintf(stderr, " (%d dynamic formats shown as just \"dynamic_n\" here)", dynamics);
+		fprintf(stderr, "\n");
+
 		exit(EXIT_SUCCESS);
 	}
 	if (!strcasecmp(options.listconf, "format-details")) {
@@ -519,8 +618,6 @@ void listconf_parse_late(void)
    But if LWS or GWS was already set, we do not overwrite. */
 		setenv("LWS", "1", 0);
 		setenv("GWS", "1", 0);
-		setenv("BLOCKS", "1", 0);
-		setenv("THREADS", "1", 0);
 #endif
 
 #if 0
@@ -534,15 +631,16 @@ void listconf_parse_late(void)
 			int ntests = 0;
 			char buf[LINE_BUFFER_SIZE + 1];
 
-/* Some encodings change max plaintext length when
+/* Some formats change max plaintext length when
    encoding is used, or KPC when under OMP */
-			fmt_init(format);
+			if (!strstr(format->params.label, "-ztex"))
+				fmt_init(format);
 
 			if (format->params.tests) {
 				while (format->params.tests[ntests++].ciphertext);
 				ntests--;
 			}
-			printf("%s\t%d\t%d\t%d\t%08x\t%d\t%s\t%s\t%s\t%d\t%d\t%d",
+			printf("%s\t%d\t%d\t%d\t%08x\t%d\t%s\t%s\t%s\t0x%x\t%d\t%d",
 			       format->params.label,
 			       format->params.plaintext_length,
 			       format->params.min_keys_per_crypt,
@@ -591,16 +689,20 @@ void listconf_parse_late(void)
    But if LWS or GWS was already set, we do not overwrite. */
 		setenv("LWS", "1", 0);
 		setenv("GWS", "1", 0);
-		setenv("BLOCKS", "1", 0);
-		setenv("THREADS", "1", 0);
 #endif
 		format = fmt_list;
 		do {
 			int ntests = 0;
+			int enc_len, utf8_len;
 
-/* Some encodings change max plaintext length when encoding is used,
+/* Some formats change max plaintext length when encoding is used,
    or KPC when under OMP */
-			fmt_init(format);
+			if (!strstr(format->params.label, "-ztex"))
+				fmt_init(format);
+
+			utf8_len = enc_len = format->params.plaintext_length;
+			if (options.target_enc == UTF_8)
+				utf8_len /= 3;
 
 			if (format->params.tests) {
 				while (format->params.tests[ntests++].ciphertext);
@@ -620,22 +722,44 @@ void listconf_parse_late(void)
 			                    SUBSECTION_FORMATS,
 			                    format->params.label, 0)
 			       ? "yes" : "no");
-			printf("Min. password length in bytes        %d\n", format->params.plaintext_min_length);
-			printf("Max. password length in bytes        %d\n", format->params.plaintext_length);
+			printf("Min. password length                 %d\n", format->params.plaintext_min_length);
+			if (!(format->params.flags & FMT_8_BIT) ||
+			    options.target_enc != UTF_8 ||
+			    !strncasecmp(format->params.label, "LM", 2) ||
+			    !strcasecmp(format->params.label, "netlm") ||
+			    !strcasecmp(format->params.label, "nethalflm") ||
+			    !strcasecmp(format->params.label, "sapb")) {
+				/* Not using UTF-8 so length is not ambiguous */
+				printf("Max. password length                 %d\n", enc_len);
+			} else if (!fmt_raw_len || fmt_raw_len == enc_len) {
+				/* Example: Office and thin dynamics */
+				printf("Max. password length                 %d [worst case UTF-8] to %d [ASCII]\n", utf8_len, enc_len);
+			} else if (enc_len == 3 * fmt_raw_len) {
+				/* Example: NT */
+				printf("Max. password length                 %d\n", utf8_len);
+			} else {
+				/* Example: SybaseASE */
+				printf("Max. password length                 %d [worst case UTF-8] to %d [ASCII]\n", utf8_len, fmt_raw_len);
+			}
 			printf("Min. keys per crypt                  %d\n", format->params.min_keys_per_crypt);
 			printf("Max. keys per crypt                  %d\n", format->params.max_keys_per_crypt);
 			printf("Flags\n");
 			printf(" Case sensitive                      %s\n", (format->params.flags & FMT_CASE) ? "yes" : "no");
-			printf(" Truncates at (our) max. length      %s\n", (format->params.flags & FMT_TRUNC) ? "yes" : "no");
+			printf(" Truncates at max. length            %s\n", (format->params.flags & FMT_TRUNC) ? "yes" : "no");
 			printf(" Supports 8-bit characters           %s\n", (format->params.flags & FMT_8_BIT) ? "yes" : "no");
-			printf(" Converts 8859-1 to UTF-16/UCS-2     %s\n", (format->params.flags & FMT_UNICODE) ? "yes" : "no");
+			printf(" Converts internally to UTF-16/UCS-2 %s\n", (format->params.flags & FMT_UNICODE) ? "yes" : "no");
 			printf(" Honours --encoding=NAME             %s\n",
-			       (format->params.flags & FMT_UTF8) ? "yes" :
+			       (format->params.flags & FMT_ENC) ? "yes" :
 			       (format->params.flags & FMT_UNICODE) ? "no" : "n/a");
 			printf(" Collisions possible (as in likely)  %s\n",
 			       (format->params.flags & FMT_NOT_EXACT) ? "yes" : "no");
 			printf(" Uses a bitslice implementation      %s\n", (format->params.flags & FMT_BS) ? "yes" : "no");
 			printf(" The split() method unifies case     %s\n", (format->params.flags & FMT_SPLIT_UNIFIES_CASE) ? "yes" : "no");
+			printf(" Supports very long hashes           %s\n", (format->params.flags & FMT_HUGE_INPUT) ? "yes" : "no");
+			if (format->params.flags & FMT_MASK)
+				printf(" Internal mask generation            yes (device target: %dx)\n", mask_int_cand_target);
+			else
+				printf(" Internal mask generation            no\n");
 
 #ifndef DYNAMIC_DISABLED
 			if (format->params.flags & FMT_DYNAMIC) {
@@ -665,7 +789,12 @@ void listconf_parse_late(void)
 			printf("Algorithm name                       %s\n", format->params.algorithm_name);
 			printf("Format name                          %s\n", format->params.format_name);
 			printf("Benchmark comment                    %s\n", format->params.benchmark_comment[0] == ' ' ? &format->params.benchmark_comment[1] : format->params.benchmark_comment);
-			printf("Benchmark length                     %d\n", format->params.benchmark_length);
+			printf("Benchmark length                     %d (0x%x, %s)\n",
+			       format->params.benchmark_length & 0x7f,
+			       format->params.benchmark_length,
+			       format->params.benchmark_length & 0x100 ?
+			       "raw" : format->params.benchmark_length & 0x200 ?
+			       "shorter speedup" : "many salts speedup");
 			printf("Binary size                          %d\n", format->params.binary_size);
 			printf("Salt size                            %d\n",
 			       ((format->params.flags & FMT_DYNAMIC) && format->params.salt_size) ?
@@ -705,7 +834,8 @@ void listconf_parse_late(void)
 		do {
 			int ShowIt = 1, i;
 
-			fmt_init(format);
+			if (!strstr(format->params.label, "-ztex"))
+				fmt_init(format);
 
 			if (options.listconf[14] == '=' || options.listconf[14] == ':') {
 				ShowIt = 0;
@@ -777,7 +907,7 @@ void listconf_parse_late(void)
 					ShowIt = 1;
 
 				for (i = 0; i < FMT_TUNABLE_COSTS; ++i) {
-					char Buf[30];
+					char Buf[32];
 					sprintf(Buf, "tunable_cost_value[%d]", i);
 					if (format->methods.tunable_cost_value[i] && !strcasecmp(&options.listconf[15], Buf))
 						ShowIt = 1;
@@ -790,7 +920,7 @@ void listconf_parse_late(void)
 				if (format->methods.clear_keys != fmt_default_clear_keys && !strcasecmp(&options.listconf[15], "clear_keys"))
 					ShowIt = 1;
 				for (i = 0; i < PASSWORD_HASH_SIZES; ++i) {
-					char Buf[20];
+					char Buf[25];
 					sprintf(Buf, "get_hash[%d]", i);
 					if (format->methods.get_hash[i] && format->methods.get_hash[i] != fmt_default_get_hash && !strcasecmp(&options.listconf[15], Buf))
 						ShowIt = 1;
@@ -799,7 +929,7 @@ void listconf_parse_late(void)
 					ShowIt = 1;
 
 				for (i = 0; i < PASSWORD_HASH_SIZES; ++i) {
-					char Buf[20];
+					char Buf[25];
 					sprintf(Buf, "binary_hash[%d]", i);
 					if (format->methods.binary_hash[i] && format->methods.binary_hash[i] != fmt_default_binary_hash && !strcasecmp(&options.listconf[15], Buf))
 						ShowIt = 1;
@@ -887,18 +1017,17 @@ void listconf_parse_late(void)
 		   GWS was already set, we do not overwrite. */
 		setenv("LWS", "1", 0);
 		setenv("GWS", "1", 0);
-		setenv("BLOCKS", "1", 0);
-		setenv("THREADS", "1", 0);
 #endif
 		do {
 			int ntests = 0;
 
 			/*
-			 * fmt_init() and fmt_done() required for --encoding=
+			 * fmt_init() and fmt_done() required for encoding
 			 * support, because some formats (like Raw-MD5u)
 			 * change their tests[] depending on the encoding.
 			 */
-			fmt_init(format);
+			if (!strstr(format->params.label, "-ztex"))
+				fmt_init(format);
 
 			if (format->params.tests) {
 				while (format->params.tests[ntests].ciphertext) {
@@ -926,8 +1055,13 @@ void listconf_parse_late(void)
 						        "Test %s %d: ciphertext contains line feed or separator character '%c'\n",
 						        format->params.label, ntests, separator);
 					}
-/* if they are both missing, simply do not output a line at all */
-					if (skip != 3) {
+/*
+ * if they are both unsuitable or it's a magic internal-only test vector,
+ * simply do not output a line at all
+ */
+					if (skip != 3 &&
+					    !strstr(ciphertext, "$elftest") &&
+					    !strstr(ciphertext, "\1\1\1\1\1\1\1\1")) {
 						printf("%s%c%d",
 							   format->params.label, separator, ntests);
 						if (skip < 2) {

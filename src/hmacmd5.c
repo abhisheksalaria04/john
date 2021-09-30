@@ -35,7 +35,6 @@
 #ifdef _MSC_VER
 #define inline _inline
 #endif
-#include "memdbg.h"
 
 /***********************************************************************
  the rfc 2104 version of hmac_md5 initialisation.
@@ -112,8 +111,8 @@ inline void hmac_md5_init_K16(const unsigned char* key, HMACMD5Context *ctx)
 #else
 //#warning INFO: Using 32-bit xor
 	for (i = 0; i < 4; i++) {
-		((ARCH_WORD_32 *)ctx->k_ipad)[i] ^= ((ARCH_WORD_32 *)key)[i];
-		((ARCH_WORD_32 *)ctx->k_opad)[i] ^= ((ARCH_WORD_32 *)key)[i];
+		((uint32_t *)ctx->k_ipad)[i] ^= ((uint32_t *)key)[i];
+		((uint32_t *)ctx->k_opad)[i] ^= ((uint32_t *)key)[i];
 	}
 #endif
 #else

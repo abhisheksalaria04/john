@@ -46,7 +46,6 @@ john_register_one(&fmt_mysqlSHA1);
 #include "formats.h"
 #include "sha.h"
 #include "johnswap.h"
-#include "memdbg.h"
 
 #define FORMAT_LABEL			"mysql-sha1"
 #define FORMAT_NAME			"MySQL 4.1+"
@@ -54,7 +53,7 @@ john_register_one(&fmt_mysqlSHA1);
 #define ALGORITHM_NAME			"SHA1 " SHA1_ALGORITHM_NAME
 
 #define BENCHMARK_COMMENT		""
-#define BENCHMARK_LENGTH		-1
+#define BENCHMARK_LENGTH		0x107
 
 #define PLAINTEXT_LENGTH		32
 #define CIPHERTEXT_LENGTH		41
@@ -68,7 +67,8 @@ john_register_one(&fmt_mysqlSHA1);
 
 #define MIN_KEYS_PER_CRYPT		NBKEYS
 #define MAX_KEYS_PER_CRYPT		NBKEYS
-#define GETPOS(i, index)		( (index&(SIMD_COEF_32-1))*4 + ((i)&(0xffffffff-3) )*SIMD_COEF_32 + (3-((i)&3)) + (unsigned int)index/SIMD_COEF_32*SHA_BUF_SIZ*4*SIMD_COEF_32 ) //for endianity conversion
+#define FMT_IS_BE
+#include "common-simd-getpos.h"
 
 #else
 
@@ -106,7 +106,7 @@ JTR_ALIGN(MEM_ALIGN_SIMD) char interm_key[SHA_BUF_SIZ*4*NBKEYS];
 
 #else
 static char saved_key[PLAINTEXT_LENGTH + 1];
-static ARCH_WORD_32 crypt_key[BINARY_SIZE / 4];
+static uint32_t crypt_key[BINARY_SIZE / 4];
 static SHA_CTX ctx;
 #endif
 
@@ -114,7 +114,7 @@ static int valid(char *ciphertext, struct fmt_main *self)
 {
 	int i;
 
-	if (strlen(ciphertext) != CIPHERTEXT_LENGTH) return 0;
+	if (strnlen(ciphertext, CIPHERTEXT_LENGTH + 1) != CIPHERTEXT_LENGTH) return 0;
 	if (ciphertext[0] != '*')
 		return 0;
 	for (i = 1; i < CIPHERTEXT_LENGTH; i++) {
@@ -153,83 +153,19 @@ static void init(struct fmt_main *self)
 #endif
 }
 
-static void set_key(char *key, int index)
-{
-#ifdef SIMD_COEF_32
-#if ARCH_ALLOWS_UNALIGNED
-	const ARCH_WORD_32 *wkey = (ARCH_WORD_32*)key;
-#else
-	char buf_aligned[PLAINTEXT_LENGTH + 1] JTR_ALIGN(sizeof(uint32_t));
-	const ARCH_WORD_32 *wkey = (uint32_t*)(is_aligned(key, sizeof(uint32_t)) ?
-	                                       key : strcpy(buf_aligned, key));
-#endif
-	ARCH_WORD_32 *keybuf_word = (ARCH_WORD_32*)&saved_key[GETPOS(3, index)];
-	unsigned int len;
-	ARCH_WORD_32 temp;
-
-	len = 0;
-	while((temp = *wkey++) & 0xff) {
-		if (!(temp & 0xff00))
-		{
-			*keybuf_word = JOHNSWAP((temp & 0xff) | (0x80 << 8));
-			len++;
-			goto key_cleaning;
-		}
-		if (!(temp & 0xff0000))
-		{
-			*keybuf_word = JOHNSWAP((temp & 0xffff) | (0x80 << 16));
-			len+=2;
-			goto key_cleaning;
-		}
-		if (!(temp & 0xff000000))
-		{
-			*keybuf_word = JOHNSWAP(temp | (0x80U << 24));
-			len+=3;
-			goto key_cleaning;
-		}
-		*keybuf_word = JOHNSWAP(temp);
-		len += 4;
-		keybuf_word += SIMD_COEF_32;
-	}
-	*keybuf_word = 0x80000000;
-
-key_cleaning:
-	keybuf_word += SIMD_COEF_32;
-	while(*keybuf_word) {
-		*keybuf_word = 0;
-		keybuf_word += SIMD_COEF_32;
-	}
-	((unsigned int *)saved_key)[15*SIMD_COEF_32 + (index&(SIMD_COEF_32-1)) + (unsigned int)index/SIMD_COEF_32*SHA_BUF_SIZ*SIMD_COEF_32] = len << 3;
-#else
-	strnzcpy(saved_key, key, PLAINTEXT_LENGTH + 1);
-#endif
-}
-
-static char *get_key(int index) {
-#ifdef SIMD_COEF_32
-	static char out[PLAINTEXT_LENGTH+1];
-	unsigned int i, s;
-
-	s = ((unsigned int *)saved_key)[15*SIMD_COEF_32 + (index&(SIMD_COEF_32-1)) + (unsigned int)index/SIMD_COEF_32*SHA_BUF_SIZ*SIMD_COEF_32] >> 3;
-	for (i = 0; i < s; i++)
-		out[i] = saved_key[ GETPOS(i, index) ];
-	out[i] = 0;
-	return out;
-#else
-	return saved_key;
-#endif
-}
+#define NON_SIMD_SINGLE_SAVED_KEY
+#include "common-simd-setkey32.h"
 
 static int cmp_all(void *binary, int count) {
 #ifdef SIMD_COEF_32
-	unsigned int x,y=0;
+	unsigned int x, y;
 
-	for(;y<SIMD_PARA_SHA1;y++)
-	for(x=0;x<SIMD_COEF_32;x++)
-	{
-		if( ((unsigned int*)binary)[0] ==
-		    ((unsigned int*)crypt_key)[x+y*SIMD_COEF_32*5] )
-			return 1;
+	for (y = 0; y < SIMD_PARA_SHA1; y++) {
+		for (x = 0; x < SIMD_COEF_32; x++) {
+			if ( ((unsigned int*)binary)[0] ==
+					((unsigned int*)crypt_key)[x+y*SIMD_COEF_32*5] )
+				return 1;
+		}
 	}
 	return 0;
 #else
@@ -239,7 +175,7 @@ static int cmp_all(void *binary, int count) {
 
 static int cmp_exact(char *source, int index)
 {
-	return (1);
+	return 1;
 }
 
 static int cmp_one(void * binary, int index)
@@ -249,15 +185,15 @@ static int cmp_one(void * binary, int index)
 	x = index&(SIMD_COEF_32-1);
 	y = (unsigned int)index/SIMD_COEF_32;
 
-	if( ((unsigned int*)binary)[0] != ((unsigned int*)crypt_key)[x+y*SIMD_COEF_32*5] )
+	if ( ((unsigned int*)binary)[0] != ((unsigned int*)crypt_key)[x+y*SIMD_COEF_32*5] )
 		return 0;
-	if( ((unsigned int*)binary)[1] != ((unsigned int*)crypt_key)[x+y*SIMD_COEF_32*5+SIMD_COEF_32*1] )
+	if ( ((unsigned int*)binary)[1] != ((unsigned int*)crypt_key)[x+y*SIMD_COEF_32*5+SIMD_COEF_32*1] )
 		return 0;
-	if( ((unsigned int*)binary)[2] != ((unsigned int*)crypt_key)[x+y*SIMD_COEF_32*5+SIMD_COEF_32*2] )
+	if ( ((unsigned int*)binary)[2] != ((unsigned int*)crypt_key)[x+y*SIMD_COEF_32*5+SIMD_COEF_32*2] )
 		return 0;
-	if( ((unsigned int*)binary)[3] != ((unsigned int*)crypt_key)[x+y*SIMD_COEF_32*5+SIMD_COEF_32*3] )
+	if ( ((unsigned int*)binary)[3] != ((unsigned int*)crypt_key)[x+y*SIMD_COEF_32*5+SIMD_COEF_32*3] )
 		return 0;
-	if( ((unsigned int*)binary)[4] != ((unsigned int*)crypt_key)[x+y*SIMD_COEF_32*5+SIMD_COEF_32*4] )
+	if ( ((unsigned int*)binary)[4] != ((unsigned int*)crypt_key)[x+y*SIMD_COEF_32*5+SIMD_COEF_32*4] )
 		return 0;
 	return 1;
 #else
@@ -305,98 +241,15 @@ static void *get_binary(char *ciphertext)
 	{
 		realcipher[i] = atoi16[ARCH_INDEX(ciphertext[i*2])]*16 + atoi16[ARCH_INDEX(ciphertext[i*2+1])];
 	}
-#ifdef SIMD_COEF_32
+#if defined(SIMD_COEF_32) && ARCH_LITTLE_ENDIAN==1
 	alter_endianity((unsigned char *)realcipher, BINARY_SIZE);
 #endif
 	return (void *)realcipher;
 }
 
-#ifdef SIMD_COEF_32
-static int get_hash_0(int index)
-{
-	unsigned int x,y;
-        x = index&(SIMD_COEF_32-1);
-        y = (unsigned int)index/SIMD_COEF_32;
-	return ((ARCH_WORD_32*)crypt_key)[x+y*SIMD_COEF_32*5] & PH_MASK_0;
-}
-static int get_hash_1(int index)
-{
-	unsigned int x,y;
-        x = index&(SIMD_COEF_32-1);
-        y = (unsigned int)index/SIMD_COEF_32;
-	return ((ARCH_WORD_32*)crypt_key)[x+y*SIMD_COEF_32*5] & PH_MASK_1;
-}
-static int get_hash_2(int index)
-{
-	unsigned int x,y;
-        x = index&(SIMD_COEF_32-1);
-        y = (unsigned int)index/SIMD_COEF_32;
-	return ((ARCH_WORD_32*)crypt_key)[x+y*SIMD_COEF_32*5] & PH_MASK_2;
-}
-static int get_hash_3(int index)
-{
-	unsigned int x,y;
-        x = index&(SIMD_COEF_32-1);
-        y = (unsigned int)index/SIMD_COEF_32;
-	return ((ARCH_WORD_32*)crypt_key)[x+y*SIMD_COEF_32*5] & PH_MASK_3;
-}
-static int get_hash_4(int index)
-{
-	unsigned int x,y;
-        x = index&(SIMD_COEF_32-1);
-        y = (unsigned int)index/SIMD_COEF_32;
-	return ((ARCH_WORD_32*)crypt_key)[x+y*SIMD_COEF_32*5] & PH_MASK_4;
-}
-static int get_hash_5(int index)
-{
-	unsigned int x,y;
-        x = index&(SIMD_COEF_32-1);
-        y = (unsigned int)index/SIMD_COEF_32;
-	return ((ARCH_WORD_32*)crypt_key)[x+y*SIMD_COEF_32*5] & PH_MASK_5;
-}
-static int get_hash_6(int index)
-{
-	unsigned int x,y;
-        x = index&(SIMD_COEF_32-1);
-        y = (unsigned int)index/SIMD_COEF_32;
-	return ((ARCH_WORD_32*)crypt_key)[x+y*SIMD_COEF_32*5] & PH_MASK_6;
-}
-#else
-static int get_hash_0(int index)
-{
-	return ((ARCH_WORD_32 *)crypt_key)[index] & PH_MASK_0;
-}
-
-static int get_hash_1(int index)
-{
-	return ((ARCH_WORD_32 *)crypt_key)[index] & PH_MASK_1;
-}
-
-static int get_hash_2(int index)
-{
-	return ((ARCH_WORD_32 *)crypt_key)[index] & PH_MASK_2;
-}
-
-static int get_hash_3(int index)
-{
-	return ((ARCH_WORD_32 *)crypt_key)[index] & PH_MASK_3;
-}
-
-static int get_hash_4(int index)
-{
-	return ((ARCH_WORD_32 *)crypt_key)[index] & PH_MASK_4;
-}
-
-static int get_hash_5(int index)
-{
-	return ((ARCH_WORD_32 *)crypt_key)[index] & PH_MASK_5;
-}
-
-static int get_hash_6(int index)
-{
-	return ((ARCH_WORD_32 *)crypt_key)[index] & PH_MASK_6;
-}
-#endif
+#define COMMON_GET_HASH_SIMD32 5
+#define COMMON_GET_HASH_VAR crypt_key
+#include "common-get-hash.h"
 
 struct fmt_main fmt_mysqlSHA1 = {
 	{
@@ -445,13 +298,8 @@ struct fmt_main fmt_mysqlSHA1 = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,

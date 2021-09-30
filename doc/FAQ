@@ -2,7 +2,7 @@
 
 The latest version of this FAQ may be viewed online at:
 
-	http://www.openwall.com/john/doc/FAQ.shtml
+	https://www.openwall.com/john/doc/FAQ.shtml
 
 
 	Help!  I can't run John.
@@ -60,7 +60,8 @@ remove the john.pot file.
 A: With PWDUMP-format files, John focuses on LM rather than NTLM hashes
 by default, and it might not load any hashes at all if there are no LM
 hashes to crack.  To have JtR Pro or a -jumbo version focus on NTLM
-hashes instead, you need to pass the "--format=nt" option.
+hashes instead, you need to pass the "--format=nt" option.  You'll also
+need to use this option along with "--show".
 A: If you're using the "--format" option, try dropping it.  Except for
 the special case mentioned in the answer above, "--format" is normally a
 way to choose one of multiple hash/cipher types found in the same file
@@ -87,13 +88,13 @@ A: John only loads properly formatted text files directly.  It can load
 can also load text files containing one password hash per line (and
 nothing else on that line).  Some other file formats are supported via
 extra tools (supplied with John): unafs (Kerberos AFS database files),
-undrop (Eggdrop IRC bot userfiles), ssh2john (OpenSSH private keys),
+undrop (Eggdrop IRC bot userfiles), ssh2sshng.py (OpenSSH private keys),
 pdf2john (some password-protected PDF files), rar2john (some
 password-protected RAR archives), zip2john (some password-protected
 PKZIP and WinZip archives).  You need -jumbo for most of these.  To use
 the proper one of these (for your file format), run it on your file(s)
 and redirect the output to a new file (using your shell's output
-redirection feature - e.g., "./ssh2john ~/.ssh/id_rsa > sshpasswd").
+redirection feature - e.g., "./ssh2sshng.py ~/.ssh/id_rsa > sshpasswd").
 Then run John on the resulting file (e.g., "./john sshpasswd").
 A: The file you're trying to run John on might in fact not be a password
 file at all.
@@ -214,17 +215,17 @@ above).  Other approaches, such as splitting password files naively
 (without regard to salts), are typically less efficient (in some cases
 to the extent where there's no speedup from using multiple nodes at
 all).  Some other approaches, such as using MPI, are listed on the wiki
-at: http://openwall.info/wiki/john/parallelization
+at: https://openwall.info/wiki/john/parallelization
 
 Q: Where do I get wordlists for use with John?
-A: http://www.openwall.com/wordlists/
+A: https://www.openwall.com/wordlists/
 
 Q: Where do I get new versions of John the Ripper?
 Q: Where do I get the source code for John?
 Q: I only have the source code for John the Ripper, where do I get it
 pre-compiled for my OS (if supported)?
 Q: What is the primary website for John the Ripper?
-A: http://www.openwall.com/john/
+A: https://www.openwall.com/john/
 
 Q: How can I contact you (the author)?
 A: See CONTACT.
@@ -305,5 +306,3 @@ Although the meaning of some of the numbers that get into .rec files is
 trivial to explain, it is not possible to reasonably describe some
 others without going into great detail on John internals.  If you really
 need to know, read the source code.
-
-$Owl$

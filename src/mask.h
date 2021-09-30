@@ -1,7 +1,6 @@
 /*
  * This file is part of John the Ripper password cracker,
- * Copyright (c) 2013 by Solar Designer
- * Copyright (c) 2013-2015 by magnum
+ * Copyright (c) 2013-2018 by magnum
  * Copyright (c) 2014 by Sayantan Datta
  *
  * Redistribution and use in source and binary forms, with or without
@@ -19,8 +18,11 @@
 
 #include "loader.h"
 
+// See also opencl_mask.h.
+#define MASK_FMT_INT_PLHDR 4
+
 // Maximum number of placeholders in a mask.
-#define MAX_NUM_MASK_PLHDR 127
+#define MAX_NUM_MASK_PLHDR 125
 
 //#define MASK_DEBUG
 
@@ -31,8 +33,6 @@ typedef struct {
 	int stack_cl_br[MAX_NUM_MASK_PLHDR + 1];
 	/* store locations of valid ? in mask */
 	int stack_qtn[MAX_NUM_MASK_PLHDR + 1];
-	/* 1 if parse is successful, otherwise 0 */
-	int parse_ok;
 } mask_parsed_ctx;
 
  /* Range of characters for a placeholder in the mask */
@@ -90,6 +90,7 @@ extern void mask_crk_init(struct db_main *db);
 extern int do_mask_crack(const char *key);
 
 extern void mask_done(void);
+extern void mask_destroy(void);
 
 /*
  * These are exported for stacked modes (eg. hybrid mask)
@@ -98,13 +99,16 @@ extern void mask_fix_state(void);
 extern void mask_save_state(FILE *file);
 extern int mask_restore_state(FILE *file);
 
+/* Evaluate mask_add_len from a given mask string without calling mask_init */
+extern int mask_calc_len(const char *mask);
+
 /*
  * Total number of candidates (per node) to begin with. Remains unchanged
  * throughout one call to do_mask_crack but may vary with hybrid parent key
  * length.  The number includes the part that is processed on GPU, and is
  * used as a multiplier in native mask mode's and parent modes' get_progress().
  */
-extern unsigned long long mask_tot_cand;
+extern uint64_t mask_tot_cand;
 
 /* Hybrid mask's contribution to key length. Eg. for bc?l?d?w this will be 4. */
 extern int mask_add_len;
@@ -113,9 +117,15 @@ extern int mask_add_len;
 extern int mask_num_qw;
 
 /* Number of times parent mode called hybrid mask. */
-extern unsigned long long mask_parent_keys;
+extern uint64_t mask_parent_keys;
 
 /* Current length when pure mask mode iterates over lengths */
 extern int mask_cur_len;
+
+/* Incremental mask iteration started at this length (contrary to options) */
+extern int mask_iter_warn;
+
+/* Mask mode is incrementing mask length */
+extern int mask_increments_len;
 
 #endif

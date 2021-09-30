@@ -23,9 +23,8 @@
  */
 
 #include "md5.h"
-#ifndef HAVE_LIBSSL
+#if !HAVE_LIBCRYPTO
 #include <string.h>
-#include "memdbg.h"
 
 /*
  * The basic MD5 functions.

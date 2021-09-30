@@ -14,7 +14,12 @@
 #include <errno.h>
 #include <libusb-1.0/libusb.h>
 
+#include "../path.h"
+#include "../list.h"
+
 #include "ztex.h"
+#include "ztex_sn.h"
+#include "../ztex_common.h"
 
 //===============================================================
 //
@@ -25,7 +30,11 @@
 
 int ZTEX_DEBUG = 0;
 
-void ztex_error(const char *s, ...) {
+#ifdef __GNUC__
+__attribute__ ((format (printf, 1, 2)))
+#endif
+static void ztex_error(const char *s, ...)
+{
 	va_list ap;
 	va_start(ap, s);
 	vfprintf(stderr, s, ap);
@@ -78,7 +87,7 @@ int ztex_device_new(libusb_device *usb_dev, struct ztex_device **ztex_dev)
 	*ztex_dev = NULL;
 	struct ztex_device *dev = malloc(sizeof(struct ztex_device));
 	if (!dev) {
-		ztex_error("malloc: unable to allocate %d bytes\n", sizeof(struct ztex_device));
+		ztex_error("malloc: unable to allocate %u bytes\n", (unsigned int)sizeof(struct ztex_device));
 		return -1;
 	}
 
@@ -86,13 +95,15 @@ int ztex_device_new(libusb_device *usb_dev, struct ztex_device **ztex_dev)
 	dev->usb_device = usb_dev;
 	dev->busnum = libusb_get_bus_number(usb_dev);
 	dev->devnum = libusb_get_device_address(usb_dev);
+	dev->iface_claimed = 0;
 
 	result = libusb_open(usb_dev, &dev->handle);
 	if (result < 0) {
 		// e.g. on Windows no driver for device
 		// or device already opened
-		ztex_error("ztex_device_new: libusb_open returns %d (%s)\n",
-				result, libusb_error_name(result));
+		if (result != LIBUSB_ERROR_ACCESS)
+			ztex_error("ztex_device_new: libusb_open returns %d (%s)\n",
+					result, libusb_error_name(result));
 		ztex_device_delete(dev);
 		return result;
 	}
@@ -114,29 +125,28 @@ int ztex_device_new(libusb_device *usb_dev, struct ztex_device **ztex_dev)
 	}
 
 	result = libusb_get_string_descriptor_ascii(dev->handle, desc.iSerialNumber,
-			(unsigned char *)dev->snString, ZTEX_SNSTRING_LEN);
+			(unsigned char *)dev->snString_orig, ZTEX_SNSTRING_LEN);
 	if (result < 0) {
-		ztex_error("ztex_device_new: libusb_get_string_descriptor_ascii(iSerialNumber): %s\n",
+		ztex_error("ztex_device_new: libusb_get_string_descriptor_ascii(iSerialNumber) returns %d (%s)\n",
 				result, libusb_error_name(result));
 		ztex_device_delete(dev);
 		return result;
 	}
-	if (strlen(dev->snString) < ZTEX_SNSTRING_MIN_LEN) {
-		ztex_error("ztex_device_new: Serial Number is too short(%d chars), must be >%d\n",
-				strlen(dev->snString), ZTEX_SNSTRING_MIN_LEN);
-		ztex_device_delete(dev);
-		return result;
-	}
-	
+
+	// Original SN remains in dev->snString_orig.
+	char *sn = ztex_sn_get_by_sn_orig(dev->snString_orig);
+	strncpy(dev->snString, sn, ZTEX_SNSTRING_LEN - 1);
+	dev->snString[ZTEX_SNSTRING_LEN - 1] = 0;
+
 	result = libusb_get_string_descriptor_ascii(dev->handle, desc.iProduct,
 			(unsigned char *)dev->product_string, ZTEX_PRODUCT_STRING_LEN);
 	if (result < 0) {
-		ztex_error("ztex_device_new: libusb_get_string_descriptor_ascii(iProduct): %s\n",
+		ztex_error("ztex_device_new: libusb_get_string_descriptor_ascii(iProduct) returns %d (%s)\n",
 				result, libusb_error_name(result));
 		ztex_device_delete(dev);
 		return result;
 	}
-	
+
 	// Ztex specific descriptor. Contains device type
 	result = ztex_get_descriptor(dev);
 	if (result < 0) {
@@ -183,8 +193,11 @@ void ztex_device_invalidate(struct ztex_device *dev)
 	if (!dev || !dev->valid)
 		return;
 	dev->valid = 0;
-	if (dev->handle)
+	if (dev->handle) {
+		if (dev->iface_claimed)
+			libusb_release_interface(dev->handle, 0);
 		libusb_close(dev->handle);
+	}
 }
 
 int ztex_device_valid(struct ztex_device *dev)
@@ -256,14 +269,20 @@ void ztex_dev_list_remove(struct ztex_dev_list *dev_list, struct ztex_device *de
 			return;
 		}
 }
-/*
-// not used, not tested
-void ztex_dev_list_remove_invalid(struct ztex_dev_list *dev_list)
+
+void ztex_dev_list_delete(struct ztex_dev_list *dev_list)
 {
-	struct ztex_device *dev;
-	for (dev = dev_list->dev; dev; dev = dev->next) {
+	if (!dev_list)
+		return;
+
+	struct ztex_device *dev, *dev_next;
+
+	for (dev = dev_list->dev; dev; dev = dev_next) {
+		dev_next = dev->next;
+		ztex_device_delete(dev);
 	}
-}*/
+	free(dev_list);
+}
 
 // count only valid devices
 int ztex_dev_list_count(struct ztex_dev_list *dev_list)
@@ -297,7 +316,7 @@ void ztex_dev_list_print(struct ztex_dev_list *dev_list)
 	}
 }
 
-
+#if 0
 // Finds valid device with given Serial Number in ztex_dev_list
 struct ztex_device *ztex_find_by_sn(struct ztex_dev_list *dev_list, char *sn)
 {
@@ -313,6 +332,7 @@ struct ztex_device *ztex_find_by_sn(struct ztex_dev_list *dev_list, char *sn)
 	}
 	return NULL;
 }
+#endif
 
 // Finds valid device by libusb_device *
 struct ztex_device *ztex_find_by_usb_dev(struct ztex_dev_list *dev_list, libusb_device *usb_dev)
@@ -374,7 +394,7 @@ int ztex_get_descriptor(struct ztex_device *dev)
 		return result;
 	}
 	//printf("result VR 0x22: %d %d %d %d\n", result, buf[6], buf[7], buf[8]);
-	if (buf[0] != 40 || buf[1] != 1 || buf[2] != 'Z' || buf[3] != 'T' 
+	if (buf[0] != 40 || buf[1] != 1 || buf[2] != 'Z' || buf[3] != 'T'
 			|| buf[4] != 'E' || buf[5] != 'X') {
 		ztex_error("SN %s: ztex_get_descriptor: invalid ztex-specific descriptor\n",
 				dev->snString);
@@ -402,72 +422,157 @@ int ztex_check_capability(struct ztex_device *dev, int i, int j)
 	return 0;
 }
 
+int ztex_firmware_is_ok(struct ztex_device *dev)
+{
+	return !strncmp("inouttraffic 1.0.0 JtR", dev->product_string, 22);
+}
 
 // Scans for devices that aren't already in dev_list, adds them to new_dev_list
 // Devices in question:
-// 1. Got ZTEX Vendor & Product ID, also SN
-// 2. Have ZTEX-specific descriptor
+// 1. Got ZTEX Vendor & Product ID, also SN, has ZTEX-specific descriptor
+// If some devices are already opened (e.g. by other process) -
+// skips them, warns if warn_open is set (it can't distinguish device
+// is already opened or other error condition such as permissions).
 // Returns:
 // >= 0 number of devices added
 // <0 error
-int ztex_scan_new_devices(struct ztex_dev_list *new_dev_list, struct ztex_dev_list *dev_list)
+int ztex_scan_new_devices(struct ztex_dev_list *new_dev_list,
+		struct ztex_dev_list *dev_list, int warn_open,
+		struct list_main *dev_allow)
 {
 	libusb_device **usb_devs;
-	int result;
+	int result, result_open = 0;
 	int count = 0;
 	ssize_t cnt;
-	
+
 	cnt = libusb_get_device_list(NULL, &usb_devs);
 	if (cnt < 0) {
 		ztex_error("libusb_get_device_list: %s\n", libusb_error_name((int)cnt));
 		return (int)cnt;
 	}
-	
+
+	int num_fail_access = 0, num_fail_other = 0;
+	int num_fail_busy = 0;
+
 	int i;
 	for (i = 0; usb_devs[i]; i++) {
 		libusb_device *usb_dev = usb_devs[i];
-		
+
 		struct libusb_device_descriptor desc;
 		result = libusb_get_device_descriptor(usb_dev, &desc);
 		if (result < 0) {
-			ztex_error("libusb_get_device_descriptor: %s\n", libusb_error_name(result));
+			ztex_error("libusb_get_device_descriptor: %s\n",
+				libusb_error_name(result));
 			continue;
 		}
 
-		if (ZTEX_DEBUG) printf("ztex_scan_new_devices: USB %04x %04x\n",
-				desc.idVendor, desc.idProduct);
+		//if (ZTEX_DEBUG) printf("ztex_scan_new_devices: USB %04x %04x\n",
+		//		desc.idVendor, desc.idProduct);
 		if (desc.idVendor != ZTEX_IDVENDOR || desc.idProduct != ZTEX_IDPRODUCT)
 			continue;
 
-		if (ztex_find_by_usb_dev(dev_list, usb_dev)) {
+		if (ztex_find_by_usb_dev(dev_list, usb_dev))
 			continue;
-		}
 
+		// Open device. Requires access rights.
+		// On Windows device must not be opened by other process.
 		struct ztex_device *ztex_dev;
-		result = ztex_device_new(usb_dev, &ztex_dev);
-		if (result < 0)
-			continue;
+		int retry_num;
+		for (retry_num = 0; retry_num < ZTEX_OPEN_NUM_RETRIES; retry_num++) {
+			result_open = ztex_device_new(usb_dev, &ztex_dev);
+			if (result_open >= 0) {
+				break;
+			} else if (result_open == LIBUSB_ERROR_ACCESS) {
+				if (retry_num < ZTEX_OPEN_NUM_RETRIES - 1) {
+					usleep(ZTEX_OPEN_RETRY_WAIT * 1000);
+				} else {
+					num_fail_access++;
+					break;
+				}
+			} else {
+				num_fail_other++;
+				break;
+			}
+		}
 
 		// found new device
-		if (ZTEX_DEBUG) printf("ztex_scan_new_devices: SN %s productId: %d.%d\n",
-				ztex_dev->snString, ztex_dev->productId[0], ztex_dev->productId[1]);
-/* Check if device is supported by application - moved to application		
+		if (ZTEX_DEBUG) printf("found: SN %s productId: %d.%d\n",
+			ztex_dev->snString, ztex_dev->productId[0],
+			ztex_dev->productId[1]);
 
+		// Free file descriptor ASAP
 		// only 1.15y devices supported for now
-		if (ztex_dev->productId[0] == 10 && ztex_dev->productId[1] == 15) {
-			ztex_dev_list_add(new_dev_list, ztex_dev);
-			count++;
-		}
-		else {
-			if (ZTEX_DEBUG) printf("SN %s: unsupported type: %d.%d, skipping\n",
-				ztex_dev->productId[0], ztex_dev->productId[1], ztex_dev->snString);
+		if (ztex_dev->productId[0] != 10 || ztex_dev->productId[1] != 15) {
 			ztex_device_delete(ztex_dev);
-		}*/
+			continue;
+		}
+
+		if (dev_allow->count) {
+			// The board may have SN of unsupported format if firmware is
+			// not uploaded - skip check, proceed to firmware upload.
+			if (!ztex_sn_is_valid(ztex_dev->snString_orig)) {
+				if (ztex_firmware_is_ok(ztex_dev)) {
+					// This shouldn't happen (maybe hardware problem)
+					fprintf(stderr, "Error: firmware_is_ok, SN is of "
+						"unsupported format (%s), skipping\n",
+						ztex_dev->snString_orig);
+					ztex_device_delete(ztex_dev);
+					continue;
+				}
+			}
+			// SN or alias is not in the allowed list
+			else if (!list_check(dev_allow, ztex_dev->snString)
+				&& !(ztex_sn_alias_is_valid(ztex_dev->snString)
+					&& list_check(dev_allow, ztex_dev->snString_orig)) ) {
+				ztex_device_delete(ztex_dev);
+				continue;
+			}
+		}
+
+		result = libusb_claim_interface(ztex_dev->handle, 0);
+		if (result == LIBUSB_ERROR_BUSY) {
+			num_fail_busy++;
+			ztex_device_delete(ztex_dev);
+			continue;
+		} else if (result < 0) {
+			fprintf(stderr, "SN %s: usb_claim_interface error %d (%s)\n",
+				ztex_dev->snString, result,
+				libusb_error_name(result));
+			ztex_device_delete(ztex_dev);
+			continue;
+		}
+		ztex_dev->iface_claimed = 1;
+
 		ztex_dev_list_add(new_dev_list, ztex_dev);
 		count++;
 	}
-	
+
 	libusb_free_device_list(usb_devs, 1);
+
+	if (warn_open && (num_fail_access + num_fail_other)) {
+		fprintf(stderr, "Warning: unable to open %d board(s): ",
+			num_fail_access + num_fail_other);
+		if (!num_fail_other) {
+			fprintf(stderr, "insufficient permissions or "
+				"another instance of john running.\n");
+		} else {
+			fprintf(stderr, "%d insufficient permissions or "
+				"another instance of john running, %d ",
+				num_fail_access, num_fail_other);
+			if (num_fail_other == 1)
+				fprintf(stderr, "error %d: %s\n",
+					result_open, libusb_error_name(result_open));
+			else
+				fprintf(stderr, "other errors, last error: %d %s\n",
+					result_open, libusb_error_name(result_open));
+		}
+	}
+
+	if (warn_open && num_fail_busy)
+		fprintf(stderr, "Warning: unable to claim interfaces of "
+			"%d board(s): another instance of john running.\n",
+			num_fail_busy);
+
 	return count;
 }
 
@@ -541,7 +646,7 @@ int ztex_configureFpgaHS(struct ztex_device *dev, FILE *fp, int endpointHS)
 				dev->snString, result, libusb_error_name(result));
 		return result;
 	}
-	
+
 	rewind(fp);
 	do {
 		int length = fread(buf, 1, transactionBytes, fp);
@@ -553,7 +658,7 @@ int ztex_configureFpgaHS(struct ztex_device *dev, FILE *fp, int endpointHS)
 		result = libusb_bulk_transfer(dev->handle, endpointHS, buf, length, &transferred, USB_RW_TIMEOUT);
 		if (result < 0) {
 			ztex_error("SN %s: usb_bulk_write returns %d (%s)\n",
-					dev->snString, result, libusb_error_name(result));			
+					dev->snString, result, libusb_error_name(result));
 			return result;
 		}
 		if (transferred != length) {
@@ -562,7 +667,7 @@ int ztex_configureFpgaHS(struct ztex_device *dev, FILE *fp, int endpointHS)
 			return -1;
 		}
 	} while ( !feof(fp) );
-	
+
 	// VC 0x35: finishHSFPGAConfiguration
 	result = vendor_command(dev->handle, 0x35, 0, 0, NULL, 0);
 	if (result < 0) {
@@ -571,23 +676,14 @@ int ztex_configureFpgaHS(struct ztex_device *dev, FILE *fp, int endpointHS)
 		return result;
 	}
 
-	if (ZTEX_DEBUG) {
-		result = ztex_getFpgaState(dev, &fpga_state);
-		printf("%s End HS config: ", dev->snString);
-		ztex_printFpgaState(&fpga_state);	
-		if (!fpga_state.fpgaConfigured) {
-			printf("UNCONFIGURED!\n");
-			return -1;
-		}
-	}
-
 	return 0;
 }
 
 // upload bitstream (High-Speed) on every FPGA in the device
 int ztex_upload_bitstream(struct ztex_device *dev, FILE *fp)
 {
- 	unsigned char settings[2];
+#if 0
+	unsigned char settings[2];
 	int result;
 
 	// VR 0x33: getHSFpgaSettings
@@ -600,20 +696,34 @@ int ztex_upload_bitstream(struct ztex_device *dev, FILE *fp)
 	int endpointHS = settings[0];
 	int interfaceHS = settings[1];
 	if (endpointHS <= 0 || interfaceHS < 0) {
-		ztex_error("SN %s: invalid HS Fpga Settings\n",
-				dev->snString, result, libusb_error_name(result));
+		ztex_error("SN %s: invalid High-Speed FPGA settings %d, %d\n",
+				dev->snString, endpointHS, interfaceHS);
 		return -1;
 	}
+#endif
 
-	// device_new() from inouttraffic performs claim_interface()
-	int i;
+	const int num_retries = 3;
+	struct ztex_fpga_state fpga_state;
+	int result;
+	int i, retry_num;
+
 	for (i = 0; i < dev->num_of_fpgas; i++) {
 		result = ztex_select_fpga(dev,i);
 		if (result < 0)
 			return result;
-		result = ztex_configureFpgaHS(dev, fp, endpointHS);
-		if (result < 0)
-			return result;
+		for (retry_num = 0; retry_num < num_retries; retry_num++) {
+			result = ztex_configureFpgaHS(dev, fp, ZTEX_ENDPOINT_HS);
+			if (result < 0)
+				return result;
+			result = ztex_getFpgaState(dev, &fpga_state);
+			if (result < 0)
+				return result;
+			if (fpga_state.fpgaConfigured)
+				break;
+			if (retry_num == num_retries - 1)
+				return -1;
+			usleep(200000);
+		}
 	}
 
 	return 1;
@@ -642,7 +752,7 @@ short hex_byte(char *str)
 	return result & 0xff;
 }
 
-const int IHX_SIZE_MAX = 65536;
+static const int IHX_SIZE_MAX = 65536;
 
 int ihx_load_data(struct ihx_data *ihx_data, FILE *fp)
 {
@@ -661,14 +771,14 @@ int ihx_load_data(struct ihx_data *ihx_data, FILE *fp)
 		ztex_error("ihx_load_data: empty ihx file\n");
 		return -1;
 	}
-	
+
 	rewind(fp);
 	char *file_data = malloc(file_size);
 	if (!file_data) {
-		ztex_error("ihx_load_data: malloc(%d) failed\n", file_size);
+		ztex_error("ihx_load_data: malloc(%ld) failed\n", file_size);
 		return -1;
 	}
-	
+
 	int offset = 0;
 	do {
 		int length = fread(file_data + offset, 1, file_size, fp);
@@ -690,14 +800,14 @@ int ihx_load_data(struct ihx_data *ihx_data, FILE *fp)
 		}
 		i++;
 		line++;
-		
+
 		len = hex_byte(file_data + i); // length field
 		if (len == -1) {
 			ztex_error("ihx_load_data: line %d: invalid len\n", line);
 			return -1;
 		}
 		cs = len;
-		
+
 		b = hex_byte(file_data + i + 2); // address field
 		if (b == -1) {
 			ztex_error("ihx_load_data: line %d: invalid address byte 0\n", line);
@@ -712,27 +822,28 @@ int ihx_load_data(struct ihx_data *ihx_data, FILE *fp)
 		}
 		cs += b;
 		addr |= b;
-		
+
 		type = hex_byte(file_data + i + 6); // type field
 		if (type == -1) {
 			ztex_error("ihx_load_data: line %d: invalid type\n", line);
 			return -1;
 		}
 		cs += type;
-		
+
 		int j;
 		for (j = 0; j < len; j++) { // data
 			buf[j] = hex_byte(file_data + i + j*2 + 8);
 			cs += buf[j];
 		}
-		
-		cs += hex_byte(file_data + i + j*2 + 8); // checksum
-		if ( (cs & 0xff) != 0 ) {
-			ztex_error("ihx_load_data: line %d: wrong checksum %d\n", line, cs);
+
+		int cs_byte = hex_byte(file_data + i + j*2 + 8); // checksum byte
+		if ( ((cs + cs_byte) & 0xff) != 0 ) {
+			ztex_error("ihx_load_data: line %d: wrong checksum byte 0x%02X"
+				" (must be 0x%02X)\n", line, cs_byte, 0x100 - (cs & 0xff) );
 			return -1;
 		}
 		i += j*2 + 10;
-		
+
 		if (type == 0) { // common data
 			int k;
 			for (k = 0; k < len; k++) {
@@ -764,8 +875,8 @@ int ztex_reset_cpu(struct ztex_device *dev, int r)
 {
 	unsigned char buf[1] = { r };
 	int result = vendor_command(dev->handle, 0xA0, 0xE600, 0, buf, 1);
-	// Don't return error on r==0 && LIBUSB_ERR_NO_DEVICE
-	if (result < 0 && !(result == -4 && !r) ) {
+	// Don't return error on r==0 && LIBUSB_ERROR_NO_DEVICE
+	if (result < 0 && !(result == LIBUSB_ERROR_NO_DEVICE && !r) ) {
 		ztex_error("SN %s: ztex_reset_cpu(%d) returns %d (%s)\n",
 				dev->snString, r, result, libusb_error_name(result));
 		return result;
@@ -783,7 +894,7 @@ int ztex_firmware_upload_ihx(struct ztex_device *dev, struct ihx_data *ihx_data)
 	const int transactionBytes = 4096;
 	unsigned char buf[transactionBytes];
 	int result;
-	
+
 	result = ztex_reset_cpu(dev, 1);
 	if (result < 0)
 		return -1;
@@ -820,7 +931,7 @@ int ztex_firmware_upload_ihx(struct ztex_device *dev, struct ihx_data *ihx_data)
 				write_len ++;
 			}
 		}
-		
+
 		result = vendor_command(dev->handle, 0xA0, i, 0, buf, write_len);
 		//printf("ztex_upload_firmware: offset %d, send %d data %d result %d\n", i, write_len, buf[0], result);
 		if (result < 0) {
@@ -836,7 +947,7 @@ int ztex_firmware_upload_ihx(struct ztex_device *dev, struct ihx_data *ihx_data)
 		uploaded += j;
 		i += j;
 	} // for ( i < IHX_SIZE_MAX; )
-	
+
 	if (ZTEX_DEBUG) printf("SN %s uploaded %d bytes\n",
 			dev->snString, uploaded);
 
@@ -849,12 +960,12 @@ int ztex_firmware_upload_ihx(struct ztex_device *dev, struct ihx_data *ihx_data)
 	return 0;
 }
 
-int ztex_firmware_upload(struct ztex_device *dev, const char *filename)
+int ztex_firmware_upload(struct ztex_device *dev, char *filename)
 {
 	int result;
 	FILE *fp;
-	if ( !(fp = fopen(filename, "r")) ) {
-		printf("fopen(%s): %s\n", filename, strerror(errno));
+	if ( !(fp = fopen(path_expand(filename), "r")) ) {
+		printf("fopen(%s): %s\n", path_expand(filename), strerror(errno));
 		return -1;
 	}
 	if (ZTEX_DEBUG) {
@@ -867,7 +978,7 @@ int ztex_firmware_upload(struct ztex_device *dev, const char *filename)
 	if (result < 0) {
 		return -1;
 	}
-	
+
 	result = ztex_firmware_upload_ihx(dev, &ihx_data);
 	return result;
 }
@@ -876,7 +987,7 @@ void ztex_device_reset(struct ztex_device *dev)
 {
 	if (!dev->handle)
 		return;
-	
+
 	if (ztex_reset_cpu(dev, 1) < 0)
 		return;
 	ztex_reset_cpu(dev, 0);

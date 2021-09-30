@@ -17,9 +17,9 @@
 #ifndef _JTR_JUMBO_H
 #define _JTR_JUMBO_H
 
-// use this define in some core (master) code, to be able to more cleanly insert code
-// leaving the master code more intact for easier merging of changes Solar gives us.
-#define JUMBO_JTR  1
+#ifndef __STDC_FORMAT_MACROS
+#define __STDC_FORMAT_MACROS
+#endif
 
 #include "arch.h"
 #include <stdio.h>
@@ -38,7 +38,20 @@
 #define HAVE__ATOI64 1
 #endif
 
-#include "stdint.h"
+#include <stdint.h>
+#if (!AC_BUILT || HAVE_INTTYPES_H) && ! defined(_MSC_VER)
+#include <inttypes.h>
+#else
+#ifndef PRIx64
+#define PRIx64    "llx"
+#endif
+#ifndef PRIu64
+#define PRIu64    "llu"
+#endif
+#ifndef PRId64
+#define PRId64    "lld"
+#endif
+#endif
 
 /******************************************/
 /* here we try to 'find' a usable fseek64 */
@@ -80,15 +93,15 @@
 // back to using fseek (and warn the user)
 #if defined (__CYGWIN32__) && !defined (__CYGWIN64__)
    extern  int fseeko64 (FILE* stream, int64_t offset, int whence);
-#  define jtr_fseek64 fseeko64
+  #define jtr_fseek64 fseeko64
 #elif defined (__CYGWIN64__)
    extern  int fseeko (FILE* stream, int64_t offset, int whence);
-#  define jtr_fseek64 fseeko
+  #define jtr_fseek64 fseeko
 #else
-#  if defined(__GNUC__) && defined (AC_BUILT)
-#    warning Using 32-bit fseek(). Files larger than 2GB will be handled unreliably
-#  endif
-#  define jtr_fseek64 fseek
+  #if defined(__GNUC__) && defined (AC_BUILT)
+    #warning Using 32-bit fseek(). Files larger than 2GB will be handled unreliably
+  #endif
+  #define jtr_fseek64 fseek
 #endif
 
 #endif /* fseek */
@@ -122,15 +135,15 @@
 // back to using ftell (and warn the user)
 #if defined (__CYGWIN32__) && !defined (__CYGWIN64__)
    extern  int64_t ftello64 (FILE* stream);
-#  define jtr_ftell64 ftello64
+  #define jtr_ftell64 ftello64
 #elif defined (__CYGWIN64__)
    extern  int64_t ftello (FILE* stream);
-#  define jtr_ftell64 ftello
+  #define jtr_ftell64 ftello
 #else
-#  if defined(__GNUC__) && defined (AC_BUILT)
-#    warning Using 32-bit ftell(). Files larger than 2GB will be handled unreliably
-#  endif
-#  define jtr_ftell64 ftell
+  #if defined(__GNUC__) && defined (AC_BUILT)
+    #warning Using 32-bit ftell(). Files larger than 2GB will be handled unreliably
+  #endif
+  #define jtr_ftell64 ftell
 #endif
 
 #endif /* ftell */
@@ -139,13 +152,13 @@
 /* here we figure out if we use fopen or fopen64 */
 /*************************************************/
 #if SIZEOF_LONG == 8
-#  define jtr_fopen fopen
+  #define jtr_fopen fopen
 #elif HAVE_FOPEN64
-#  define jtr_fopen fopen64
+  #define jtr_fopen fopen64
 #elif HAVE__FOPEN64
-#  define jtr_fopen _fopen64
+  #define jtr_fopen _fopen64
 #else
-#  define jtr_fopen fopen
+  #define jtr_fopen fopen
 #endif
 #if __CYGWIN32__ || _MSC_VER
    extern  FILE *_fopen64 (const char *Fname, const char *type);
@@ -212,7 +225,7 @@ extern void *memmem(const void *haystack, size_t haystack_len,
 // We configure search for unix sleep(seconds) function, MSVC and MinGW do not have this,
 // so we replicate it with Win32 Sleep(ms) function.
 #if (AC_BUILT && !HAVE_SLEEP) || (!AC_BUILT && (_MSC_VER || __MINGW32__ || __MINGW64__))
-extern int sleep(int i);
+extern unsigned int sleep(unsigned int i);
 #endif
 
 #if !AC_BUILT
@@ -283,6 +296,8 @@ extern long long jtr_atoll(const char *);
 #endif
 #endif
 
+void memcpylwr(char *, const char *, size_t);
+
 #if (__MINGW32__ || __MINGW64__) && __STRICT_ANSI__
 // since we added -std=c99 for Mingw builds (to handle printf/scanf %xxx specifiers better),
 // we had to make some 'changes'. Mostly, some of the string types are undeclared (but will
@@ -316,6 +331,11 @@ extern int fileno(FILE *);
 #define strlwr _strlwr
 #define open _open
 #define fdopen _fdopen
+#pragma warning(disable: 4244) // possible loss of data
+#pragma warning(disable: 4334) // 32 bit shift implictly converted to 64 bits
+#pragma warning(disable: 4133) // function imcompatible types
+#pragma warning(disable: 4146) // unary minus applied to unsigned
+#pragma warning(disable: 4715) // not all control paths return a value
 #endif
 
 #if (AC_BUILT && !HAVE_SNPRINTF && HAVE_SPRINTF_S) || (!AC_BUILT && _MSC_VER)
@@ -329,8 +349,14 @@ extern int fileno(FILE *);
 // blindly use these for VC.  For VC, they are used to work around many
 // red-herring compiler warnings
 #undef snprintf
+#if _MSC_VER < 1900
+// note, in VC 2015, snprintf was fixed to be POSIX compliant. The legacy _snprintf function
+// starting at at VC 2015 is no longer the same as snprintf (as it was prior).  The _snprintf
+// was kept at the legacy problematic manner, while snprintf now 'works' properly.
+// _MSC_VER == 1900 is the key for VC 2015
 #define snprintf(str, size, ...) vc_fixed_snprintf((str), (size), __VA_ARGS__)
 extern int vc_fixed_snprintf(char *Dest, size_t max_cnt, const char *Fmt, ...);
+#endif
 #undef alloca
 #define alloca _alloca
 #undef unlink
@@ -407,5 +433,11 @@ char *strcasestr(const char *haystack, const char *needle);
  * On failure, returns -1.
  */
 extern int check_pkcs_pad(const unsigned char* data, size_t len, int blocksize);
+
+/*
+ * Replace, in-place, any instance of 'c' within string with 'n'.
+ * If 'n' is null, skip any 'c' but continue copying.
+ */
+extern char *replace(char *string, char c, char n);
 
 #endif /* _JTR_JUMBO_H */

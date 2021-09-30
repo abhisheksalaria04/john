@@ -1,6 +1,7 @@
 /*
  * This file is part of John the Ripper password cracker,
- * Copyright (c) 1996-2003,2006,2011 by Solar Designer
+ * Copyright (c) 1996-2003,2006,2011,2019 by Solar Designer
+ * Copyright (c) 2015,2017 by magnum
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted.
@@ -28,8 +29,9 @@
 #define DES_xor_key2			_DES_xor_key2
 #define MD5_body			_MD5_body
 #define BF_body				_BF_body
-#define BF_body_generic     _BF_body_generic
+#define BF_body_generic     		_BF_body_generic
 #define BF_current			_BF_current
+#define CPU_req_name			_CPU_req_name
 #define CPU_detect			_CPU_detect
 #endif
 
@@ -1294,13 +1296,23 @@ BF_body:
  */
 
 #define EF_ID				$0x00200000
+
+/* Leaf 1 */
 #define CF_MMX				$0x00800000
-#define CF_SSE2				$0x04000000
-#define CF_SSSE3			$0x00000200 /* SSSE3 */
-#define CF_SSE4_1			$0x00080200 /* SSE4.1 + SSSE3 */
+#define CF_SSE2				$0x04000000 /* SSE2 (edx) */
+#define CF_SSSE3			$0x00000200 /* SSSE3 (ecx) */
+#define CF_SSE4_1			$0x00080200 /* + SSE4.1 (ecx) */
+#define CF_SSE4_2			$0x00180200 /* + SSE4.2 (ecx) */
 #define CF_XSAVE_OSXSAVE_AVX		$0x1C000000
-#define CF_XOP				$0x00000800
-#define CF_AVX2				$0x1C401000 /* Quick and dirty */
+
+/* Extended features */
+#define CX_XOP				$0x00000800
+
+/* Leaf 7 */
+#define C7_AVX2				$0x00000020 /* AVX2 (ebx) */
+#define C7_AVX512F			$0x00010020 /* + AVX512F (ebx) */
+#define C7_AVX512BW			$0x40010020 /* + AVX512BW (ebx) */
+
 /* "GenuineIntel" */
 #define CV_INTEL			$0x6C65746E
 /* "AuthenticAMD" */
@@ -1314,6 +1326,12 @@ BF_body:
 #define cpuid \
 	.byte 0x0F; \
 	.byte 0xA2
+#endif
+
+#ifdef CPU_NAME
+.globl CPU_req_name
+CPU_req_name:
+	.asciz CPU_NAME
 #endif
 
 .globl CPU_detect
@@ -1337,25 +1355,34 @@ CPU_detect:
 	testl %eax,%eax
 	jz CPU_detect_ret		/* Newer 486s */
 	pushl %ecx
-#if CPU_REQ_AVX2 || CPU_REQ_SSE4_1 || CPU_REQ_SSSE3
-	movl $1,%eax
+/* Leaf 7 checks */
+#if CPU_REQ_AVX2 || CPU_REQ_AVX512F || CPU_REQ_AVX512BW
+	xorl %eax,%eax
 	cpuid
-#if CPU_REQ_AVX2
-	andl CF_AVX2,%ecx
-	cmpl CF_AVX2,%ecx
-#elif CPU_REQ_SSE4_1
-	andl CF_SSE4_1,%ecx
-	cmpl CF_SSE4_1,%ecx
-#elif CPU_REQ_SSSE3
-	andl CF_SSSE3,%ecx
-	cmpl CF_SSSE3,%ecx
+	movl $7,%edx
+	cmpl %edx,%eax
+	jl CPU_detect_fail
+	xchgl %edx,%eax
+	xorl %ecx,%ecx
+	cpuid
+#if CPU_REQ_AVX512BW
+	andl C7_AVX512BW,%ebx
+	cmpl C7_AVX512BW,%ebx
+#elif CPU_REQ_AVX512F
+	andl C7_AVX512F,%ebx
+	cmpl C7_AVX512F,%ebx
+#elif CPU_REQ_AVX2
+	andl C7_AVX2,%ebx
+	cmpl C7_AVX2,%ebx
 #endif
 	je CPU_detect_cont
+CPU_detect_fail:
 	popl %ecx
 	xorl %eax,%eax
 	jmp CPU_detect_ret
 CPU_detect_cont:
 #endif
+/* Leaf 1 checks */
 	movl $1,%eax
 	cpuid
 #if defined(CPU_REQ_AVX) || defined(CPU_REQ_XOP)
@@ -1387,7 +1414,7 @@ CPU_detect_AVX:
 	jl CPU_detect_no_XOP
 	xchgl %edx,%eax
 	cpuid
-	testl CF_XOP,%ecx
+	testl CX_XOP,%ecx
 	jnz CPU_detect_XOP
 CPU_detect_no_XOP:
 	popl %edx
@@ -1396,6 +1423,25 @@ CPU_detect_no_XOP:
 CPU_detect_XOP:
 	popl %edx
 	popl %eax
+#endif
+#if CPU_REQ_SSE4_2 || CPU_REQ_SSE4_1 || CPU_REQ_SSSE3
+	movl $1,%eax
+	cpuid
+#if CPU_REQ_SSE4_2
+	andl CF_SSE4_2,%ecx
+	cmpl CF_SSE4_2,%ecx
+#elif CPU_REQ_SSE4_1
+	andl CF_SSE4_1,%ecx
+	cmpl CF_SSE4_1,%ecx
+#elif CPU_REQ_SSSE3
+	andl CF_SSSE3,%ecx
+	cmpl CF_SSSE3,%ecx
+#endif
+	je CPU_detect_end_of_jumbo
+	popl %ecx
+	xorl %eax,%eax
+	jmp CPU_detect_ret
+CPU_detect_end_of_jumbo:
 #endif
 	popl %ecx
 #if DES_BS_VECTOR >= 4

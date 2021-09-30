@@ -28,6 +28,7 @@
  */
 
 #include <string.h>
+#include <stdint.h>
 
 #include "common.h"
 #include "arch.h"
@@ -38,10 +39,8 @@
 #include "encoding_data.h"
 #include "misc.h"
 #include "config.h"
-#include "stdint.h"
 #include "md4.h"
 #include "john.h"
-#include "memdbg.h"
 
 UTF16 ucs2_upcase[0x10000];
 UTF16 ucs2_downcase[0x10000];
@@ -59,11 +58,11 @@ static int UnicodeType = -1;
 static int UnicodeInited = 0;
 #endif
 
-/*
- * This is used by single.c for determining that a character is a letter
- */
 UTF8 CP_isLetter[0x100];
 UTF8 CP_isSeparator[0x100];
+UTF8 CP_isUpper[0x100];
+UTF8 CP_isLower[0x100];
+UTF8 CP_isDigit[0x100];
 
 #if ARCH_LITTLE_ENDIAN
 #define BE_FIX(a) a
@@ -346,7 +345,7 @@ int enc_to_utf16(UTF16 *dst, unsigned int maxdstlen, const UTF8 *src,
                  unsigned int srclen)
 {
 #ifndef UNICODE_NO_OPTIONS
-	if (options.target_enc != UTF_8) {
+	if ((options.target_enc ? options.target_enc : options.input_enc) != UTF_8) {
 		int i, trunclen = (int)srclen;
 		if (trunclen > maxdstlen)
 			trunclen = maxdstlen;
@@ -373,7 +372,7 @@ int enc_to_utf16(UTF16 *dst, unsigned int maxdstlen, const UTF8 *src,
 #endif
 }
 
-static inline int cp_to_utf16(UTF16 *dst, unsigned int maxdstlen,
+inline static int cp_to_utf16(UTF16 *dst, unsigned int maxdstlen,
                               const UTF8 *src, unsigned int srclen)
 {
 	int i, trunclen = (int)srclen;
@@ -404,7 +403,7 @@ int enc_to_utf16_be(UTF16 *dst, unsigned int maxdstlen, const UTF8 *src,
                     unsigned int srclen)
 {
 #ifndef UNICODE_NO_OPTIONS
-	if (options.target_enc != UTF_8) {
+	if ((options.target_enc ? options.target_enc : options.input_enc) != UTF_8) {
 		int i, trunclen = (int)srclen;
 		if (trunclen > maxdstlen)
 			trunclen = maxdstlen;
@@ -428,6 +427,17 @@ int enc_to_utf16_be(UTF16 *dst, unsigned int maxdstlen, const UTF8 *src,
 #ifndef UNICODE_NO_OPTIONS
 	}
 #endif
+}
+
+/*
+ * Strlen of UTF-32 (in 32-bit words, not octets).
+ */
+inline unsigned int strlen32(const UTF32 *str)
+{
+	unsigned int len = 0;
+	while (*str++ != 0)
+		len++;
+	return len;
 }
 
 /*
@@ -476,6 +486,26 @@ inline unsigned int strlen8(const UTF8 *source)
 			break;
 	}
 	return targetLen;
+}
+
+/*
+ * Return length (in characters) of a string, best-effort.
+ * For a fully valid UTF-8 string, return number of characters.
+ * If the string contains invalid UTF-8, just count bytes from that point.
+ */
+inline size_t strlen_any(const void *source)
+{
+	const UTF8 *src = source;
+	int len;
+
+	len = strlen8(src);
+	if (len < 0) {
+		size_t extra;
+		len = -len;
+		extra = strlen(&((char*)source)[len + 1]);
+		len += extra;
+	}
+	return len;
 }
 
 /* Check if a string is valid UTF-8 */
@@ -541,7 +571,7 @@ int E_md4hash(const UTF8 *passwd, unsigned int len, unsigned char *p16)
 
 	/* Password is converted to UTF-16LE */
 	trunclen = enc_to_utf16(wpwd, PLAINTEXT_BUFFER_SIZE, passwd, len);
-	if(trunclen < 0)
+	if (trunclen < 0)
 		len = strlen16(wpwd); /* From UTF-8 you can't know */
 	else
 		len = trunclen;
@@ -645,16 +675,15 @@ char *utf8_to_enc_r(UTF8 *src, char *dst, int dstlen)
 /*
  * Thread-safe conversion from codepage to UTF-8.
  */
-char *cp_to_utf8_r(char *src, char *dst, int dstlen)
+char *cp_to_utf8_r(const char *src, char *dst, int dstlen)
 {
 	UTF16 tmp16[LINE_BUFFER_SIZE + 1];
 
-	cp_to_utf16(tmp16, LINE_BUFFER_SIZE, (unsigned char*)src,
-	             strlen(src));
+	cp_to_utf16(tmp16, LINE_BUFFER_SIZE, (unsigned char*)src, strlen(src));
 	return (char*)utf16_to_utf8_r((UTF8*)dst, dstlen, tmp16);
 }
 
-static inline UTF8 *utf16_to_cp_r(UTF8 *dst, int dst_len, const UTF16 *source)
+inline static UTF8 *utf16_to_cp_r(UTF8 *dst, int dst_len, const UTF16 *source)
 {
 	UTF8 *tgt = dst;
 	UTF8 *targetEnd = tgt + dst_len;
@@ -678,12 +707,11 @@ static inline UTF8 *utf16_to_cp_r(UTF8 *dst, int dst_len, const UTF16 *source)
 /*
  * Thread-safe conversion from UTF-8 to codepage
  */
-char *utf8_to_cp_r(char *src, char *dst, int dstlen)
+char *utf8_to_cp_r(const char *src, char *dst, int dstlen)
 {
 	UTF16 tmp16[LINE_BUFFER_SIZE + 1];
 
-	utf8_to_utf16(tmp16, LINE_BUFFER_SIZE, (UTF8*)src,
-	              strlen(src));
+	utf8_to_utf16(tmp16, LINE_BUFFER_SIZE, (UTF8*)src, strlen(src));
 	utf16_to_cp_r((UTF8*)dst, dstlen, tmp16);
 	return (char*)dst;
 }
@@ -701,6 +729,29 @@ char *utf16_to_cp(const UTF16 *source)
 }
 
 /*
+ * Convert UTF-16BE to codepage.
+ * This is not optimized as it's only used in get_key() as of now.
+ * Non thread-safe version.
+ */
+UTF8 *utf16_be_to_enc(const UTF16 *source)
+{
+	static UTF8 ret_Key[PLAINTEXT_BUFFER_SIZE + 1];
+	UTF16 swapped[PLAINTEXT_BUFFER_SIZE + 1];
+	const UTF16 *s = source;
+	UTF16 c, *d = swapped;
+
+	do {
+		c = *s++;
+#if ARCH_LITTLE_ENDIAN
+		c = (c >> 8) | (UTF16)(c << 8);
+#endif
+		*d++ = c;
+	} while (c);
+
+	return utf16_to_enc_r(ret_Key, PLAINTEXT_BUFFER_SIZE, swapped);
+}
+
+/*
  * Convert UTF-16LE to codepage.
  * This is not optimized as it's only used in get_key() as of now.
  * Non thread-safe version.
@@ -715,7 +766,7 @@ UTF8 *utf16_to_enc(const UTF16 *source)
 UTF8 *utf16_to_enc_r(UTF8 *dst, int dst_len, const UTF16 *source)
 {
 #ifndef UNICODE_NO_OPTIONS
-	if (options.target_enc == UTF_8)
+	if ((options.target_enc ? options.target_enc : options.input_enc) == UTF_8)
 #endif
 		return utf16_to_utf8_r(dst, dst_len, source);
 #ifndef UNICODE_NO_OPTIONS
@@ -725,7 +776,7 @@ UTF8 *utf16_to_enc_r(UTF8 *dst, int dst_len, const UTF16 *source)
 }
 
 /* UTF-32 functions */
-static inline UTF8 *utf32_to_utf8(UTF8 *dst, int dst_len, const UTF32 *source)
+inline static UTF8 *utf32_to_utf8(UTF8 *dst, int dst_len, const UTF32 *source)
 {
 	UTF8 *tpt = dst;
 	UTF8 *targetEnd = tpt + dst_len;
@@ -763,8 +814,8 @@ static inline UTF8 *utf32_to_utf8(UTF8 *dst, int dst_len, const UTF32 *source)
 	return dst;
 }
 
-static inline int utf8_to_utf32(UTF32 *target, unsigned int len,
-                                const UTF8 *source, unsigned int sourceLen)
+inline int utf8_to_utf32(UTF32 *target, unsigned int len,
+                         const UTF8 *source, unsigned int sourceLen)
 {
 	const UTF32 *targetStart = target;
 	const UTF32 *targetEnd = target + len;
@@ -826,7 +877,7 @@ static inline int utf8_to_utf32(UTF32 *target, unsigned int len,
 	return (target - targetStart);
 }
 
-static inline UTF8 *utf32_to_cp(UTF8 *dst, int dst_len, const UTF32 *source)
+inline static UTF8 *utf32_to_cp(UTF8 *dst, int dst_len, const UTF32 *source)
 {
 	UTF8 *tgt = dst;
 	UTF8 *targetEnd = tgt + dst_len;
@@ -840,7 +891,7 @@ static inline UTF8 *utf32_to_cp(UTF8 *dst, int dst_len, const UTF32 *source)
 	return dst;
 }
 
-static inline int cp_to_utf32(UTF32 *dst, unsigned int maxdstlen, const UTF8 *src,
+inline static int cp_to_utf32(UTF32 *dst, unsigned int maxdstlen, const UTF8 *src,
                               unsigned int srclen)
 {
 	int i, trunclen = (int)srclen;
@@ -860,7 +911,7 @@ int enc_to_utf32(UTF32 *dst, unsigned int maxdstlen, const UTF8 *src,
                  unsigned int srclen)
 {
 #ifndef UNICODE_NO_OPTIONS
-	if (options.target_enc != UTF_8)
+	if ((options.target_enc ? options.target_enc : options.input_enc) != UTF_8)
 		return cp_to_utf32(dst, maxdstlen, src, srclen);
 	else
 #endif
@@ -870,7 +921,7 @@ int enc_to_utf32(UTF32 *dst, unsigned int maxdstlen, const UTF8 *src,
 UTF8 *utf32_to_enc(UTF8 *dst, int dst_len, const UTF32 *source)
 {
 #ifndef UNICODE_NO_OPTIONS
-	if (options.target_enc == UTF_8)
+	if ((options.target_enc ? options.target_enc : options.input_enc) == UTF_8)
 #endif
 		return utf32_to_utf8(dst, dst_len, source);
 #ifndef UNICODE_NO_OPTIONS
@@ -921,7 +972,7 @@ void listEncodings(FILE *fd)
 	        "CP1250, CP1251, CP1252, CP1253, CP1254, CP1255, CP1256\n");
 }
 
-static char *enc_name[] = { "UNDEF", "ASCII", "CP437", "CP720", "CP737",
+static char *enc_name[] = { "UNDEF", "RAW", "CP437", "CP720", "CP737",
                             "CP850", "CP852", "CP858", "CP866", "CP868",
                             "CP1250", "CP1251", "CP1252", "CP1253", "CP1254",
                             "CP1255", "CP1256", "ISO-8859-1",
@@ -938,7 +989,7 @@ char *cp_id2name(int encoding)
 	error();
 }
 
-static char *enc_macro[] = { "UNDEF", "ASCII", "CP437", "CP720", "CP737",
+static char *enc_macro[] = { "UNDEF", "ENC_RAW", "CP437", "CP720", "CP737",
                              "CP850", "CP852", "CP858", "CP866", "CP868",
                              "CP1250", "CP1251", "CP1252", "CP1253", "CP1254",
                              "CP1255", "CP1256", "ISO_8859_1",
@@ -956,12 +1007,13 @@ char *cp_id2macro(int encoding)
 }
 
 /* Convert encoding name to numerical ID */
-int cp_name2id(char *encoding)
+int cp_name2id(const char *encoding, int error_exit)
 {
+	const char *orig_arg = encoding;
 	char enc[16] = "";
 	char *d = enc;
 
-	if (!encoding)
+	if (!encoding || !encoding[0])
 		return CP_UNDEF;
 	if (strlen(encoding) > sizeof(enc))
 		goto err;
@@ -971,13 +1023,17 @@ int cp_name2id(char *encoding)
 		encoding += 4;
 	else if (!strncasecmp(encoding, "iso", 3))
 		encoding += 3;
+	/* Strip cp prefix */
+	else if (!strncasecmp(encoding, "cp", 2))
+		encoding += 2;
 
 	/* Lowercase */
-	while (*encoding)
-	if (*encoding >= 'A' && *encoding <= 'Z')
-		*d++ = *encoding++ | 0x20;
-	else
-		*d++ = *encoding++;
+	do {
+		if (*encoding >= 'A' && *encoding <= 'Z')
+			*d++ = *encoding++ | 0x20;
+		else
+			*d++ = *encoding++;
+	} while (*encoding);
 
 	/* Now parse this canonical format */
 	if (!strcmp(enc, "utf8") || !strcmp(enc, "utf-8"))
@@ -999,58 +1055,61 @@ int cp_name2id(char *encoding)
 	if (!strcmp(enc, "koi8r") || !strcmp(enc, "koi8-r"))
 		return KOI8_R;
 	else
-	if (!strcmp(enc, "cp437"))
+	if (!strcmp(enc, "437"))
 		return CP437;
 	else
-	if (!strcmp(enc, "cp720"))
+	if (!strcmp(enc, "720"))
 		return CP720;
 	else
-	if (!strcmp(enc, "cp737"))
+	if (!strcmp(enc, "737"))
 		return CP737;
 	else
-	if (!strcmp(enc, "cp850"))
+	if (!strcmp(enc, "850"))
 		return CP850;
 	else
-	if (!strcmp(enc, "cp852"))
+	if (!strcmp(enc, "852"))
 		return CP852;
 	else
-	if (!strcmp(enc, "cp858"))
+	if (!strcmp(enc, "858"))
 		return CP858;
 	else
-	if (!strcmp(enc, "cp866"))
+	if (!strcmp(enc, "866"))
 		return CP866;
 	else
-	if (!strcmp(enc, "cp868"))
+	if (!strcmp(enc, "868"))
 		return CP868;
 	else
-	if (!strcmp(enc, "cp1250"))
+	if (!strcmp(enc, "1250"))
 		return CP1250;
 	else
-	if (!strcmp(enc, "cp1251"))
+	if (!strcmp(enc, "1251"))
 		return CP1251;
 	else
-	if (!strcmp(enc, "cp1252"))
+	if (!strcmp(enc, "1252"))
 		return CP1252;
 	else
-	if (!strcmp(enc, "cp1253"))
+	if (!strcmp(enc, "1253"))
 		return CP1253;
 	else
-	if (!strcmp(enc, "cp1254"))
+	if (!strcmp(enc, "1254"))
 		return CP1254;
 	else
-	if (!strcmp(enc, "cp1255"))
+	if (!strcmp(enc, "1255"))
 		return CP1255;
 	else
-	if (!strcmp(enc, "cp1256"))
+	if (!strcmp(enc, "1256"))
 		return CP1256;
 	else
 	if (!strcmp(enc, "raw") || !strcmp(enc, "ascii"))
-		return ASCII;
+		return ENC_RAW;
 
  err:
-	fprintf(stderr, "Invalid encoding. Supported encodings:\n");
-	listEncodings(stderr);
-	error();
+	if (error_exit) {
+		fprintf(stderr, "Invalid encoding '%s'. Supported encodings:\n", orig_arg);
+		listEncodings(stderr);
+		error();
+	} else
+		return CP_UNDEF;
 }
 
 int cp_class(int encoding)
@@ -1070,13 +1129,13 @@ void initUnicode(int type)
 {
 	unsigned i, j;
 #ifndef UNICODE_NO_OPTIONS
-	unsigned char *cpU, *cpL, *Sep, *Letter;
+	unsigned char *cpU, *cpL, *Sep, *Letter, *Digit;
 	unsigned char *pos;
 	int encoding;
 
 	/* Default to core John's behavior */
 	if (!options.input_enc) {
-		options.input_enc = ASCII;
+		options.input_enc = ENC_RAW;
 		options.default_enc = 1;
 	}
 
@@ -1101,7 +1160,7 @@ void initUnicode(int type)
 	if (UnicodeType == type && UnicodeInited == options.unicode_cp)
 		return;
 
-	if (options.verbosity == VERB_MAX) {
+	if (options.verbosity >= VERB_MAX) {
 		fprintf(stderr, "%s(%s, %s/%s)\n", __FUNCTION__,
 		        type == 1 ? "MS_OLD" :
 		        type == 2 ? "MS_NEW" : "UNICODE",
@@ -1127,7 +1186,7 @@ void initUnicode(int type)
  * format we are using. This is still TBD on how best to do it.
  */
 	if (type == UNICODE_MS_OLD) {
-		if (encoding == ASCII) {
+		if (encoding == ENC_RAW) {
 /*
  * The 'proper' default encoding for mssql IS CP1252. The test suite will have
  * a TON of failures, unless this is set this way.  All of the data IN that
@@ -1238,41 +1297,9 @@ void initUnicode(int type)
 			CP_to_Unicode[i] = ISO_8859_1_to_unicode_high128[i-128];
 		}
 	}
-	memset(CP_from_Unicode, 0, sizeof(CP_from_Unicode));
+	memset(CP_from_Unicode, options.replacement_character, sizeof(CP_from_Unicode));
 	for (i = 0; i < 128; ++i)
 		CP_from_Unicode[i] = i;
-
-	/* Best-effort conversion hack */
-	for (i = 0; i < 128; ++i) {
-		switch (cp_class(encoding)) {
-
-		case CP_DOS:
-		CP_from_Unicode[CP437_to_unicode_high128[i]] = i+128;
-		CP_from_Unicode[CP720_to_unicode_high128[i]] = i+128;
-		CP_from_Unicode[CP737_to_unicode_high128[i]] = i+128;
-		CP_from_Unicode[CP850_to_unicode_high128[i]] = i+128;
-		CP_from_Unicode[CP852_to_unicode_high128[i]] = i+128;
-		CP_from_Unicode[CP858_to_unicode_high128[i]] = i+128;
-		CP_from_Unicode[CP866_to_unicode_high128[i]] = i+128;
-		CP_from_Unicode[CP868_to_unicode_high128[i]] = i+128;
-		break;
-
-		case CP_WIN:
-		CP_from_Unicode[CP1250_to_unicode_high128[i]] = i+128;
-		CP_from_Unicode[CP1251_to_unicode_high128[i]] = i+128;
-		CP_from_Unicode[CP1252_to_unicode_high128[i]] = i+128;
-		CP_from_Unicode[CP1253_to_unicode_high128[i]] = i+128;
-		break;
-
-		default:
-		CP_from_Unicode[ISO_8859_1_to_unicode_high128[i]] = i+128;
-		CP_from_Unicode[ISO_8859_2_to_unicode_high128[i]] = i+128;
-		CP_from_Unicode[ISO_8859_7_to_unicode_high128[i]] = i+128;
-		CP_from_Unicode[ISO_8859_15_to_unicode_high128[i]] = i+128;
-		CP_from_Unicode[KOI8_R_to_unicode_high128[i]] = i+128;
-
-		}
-	}
 
 	/* Now our actual selected codepage */
 	for (i = 0; i < 128; ++i) {
@@ -1374,6 +1401,7 @@ void initUnicode(int type)
 			CHARS_SPECIALS_ISO_8859_1 CHARS_WHITESPACE_ISO_8859_1
 			CHARS_CONTROL_ISO_8859_1 CHARS_INVALID_ISO_8859_1;
 		Letter = (unsigned char*)CHARS_ALPHA_ISO_8859_1;
+		Digit = (unsigned char*)CHARS_DIGITS_ISO_8859_1;
 		break;
 	case ISO_8859_2:
 		cpU = (unsigned char*)CHARS_UPPER_ISO_8859_2;
@@ -1382,6 +1410,7 @@ void initUnicode(int type)
 			CHARS_SPECIALS_ISO_8859_2 CHARS_WHITESPACE_ISO_8859_2
 			CHARS_CONTROL_ISO_8859_2 CHARS_INVALID_ISO_8859_2;
 		Letter = (unsigned char*)CHARS_ALPHA_ISO_8859_2;
+		Digit = (unsigned char*)CHARS_DIGITS_ISO_8859_2;
 		break;
 	case ISO_8859_7:
 		cpU = (unsigned char*)CHARS_UPPER_ISO_8859_7;
@@ -1390,6 +1419,7 @@ void initUnicode(int type)
 			CHARS_SPECIALS_ISO_8859_7 CHARS_WHITESPACE_ISO_8859_7
 			CHARS_CONTROL_ISO_8859_7 CHARS_INVALID_ISO_8859_7;
 		Letter = (unsigned char*)CHARS_ALPHA_ISO_8859_7;
+		Digit = (unsigned char*)CHARS_DIGITS_ISO_8859_7;
 		break;
 	case ISO_8859_15:
 		cpU = (unsigned char*)CHARS_UPPER_ISO_8859_15;
@@ -1398,6 +1428,7 @@ void initUnicode(int type)
 			CHARS_SPECIALS_ISO_8859_15 CHARS_WHITESPACE_ISO_8859_15
 			CHARS_CONTROL_ISO_8859_15 CHARS_INVALID_ISO_8859_15;
 		Letter = (unsigned char*)CHARS_ALPHA_ISO_8859_15;
+		Digit = (unsigned char*)CHARS_DIGITS_ISO_8859_15;
 		break;
 	case KOI8_R:
 		cpU = (unsigned char*)CHARS_UPPER_KOI8_R;
@@ -1406,6 +1437,7 @@ void initUnicode(int type)
 			CHARS_SPECIALS_KOI8_R CHARS_WHITESPACE_KOI8_R
 			CHARS_CONTROL_KOI8_R CHARS_INVALID_KOI8_R;
 		Letter = (unsigned char*)CHARS_ALPHA_KOI8_R;
+		Digit = (unsigned char*)CHARS_DIGITS_KOI8_R;
 		break;
 	case CP437:
 		cpU = (unsigned char*)CHARS_UPPER_CP437;
@@ -1414,6 +1446,7 @@ void initUnicode(int type)
 			CHARS_SPECIALS_CP437 CHARS_WHITESPACE_CP437
 			CHARS_CONTROL_CP437 CHARS_INVALID_CP437;
 		Letter = (unsigned char*)CHARS_ALPHA_CP437;
+		Digit = (unsigned char*)CHARS_DIGITS_CP437;
 		break;
 	case CP720:
 		cpU = (unsigned char*)CHARS_UPPER_CP720;
@@ -1422,6 +1455,7 @@ void initUnicode(int type)
 			CHARS_SPECIALS_CP720 CHARS_WHITESPACE_CP720
 			CHARS_CONTROL_CP720 CHARS_INVALID_CP720;
 		Letter = (unsigned char*)CHARS_ALPHA_CP720;
+		Digit = (unsigned char*)CHARS_DIGITS_CP720;
 		break;
 	case CP737:
 		cpU = (unsigned char*)CHARS_UPPER_CP737;
@@ -1430,6 +1464,7 @@ void initUnicode(int type)
 			CHARS_SPECIALS_CP737 CHARS_WHITESPACE_CP737
 			CHARS_CONTROL_CP737 CHARS_INVALID_CP737;
 		Letter = (unsigned char*)CHARS_ALPHA_CP737;
+		Digit = (unsigned char*)CHARS_DIGITS_CP737;
 		break;
 	case CP850:
 		cpU = (unsigned char*)CHARS_UPPER_CP850;
@@ -1438,6 +1473,7 @@ void initUnicode(int type)
 			CHARS_SPECIALS_CP850 CHARS_WHITESPACE_CP850
 			CHARS_CONTROL_CP850 CHARS_INVALID_CP850;
 		Letter = (unsigned char*)CHARS_ALPHA_CP850;
+		Digit = (unsigned char*)CHARS_DIGITS_CP850;
 		break;
 	case CP852:
 		cpU = (unsigned char*)CHARS_UPPER_CP852;
@@ -1446,6 +1482,7 @@ void initUnicode(int type)
 			CHARS_SPECIALS_CP852 CHARS_WHITESPACE_CP852
 			CHARS_CONTROL_CP852 CHARS_INVALID_CP852;
 		Letter = (unsigned char*)CHARS_ALPHA_CP852;
+		Digit = (unsigned char*)CHARS_DIGITS_CP852;
 		break;
 	case CP858:
 		cpU = (unsigned char*)CHARS_UPPER_CP858;
@@ -1454,6 +1491,7 @@ void initUnicode(int type)
 			CHARS_SPECIALS_CP858 CHARS_WHITESPACE_CP858
 			CHARS_CONTROL_CP858 CHARS_INVALID_CP858;
 		Letter = (unsigned char*)CHARS_ALPHA_CP858;
+		Digit = (unsigned char*)CHARS_DIGITS_CP858;
 		break;
 	case CP866:
 		cpU = (unsigned char*)CHARS_UPPER_CP866;
@@ -1462,6 +1500,7 @@ void initUnicode(int type)
 			CHARS_SPECIALS_CP866 CHARS_WHITESPACE_CP866
 			CHARS_CONTROL_CP866 CHARS_INVALID_CP866;
 		Letter = (unsigned char*)CHARS_ALPHA_CP866;
+		Digit = (unsigned char*)CHARS_DIGITS_CP866;
 		break;
 	case CP868:
 		cpU = (unsigned char*)CHARS_UPPER_CP868;
@@ -1470,6 +1509,7 @@ void initUnicode(int type)
 			CHARS_SPECIALS_CP868 CHARS_WHITESPACE_CP868
 			CHARS_CONTROL_CP868 CHARS_INVALID_CP868;
 		Letter = (unsigned char*)CHARS_ALPHA_CP868;
+		Digit = (unsigned char*)CHARS_DIGITS_CP868;
 		break;
 	case CP1250:
 		cpU = (unsigned char*)CHARS_UPPER_CP1250;
@@ -1478,6 +1518,7 @@ void initUnicode(int type)
 			CHARS_SPECIALS_CP1250 CHARS_WHITESPACE_CP1250
 			CHARS_CONTROL_CP1250 CHARS_INVALID_CP1250;
 		Letter = (unsigned char*)CHARS_ALPHA_CP1250;
+		Digit = (unsigned char*)CHARS_DIGITS_CP1250;
 		break;
 	case CP1251:
 		cpU = (unsigned char*)CHARS_UPPER_CP1251;
@@ -1486,6 +1527,7 @@ void initUnicode(int type)
 			CHARS_SPECIALS_CP1251 CHARS_WHITESPACE_CP1251
 			CHARS_CONTROL_CP1251 CHARS_INVALID_CP1251;
 		Letter = (unsigned char*)CHARS_ALPHA_CP1251;
+		Digit = (unsigned char*)CHARS_DIGITS_CP1251;
 		break;
 	case CP1252:
 		cpU = (unsigned char*)CHARS_UPPER_CP1252;
@@ -1494,6 +1536,7 @@ void initUnicode(int type)
 			CHARS_SPECIALS_CP1252 CHARS_WHITESPACE_CP1252
 			CHARS_CONTROL_CP1252 CHARS_INVALID_CP1252;
 		Letter = (unsigned char*)CHARS_ALPHA_CP1252;
+		Digit = (unsigned char*)CHARS_DIGITS_CP1252;
 		break;
 	case CP1253:
 		cpU = (unsigned char*)CHARS_UPPER_CP1253;
@@ -1502,6 +1545,7 @@ void initUnicode(int type)
 			CHARS_SPECIALS_CP1253 CHARS_WHITESPACE_CP1253
 			CHARS_CONTROL_CP1253 CHARS_INVALID_CP1253;
 		Letter = (unsigned char*)CHARS_ALPHA_CP1253;
+		Digit = (unsigned char*)CHARS_DIGITS_CP1253;
 		break;
 	case CP1254:
 		cpU = (unsigned char*)CHARS_UPPER_CP1254;
@@ -1510,6 +1554,7 @@ void initUnicode(int type)
 			CHARS_SPECIALS_CP1254 CHARS_WHITESPACE_CP1254
 			CHARS_CONTROL_CP1254 CHARS_INVALID_CP1254;
 		Letter = (unsigned char*)CHARS_ALPHA_CP1254;
+		Digit = (unsigned char*)CHARS_DIGITS_CP1254;
 		break;
 	case CP1255:
 		cpU = (unsigned char*)CHARS_UPPER_CP1255;
@@ -1518,6 +1563,7 @@ void initUnicode(int type)
 			CHARS_SPECIALS_CP1255 CHARS_WHITESPACE_CP1255
 			CHARS_CONTROL_CP1255 CHARS_INVALID_CP1255;
 		Letter = (unsigned char*)CHARS_ALPHA_CP1255;
+		Digit = (unsigned char*)CHARS_DIGITS_CP1255;
 		break;
 	case CP1256:
 		cpU = (unsigned char*)CHARS_UPPER_CP1256;
@@ -1526,12 +1572,14 @@ void initUnicode(int type)
 			CHARS_SPECIALS_CP1256 CHARS_WHITESPACE_CP1256
 			CHARS_CONTROL_CP1256 CHARS_INVALID_CP1256;
 		Letter = (unsigned char*)CHARS_ALPHA_CP1256;
+		Digit = (unsigned char*)CHARS_DIGITS_CP1256;
 		break;
 	default:
 		cpU = (unsigned char*)"";
 		cpL = (unsigned char*)"";
 		Sep = (unsigned char*)CP_issep;
 		Letter = (unsigned char*)"";
+		Digit = (unsigned char*)"";
 	}
 
 	for (i = 0; cpU[i]; ++i) {
@@ -1545,14 +1593,31 @@ void initUnicode(int type)
 	for (pos = Sep; *pos; pos++)
 		CP_isSeparator[ARCH_INDEX(*pos)] = 1;
 
+	/* CP_isDigit[c] will return true if c is a digit */
+	memset(CP_isDigit, 0, sizeof(CP_isDigit));
+	for (i = '0'; i <= '9'; i++)
+		CP_isDigit[i] = 1;
+	for (pos = Digit; *pos; pos++)
+		CP_isDigit[ARCH_INDEX(*pos)] = 1;
+
 	/* CP_isLetter[c] will return true if c is a letter */
 	memset(CP_isLetter, 0, sizeof(CP_isLetter));
-	for (i = 'a'; i <= 'z'; i++)
+	memset(CP_isLower, 0, sizeof(CP_isLower));
+	memset(CP_isUpper, 0, sizeof(CP_isUpper));
+	for (i = 'a'; i <= 'z'; i++) {
 		CP_isLetter[i] = 1;
-	for (i = 'A'; i <= 'Z'; i++)
+		CP_isLower[i] = 1;
+	}
+	for (i = 'A'; i <= 'Z'; i++) {
 		CP_isLetter[i] = 1;
+		CP_isUpper[i] = 1;
+	}
 	for (pos = Letter; *pos; pos++)
 		CP_isLetter[ARCH_INDEX(*pos)] = 1;
+	for (pos = cpL; *pos; pos++)
+		CP_isLower[ARCH_INDEX(*pos)] = 1;
+	for (pos = cpU; *pos; pos++)
+		CP_isUpper[ARCH_INDEX(*pos)] = 1;
 
 	if (type == UNICODE_MS_OLD && encoding == CP850) {
 /*
@@ -1667,7 +1732,7 @@ int enc_lc(UTF8 *dst, unsigned dst_bufsize, const UTF8 *src, unsigned src_len)
 	int utf16len, i;
 
 #ifndef UNICODE_NO_OPTIONS
-	if (options.target_enc != UTF_8) {
+	if ((options.target_enc ? options.target_enc : options.input_enc) != UTF_8) {
 		if (dst_bufsize <= src_len)
 			src_len = dst_bufsize - 1;
 		for (i = 0; i < src_len; ++i) {
@@ -1706,7 +1771,7 @@ int enc_uc(UTF8 *dst, unsigned dst_bufsize, const UTF8 *src, unsigned src_len)
 	int utf16len, i;
 
 #ifndef UNICODE_NO_OPTIONS
-	if (options.target_enc != UTF_8) {
+	if ((options.target_enc ? options.target_enc : options.input_enc) != UTF_8) {
 		int len;
 		if (dst_bufsize <= src_len)
 			src_len = dst_bufsize - 1;
@@ -1776,4 +1841,127 @@ char *enc_strupper(char *s)
 	int srclen = strlen(s);
 	enc_uc(ptr, srclen + 1, ptr, srclen);
 	return s;
+}
+
+int enc_hasupper(char *s)
+{
+	while (*s)
+		if (enc_isupper(*s))
+			return 1;
+		else
+			s++;
+	return 0;
+}
+
+int enc_haslower(char *s)
+{
+	while (*s)
+		if (enc_islower(*s))
+			return 1;
+		else
+			s++;
+	return 0;
+}
+
+int enc_hasdigit(char *s)
+{
+	while (*s)
+		if (enc_isdigit(*s))
+			return 1;
+		else
+			s++;
+	return 0;
+}
+
+/*
+ * The concept of UTF-8-32 and associated code was first mentioned at
+ * https://github.com/openwall/john/issues/3510
+ *
+ * Char| Unicode |    UTF-8    |   UTF-32   | UTF-8-32
+ * ----|---------|-------------|------------|-----------
+ *  A  |  U+0041 |          41 | 0x00000041 | 0x00000041
+ *  £  |  U+00A3 |       c2 a3 | 0x000000a3 | 0x0000a3c2
+ *  €  |  U+20AC |    e2 82 ac | 0x000020ac | 0x00ac82e2
+ * :-) | U+1F600 | f0 9f 98 80 | 0x0001f600 | 0x80989ff0
+ *
+ * The UTF-8-32 concept and code is Copyright (c) magnum 2018 and is
+ * hereby released to the general public under the following terms:
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted.
+ */
+
+/*
+ * Source is a UTF-8-32 string, destination is a normal UTF-8 string.
+ */
+UTF8 *utf8_32_to_utf8(UTF8 *dst, UTF32 *src)
+{
+	UTF8 *ret = dst;
+	UTF32 c;
+
+	while ((c = *src++))
+	do
+		*dst++ = c & 0xff;
+	while ((c >>= 8));
+
+	*dst = 0;
+
+	return ret;
+}
+
+/*
+ * Convert a UTF-8 string to UTF-8-32. Not much error checking.
+ */
+void utf8_to_utf8_32(UTF32 *dst, UTF8 *src)
+{
+	UTF32 c;
+
+	while ((c = *src++)) {
+		if (c >= 0xC0) {
+			unsigned int eb;
+			eb = opt_trailingBytesUTF8[c & 0x3f];
+
+			if (eb > 3) /* invalid */
+				continue;
+			c += (UTF32)*src++ << 8;
+			if (eb > 1)
+				c += (UTF32)*src++ << 16;
+			if (eb > 2)
+				c += (UTF32)*src++ << 24;
+		}
+		*dst++ = c;
+	}
+	*dst = 0;
+}
+
+/* Convert UTF-32 to UTF-8-32, in place */
+void utf32_to_utf8_32(UTF32 *in_place_string)
+{
+	UTF32 *src = in_place_string;
+	UTF32 *dst = in_place_string;
+
+	while (*src) {
+		UTF32 ch, u8_32 = 0;
+		unsigned short bytesToWrite = 0;
+		const UTF32 byteMask = 0xBF;
+		const UTF32 byteMark = 0x80;
+
+		ch = *src++;
+
+		/* Figure out how many bytes the result will require */
+		if (ch < (UTF32)0x80) {	     bytesToWrite = 1;
+		} else if (ch < (UTF32)0x800) {     bytesToWrite = 2;
+		} else if (ch < (UTF32)0x10000) {   bytesToWrite = 3;
+		} else if (ch < (UTF32)0x110000) {  bytesToWrite = 4;
+		} else {			    bytesToWrite = 3;
+			ch = UNI_REPLACEMENT_CHAR;
+		}
+
+		switch (bytesToWrite) { /* note: everything falls through. */
+		case 4: u8_32 |= ((ch | byteMark) & byteMask) << 24; ch >>= 6;
+		case 3: u8_32 |= ((ch | byteMark) & byteMask) << 16; ch >>= 6;
+		case 2: u8_32 |= ((ch | byteMark) & byteMask) << 8; ch >>= 6;
+		case 1: u8_32 |= (ch | firstByteMark[bytesToWrite]);
+		}
+		*dst++ = u8_32;
+	}
 }

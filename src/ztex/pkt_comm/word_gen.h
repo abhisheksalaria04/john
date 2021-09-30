@@ -7,6 +7,8 @@
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted.
  *
+ * Note: start_idx, num_generate actually not used.
+ *
  */
 
 #define PKT_TYPE_WORD_GEN	2
@@ -30,7 +32,7 @@ struct word_gen {
 	//unsigned char magic;	// 0xBB <- added by pkt_word_gen_new()
 };
 
-struct word_gen word_gen_words_pass_by;
+extern struct word_gen word_gen_words_pass_by;
 
-struct pkt *pkt_word_gen_new(struct word_gen *word_gen, int num_generate);
+struct pkt *pkt_word_gen_new(struct word_gen *word_gen);
 

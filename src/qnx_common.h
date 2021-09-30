@@ -18,7 +18,7 @@
 
 #define FORMAT_NAME		"qnx hash"
 #define BENCHMARK_COMMENT	" (rounds=1000)"
-#define BENCHMARK_LENGTH	-1
+#define BENCHMARK_LENGTH	0x107
 #define CIPHERTEXT_LENGTH	43
 
 // binary size is 'max' which is for sha512
@@ -38,7 +38,7 @@ static int valid(char *ciphertext, struct fmt_main *self) {
 		goto Exit;
 	ct = strtokm(&ct[1], "@");
 	// Only allow @m @s or @S signatures.
-	if (!ct || *ct == '\0')
+	if (!ct || !(*ct == 'm' || *ct == 's' || *ct == 'S'))
 		goto Exit;
 	if (*ct == 'm') len = 32;
 	else if (*ct == 's') len = 64;
@@ -66,7 +66,7 @@ Exit:;
 }
 
 static void *get_binary(char *ciphertext) {
-	static ARCH_WORD_32 outbuf[BINARY_SIZE/4];
+	static uint32_t outbuf[BINARY_SIZE/4];
 	unsigned char *out = (unsigned char*)outbuf;
 	memset(outbuf, 0, sizeof(outbuf));
 	ciphertext = strchr(&ciphertext[1], '@') + 1;

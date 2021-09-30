@@ -14,14 +14,12 @@
 #undef SIMD_COEF_32
 #endif
 
+#include "arch.h"
 #include "common.h"
 #include "pseudo_intrinsics.h"
 #include "simd-intrinsics-load-flags.h"
 #include "aligned.h"
 
-#ifndef _EMMINTRIN_H_INCLUDED
-#define __m128i void
-#endif
 #define vtype void
 
 #define STRINGIZE2(s) #s
@@ -30,12 +28,18 @@
 #if __ALTIVEC__
 #undef SIMD_TYPE
 #define SIMD_TYPE            "AltiVec"
+#elif __aarch64__
+#undef SIMD_TYPE
+#define SIMD_TYPE            "ASIMD"
 #elif __ARM_NEON
 #undef SIMD_TYPE
 #define SIMD_TYPE            "NEON"
 #elif __MIC__
 #undef SIMD_TYPE
 #define SIMD_TYPE            "MIC"
+#elif __AVX512BW__
+#undef SIMD_TYPE
+#define SIMD_TYPE            "AVX512BW"
 #elif __AVX512F__
 #undef SIMD_TYPE
 #define SIMD_TYPE            "AVX512F"
@@ -73,7 +77,7 @@
 
 #ifdef SIMD_PARA_MD5
 void md5cryptsse(unsigned char *buf, unsigned char *salt, char *out, unsigned int md5_type);
-void SIMDmd5body(vtype* data, ARCH_WORD_32 *out, ARCH_WORD_32 *reload_state, unsigned SSEi_flags);
+void SIMDmd5body(vtype* data, uint32_t *out, uint32_t *reload_state, unsigned SSEi_flags);
 void md5_reverse(uint32_t *hash);
 void md5_unreverse(uint32_t *hash);
 #define MD5_ALGORITHM_NAME		BITS " " SIMD_TYPE " " MD5_N_STR
@@ -83,7 +87,7 @@ void md5_unreverse(uint32_t *hash);
 
 #ifdef SIMD_PARA_MD4
 //void SIMDmd4body(__m128i* data, unsigned int *out, int init);
-void SIMDmd4body(vtype* data, ARCH_WORD_32 *out, ARCH_WORD_32 *reload_state, unsigned SSEi_flags);
+void SIMDmd4body(vtype* data, uint32_t *out, uint32_t *reload_state, unsigned SSEi_flags);
 void md4_reverse(uint32_t *hash);
 void md4_unreverse(uint32_t *hash);
 #define MD4_ALGORITHM_NAME		BITS " " SIMD_TYPE " " MD4_N_STR
@@ -92,7 +96,7 @@ void md4_unreverse(uint32_t *hash);
 #endif
 
 #ifdef SIMD_PARA_SHA1
-void SIMDSHA1body(vtype* data, ARCH_WORD_32 *out, ARCH_WORD_32 *reload_state, unsigned SSEi_flags);
+void SIMDSHA1body(vtype* data, uint32_t *out, uint32_t *reload_state, unsigned SSEi_flags);
 void sha1_reverse(uint32_t *hash);
 void sha1_unreverse(uint32_t *hash);
 void sha1_reverse3(uint32_t *hash);
@@ -102,12 +106,12 @@ void sha1_unreverse3(uint32_t *hash);
 #define SHA1_ALGORITHM_NAME		"32/" ARCH_BITS_STR
 #endif
 
-// we use the 'outter' SIMD_COEF_32 wrapper, as the flag for SHA256/SHA512.  FIX_ME!!
+// we use the 'outer' SIMD_COEF_32 wrapper, as the flag for SHA256/SHA512.  FIX_ME!!
 #if SIMD_COEF_32 > 1
 
 #ifdef SIMD_COEF_32
 #define SHA256_ALGORITHM_NAME	BITS " " SIMD_TYPE " " SHA256_N_STR
-void SIMDSHA256body(vtype* data, ARCH_WORD_32 *out, ARCH_WORD_32 *reload_state, unsigned SSEi_flags);
+void SIMDSHA256body(vtype* data, uint32_t *out, uint32_t *reload_state, unsigned SSEi_flags);
 void sha224_reverse(uint32_t *hash);
 void sha224_unreverse(uint32_t *hash);
 void sha256_reverse(uint32_t *hash);
@@ -116,20 +120,18 @@ void sha256_unreverse(uint32_t *hash);
 
 #ifdef SIMD_COEF_64
 #define SHA512_ALGORITHM_NAME	BITS " " SIMD_TYPE " " SHA512_N_STR
-void SIMDSHA512body(vtype* data, ARCH_WORD_64 *out, ARCH_WORD_64 *reload_state, unsigned SSEi_flags);
-void sha384_reverse(ARCH_WORD_64 *hash);
-void sha384_unreverse(ARCH_WORD_64 *hash);
-void sha512_reverse(ARCH_WORD_64 *hash);
-void sha512_unreverse(ARCH_WORD_64 *hash);
+void SIMDSHA512body(vtype* data, uint64_t *out, uint64_t *reload_state, unsigned SSEi_flags);
+void sha384_reverse(uint64_t *hash);
+void sha384_unreverse(uint64_t *hash);
+// sha512_reverse is defined in sha2.h. It can be used for a non-SIMD build.
 #endif
 
 #else
+#define SHA256_ALGORITHM_NAME                 "32/" ARCH_BITS_STR
 #if ARCH_BITS >= 64
-#define SHA256_ALGORITHM_NAME                 "64/" ARCH_BITS_STR " " SHA2_LIB
-#define SHA512_ALGORITHM_NAME                 "64/" ARCH_BITS_STR " " SHA2_LIB
+#define SHA512_ALGORITHM_NAME                 "64/" ARCH_BITS_STR
 #else
-#define SHA256_ALGORITHM_NAME                 "32/" ARCH_BITS_STR " " SHA2_LIB
-#define SHA512_ALGORITHM_NAME                 "32/" ARCH_BITS_STR " " SHA2_LIB
+#define SHA512_ALGORITHM_NAME                 "32/" ARCH_BITS_STR
 #endif
 
 #endif

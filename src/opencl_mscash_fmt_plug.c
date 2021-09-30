@@ -16,7 +16,6 @@ john_register_one(&FMT_STRUCT);
 #else
 
 #include <string.h>
-#include <assert.h>
 #include <sys/time.h>
 
 #include "arch.h"
@@ -24,7 +23,7 @@ john_register_one(&FMT_STRUCT);
 #include "path.h"
 #include "common.h"
 #include "formats.h"
-#include "common-opencl.h"
+#include "opencl_common.h"
 #include "config.h"
 #include "options.h"
 #include "unicode.h"
@@ -47,16 +46,15 @@ static cl_uint *saved_plain, *saved_idx, *saved_int_key_loc;
 static int static_gpu_locations[MASK_FMT_INT_PLHDR];
 
 static cl_mem buffer_return_hashes, buffer_hash_ids, buffer_bitmap_dupe;
-static cl_mem buffer_offset_table_test, buffer_hash_table_test, buffer_bitmaps_test, buffer_salt_test;
-static cl_mem *buffer_offset_tables = NULL, *buffer_hash_tables = NULL, *buffer_bitmaps = NULL, *buffer_salts = NULL;
-static OFFSET_TABLE_WORD *offset_table = NULL;
-static unsigned int **hash_tables = NULL;
-static unsigned int current_salt = 0;
-static cl_uint *loaded_hashes = NULL, max_num_loaded_hashes, *hash_ids = NULL, *bitmaps = NULL, max_hash_table_size = 0;
-static cl_ulong bitmap_size_bits = 0;
+static cl_mem *buffer_offset_tables, *buffer_hash_tables, *buffer_bitmaps, *buffer_salts;
+static OFFSET_TABLE_WORD *offset_table;
+static unsigned int **hash_tables;
+static unsigned int current_salt;
+static cl_uint *loaded_hashes, max_num_loaded_hashes, *hash_ids, *bitmaps, max_hash_table_size;
+static cl_ulong bitmap_size_bits;
 
-static unsigned int key_idx = 0;
-static unsigned int set_new_keys = 1;
+static unsigned int key_idx;
+static unsigned int set_new_keys;
 static struct fmt_main *self;
 static cl_uint *zero_buffer;
 
@@ -71,8 +69,7 @@ static const char *warn[] = {
 };
 
 //This file contains auto-tuning routine(s). Has to be included after formats definitions.
-#include "opencl-autotune.h"
-#include "memdbg.h"
+#include "opencl_autotune.h"
 
 /* ------- Helper functions ------- */
 static size_t get_task_max_work_group_size()
@@ -97,8 +94,12 @@ static void set_kernel_args()
 	HANDLE_CLERROR(clSetKernelArg(crypt_kernel, 10, sizeof(buffer_bitmap_dupe), (void *) &buffer_bitmap_dupe), "Error setting argument 11.");
 }
 
+static void release_clobj(void);
+
 static void create_clobj(size_t kpc, struct fmt_main *self)
 {
+	release_clobj();
+
 	pinned_saved_keys = clCreateBuffer(context[gpu_id], CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, BUFSIZE * kpc, NULL, &ret_code);
 	if (ret_code != CL_SUCCESS) {
 		saved_plain = (cl_uint *) mem_alloc(BUFSIZE * kpc);
@@ -179,17 +180,6 @@ static void release_clobj(void)
 	}
 }
 
-static void release_clobj_test(void)
-{
-	if (buffer_salt_test) {
-		HANDLE_CLERROR(clReleaseMemObject(buffer_salt_test), "Error Releasing buffer_salt_test.");
-		HANDLE_CLERROR(clReleaseMemObject(buffer_offset_table_test), "Error Releasing buffer_offset_table_test.");
-		HANDLE_CLERROR(clReleaseMemObject(buffer_hash_table_test), "Error Releasing buffer_hash_table_test.");
-		HANDLE_CLERROR(clReleaseMemObject(buffer_bitmaps_test), "Error Releasing buffer_bitmap_test.");
-		buffer_salt_test = 0;
-	}
-}
-
 static void release_base_clobj(void)
 {
 	if (buffer_int_keys) {
@@ -209,11 +199,9 @@ static void release_salt_buffers()
 		k = 0;
 		while (hash_tables[k]) {
 			MEM_FREE(hash_tables[k]);
-			hash_tables[k] = 0;
 			k++;
 		}
 		MEM_FREE(hash_tables);
-		hash_tables = NULL;
 	}
 	if (buffer_offset_tables) {
 		k = 0;
@@ -223,7 +211,6 @@ static void release_salt_buffers()
 			k++;
 		}
 		MEM_FREE(buffer_offset_tables);
-		buffer_offset_tables = NULL;
 	}
 	if (buffer_hash_tables) {
 		k = 0;
@@ -233,7 +220,6 @@ static void release_salt_buffers()
 			k++;
 		}
 		MEM_FREE(buffer_hash_tables);
-		buffer_hash_tables = NULL;
 	}
 	if (buffer_bitmaps) {
 		k = 0;
@@ -243,7 +229,6 @@ static void release_salt_buffers()
 			k++;
 		}
 		MEM_FREE(buffer_bitmaps);
-		buffer_bitmaps = NULL;
 	}
 	if (buffer_salts) {
 		k = 0;
@@ -253,13 +238,11 @@ static void release_salt_buffers()
 			k++;
 		}
 		MEM_FREE(buffer_salts);
-		buffer_salts = NULL;
 	}
 }
 
 static void done(void)
 {
-	release_clobj_test();
 	release_clobj();
 	release_base_clobj();
 
@@ -282,10 +265,14 @@ static void init_kernel(void)
 	int i;
 	cl_ulong const_cache_size;
 
-	clReleaseKernel(crypt_kernel);
+	if (crypt_kernel) {
+		HANDLE_CLERROR(clReleaseKernel(crypt_kernel), "Release kernel.");
+		HANDLE_CLERROR(clReleaseProgram(program[gpu_id]), "Release Program.");
+		crypt_kernel = NULL;
+	}
 
 	for (i = 0; i < MASK_FMT_INT_PLHDR; i++)
-		if (mask_skip_ranges!= NULL && mask_skip_ranges[i] != -1)
+		if (mask_skip_ranges && mask_skip_ranges[i] != -1)
 			static_gpu_locations[i] = mask_int_cand.int_cpu_mask_ctx->
 				ranges[mask_skip_ranges[i]].pos;
 		else
@@ -309,7 +296,7 @@ static void init_kernel(void)
 #endif
 	, mask_int_cand.num_int_cand, mask_gpu_is_static,
 	(unsigned long long)const_cache_size, cp_id2macro(options.target_enc),
-	options.internal_cp == UTF_8 ? cp_id2macro(ASCII) :
+	options.internal_cp == UTF_8 ? cp_id2macro(ENC_RAW) :
 	cp_id2macro(options.internal_cp), PLAINTEXT_LENGTH,
 	static_gpu_locations[0]
 #if MASK_FMT_INT_PLHDR > 1
@@ -323,7 +310,7 @@ static void init_kernel(void)
 #endif
 	);
 
-	opencl_build_kernel("$JOHN/kernels/mscash_kernel.cl", gpu_id, build_opts, 0);
+	opencl_build_kernel("$JOHN/opencl/mscash_kernel.cl", gpu_id, build_opts, 0);
 	crypt_kernel = clCreateKernel(program[gpu_id], "mscash", &ret_code);
 	HANDLE_CLERROR(ret_code, "Error creating kernel. Double-check kernel name?");
 }
@@ -340,7 +327,7 @@ static void init(struct fmt_main *_self)
 	mask_int_cand_target = opencl_speed_index(gpu_id) / 300;
 
 	mscash1_adjust_tests(self, options.target_enc, PLAINTEXT_LENGTH,
-	                     set_key, set_key, salt, salt);
+	                     set_key, set_key);
 }
 
 static void *salt(char *ciphertext)
@@ -355,11 +342,12 @@ static void *salt(char *ciphertext)
 	UTF8 csalt[3 * MSCASH1_MAX_SALT_LENGTH + 1];
 	int i, length = 0;
 	char *pos = ciphertext + FORMAT_TAG_LEN;
+	char *lasth = strrchr(ciphertext, '#');
 
 	memset(nt_buffer.w, 0, sizeof(nt_buffer.w));
 	memset(usalt, 0, sizeof(usalt));
 
-	while (*pos != '#' && length < 3 * MSCASH1_MAX_SALT_LENGTH)
+	while (pos < lasth)
 		csalt[length++] = *pos++;
 	csalt[length] = 0;
 
@@ -387,12 +375,12 @@ static int get_hash_6(int index) { return hash_tables[current_salt][hash_ids[3 +
 static void clear_keys(void)
 {
 	key_idx = 0;
-	set_new_keys = 1;
+	set_new_keys = 0;
 }
 
 static void set_key(char *_key, int index)
 {
-	const ARCH_WORD_32 *key = (ARCH_WORD_32*)_key;
+	const uint32_t *key = (uint32_t*)_key;
 	int len = strlen(_key);
 
 	if (mask_int_cand.num_int_cand > 1 && !mask_gpu_is_static) {
@@ -450,7 +438,7 @@ static char *get_key(int index)
 		out[i] = *key++;
 	out[i] = 0;
 
-	if (mask_skip_ranges && mask_int_cand.num_int_cand > 1) {
+	if (len && mask_skip_ranges && mask_int_cand.num_int_cand > 1) {
 		for (i = 0; i < MASK_FMT_INT_PLHDR && mask_skip_ranges[i] != -1; i++)
 			if (mask_gpu_is_static)
 				out[static_gpu_locations[i]] =
@@ -464,7 +452,7 @@ static char *get_key(int index)
 }
 
 /* Use only for smaller bitmaps < 16MB */
-static void prepare_bitmap_4(cl_ulong bmp_sz, cl_uint **bitmap_ptr, uint num_loaded_hashes)
+static void prepare_bitmap_4(cl_ulong bmp_sz, cl_uint **bitmap_ptr, uint32_t num_loaded_hashes)
 {
 	unsigned int i;
 	MEM_FREE(*bitmap_ptr);
@@ -488,7 +476,7 @@ static void prepare_bitmap_4(cl_ulong bmp_sz, cl_uint **bitmap_ptr, uint num_loa
 	}
 }
 /*
-static void prepare_bitmap_1(cl_ulong bmp_sz, cl_uint **bitmap_ptr, uint num_loaded_hashes)
+static void prepare_bitmap_1(cl_ulong bmp_sz, cl_uint **bitmap_ptr, uint32_t num_loaded_hashes)
 {
 	unsigned int i;
 	MEM_FREE(*bitmap_ptr);
@@ -547,7 +535,11 @@ static void select_bitmap(unsigned int num_loaded_hashes)
 		else
 			bitmap_size_bits = 2048 * 1024;
 	}
-	assert(num_loaded_hashes <= 1100100);
+	else {
+		fprintf(stderr, "Too many hashes (%d), max is 1100100\n",
+		        num_loaded_hashes);
+		error();
+	}
 
 	prepare_bitmap_4(bitmap_size_bits, &bitmaps, num_loaded_hashes);
 }
@@ -555,6 +547,7 @@ static void select_bitmap(unsigned int num_loaded_hashes)
 static void prepare_table(struct db_main *db)
 {
 	struct db_salt *salt;
+	int seq_ids = 0;
 
 	max_num_loaded_hashes = 0;
 	max_hash_table_size = 1;
@@ -563,20 +556,20 @@ static void prepare_table(struct db_main *db)
 	do {
 		if (salt->count > max_num_loaded_hashes)
 			max_num_loaded_hashes = salt->count;
-	} while((salt = salt->next));
+	} while ((salt = salt->next));
 
 	MEM_FREE(loaded_hashes);
 	MEM_FREE(hash_ids);
 	release_salt_buffers();
 
 	loaded_hashes = (cl_uint*) mem_alloc(4 * max_num_loaded_hashes * sizeof(cl_uint));
-	hash_ids = (cl_uint*) mem_alloc((3 * max_num_loaded_hashes + 1) * sizeof(cl_uint));
+	hash_ids = (cl_uint*) mem_calloc((3 * max_num_loaded_hashes + 1), sizeof(cl_uint));
 
-	hash_tables = (unsigned int **)mem_alloc(sizeof(unsigned int*) * (db->salt_count + 1));
-	buffer_offset_tables = (cl_mem *)mem_alloc(sizeof(cl_mem) * (db->salt_count + 1));
-	buffer_hash_tables = (cl_mem *)mem_alloc(sizeof(cl_mem) * (db->salt_count + 1));
-	buffer_bitmaps = (cl_mem *)mem_alloc(sizeof(cl_mem) * (db->salt_count + 1));
-	buffer_salts = (cl_mem *)mem_alloc(sizeof(cl_mem) * (db->salt_count + 1));
+	hash_tables = (unsigned int **)mem_calloc(sizeof(unsigned int*), db->salt_count + 1);
+	buffer_offset_tables = (cl_mem *)mem_calloc(sizeof(cl_mem), db->salt_count + 1);
+	buffer_hash_tables = (cl_mem *)mem_calloc(sizeof(cl_mem), db->salt_count + 1);
+	buffer_bitmaps = (cl_mem *)mem_calloc(sizeof(cl_mem), db->salt_count + 1);
+	buffer_salts = (cl_mem *)mem_calloc(sizeof(cl_mem), db->salt_count + 1);
 
 	hash_tables[db->salt_count] = NULL;
 	buffer_offset_tables[db->salt_count] = NULL;
@@ -615,12 +608,13 @@ static void prepare_table(struct db_main *db)
 			error();
 		}
 		num_loaded_hashes = salt->count;
+		salt->sequential_id = seq_ids++;
 
-		num_loaded_hashes = create_perfect_hash_table(128, (void *)loaded_hashes,
-				num_loaded_hashes,
-			        &offset_table,
-			        &offset_table_size,
-			        &hash_table_size, 0);
+		num_loaded_hashes = create_perfect_hash_table(128, (void*)loaded_hashes,
+		                                              num_loaded_hashes,
+		                                              &offset_table,
+		                                              &offset_table_size,
+		                                              &hash_table_size, 0);
 
 		if (!num_loaded_hashes) {
 			MEM_FREE(hash_table_128);
@@ -660,7 +654,7 @@ static void prepare_table(struct db_main *db)
 		MEM_FREE(bitmaps);
 		MEM_FREE(offset_table);
 
-	} while((salt = salt->next));
+	} while ((salt = salt->next));
 }
 
 static int crypt_all(int *pcount, struct db_salt *salt)
@@ -668,7 +662,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 	const int count = *pcount;
 
 	size_t *lws = local_work_size ? &local_work_size : NULL;
-	size_t gws = GET_MULTIPLE_OR_BIGGER(count, local_work_size);
+	size_t gws = GET_NEXT_MULTIPLE(count, local_work_size);
 
 	//fprintf(stderr, "%s(%d) lws "Zu" gws "Zu" idx %u int_cand %d\n", __FUNCTION__, count, local_work_size, gws, key_idx, mask_int_cand.num_int_cand);
 
@@ -733,43 +727,29 @@ static int cmp_exact(char *source, int index)
 
 static void reset(struct db_main *db)
 {
-	static size_t o_lws, o_gws;
-	static int initialized;
-	size_t gws_limit;
+	static int last_int_cand;
 
-	//fprintf(stderr, "%s(%p), i=%d\n", __FUNCTION__, db, initialized);
-	gws_limit = MIN((0xf << 21) * 4 / BUFSIZE,
-	                get_max_mem_alloc_size(gpu_id) / BUFSIZE);
+	if (!crypt_kernel || last_int_cand != mask_int_cand.num_int_cand) {
+		release_base_clobj();
+		release_clobj();
+
+		prepare_table(db);
+		init_kernel();
+
+		create_base_clobj();
+
+		current_salt = 0;
+		hash_ids[0] = 0;
+
+		last_int_cand = mask_int_cand.num_int_cand;
+	}
+
+	size_t gws_limit = MIN((0xf << 21) * 4 / BUFSIZE,
+	                       get_max_mem_alloc_size(gpu_id) / BUFSIZE);
 	get_power_of_two(gws_limit);
 	if (gws_limit > MIN((0xf << 21) * 4 / BUFSIZE,
 	                    get_max_mem_alloc_size(gpu_id) / BUFSIZE))
 		gws_limit >>= 1;
-
-
-	if (initialized) {
-		// Forget the previous auto-tune
-		local_work_size = o_lws;
-		global_work_size = o_gws;
-
-		release_base_clobj();
-		release_clobj();
-	} else {
-		o_lws = local_work_size;
-		o_gws = global_work_size;
-		initialized = 1;
-	}
-
-	prepare_table(db);
-	init_kernel();
-
-	create_base_clobj();
-
-	current_salt = 0;
-	hash_ids[0] = 0;
-
-	// If real crack run, don't auto-tune for self-tests
-	if (db->real && db != db->real)
-		opencl_get_sane_lws_gws_values();
 
 	// Initialize openCL tuning (library) for this format.
 	opencl_init_auto_setup(SEED, 1, NULL, warn, 2, self,
@@ -777,7 +757,7 @@ static void reset(struct db_main *db)
 	                       2 * BUFSIZE, gws_limit, db);
 
 	// Auto tune execution from shared/included code.
-	autotune_run_extra(self, 1, gws_limit, 300, CL_TRUE);
+	autotune_run_extra(self, 1, gws_limit, 200, CL_TRUE);
 }
 
 struct fmt_main FMT_STRUCT = {
@@ -795,7 +775,7 @@ struct fmt_main FMT_STRUCT = {
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_CASE | FMT_8_BIT | FMT_SPLIT_UNIFIES_CASE | FMT_UNICODE | FMT_UTF8 | FMT_REMOVE,
+		FMT_CASE | FMT_8_BIT | FMT_SPLIT_UNIFIES_CASE | FMT_UNICODE | FMT_ENC | FMT_REMOVE | FMT_MASK,
 		{ NULL },
 		{ FORMAT_TAG },
 		mscash1_common_tests

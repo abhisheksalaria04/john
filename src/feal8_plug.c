@@ -11,7 +11,6 @@
 
 #include "common.h"
 #include "johnswap.h"
-#include "memdbg.h"
 
 static MAYBE_INLINE ByteType Rot2(ByteType X)
 /*
@@ -39,11 +38,11 @@ static MAYBE_INLINE HalfWord f(HalfWord AA, QuarterWord BB)
 	ByteType f1, f2;
 	union {
 		HalfWord All;
-		ByteType Byte[4];
+		ByteType Byte[sizeof(HalfWord)];
 	} RetVal, A;
 	union {
-		unsigned int All;
-		ByteType Byte[2];
+		HalfWord All;
+		ByteType Byte[sizeof(HalfWord)];
 	} B;
 
 	A.All = AA;

@@ -41,20 +41,12 @@
 #define UBSAN_STRING ""
 #endif
 
-#if defined(MEMDBG_ON) && defined(MEMDBG_EXTRA_CHECKS)
-#define MEMDBG_STRING " memdbg-ex"
-#elif defined(MEMDBG_ON)
-#define MEMDBG_STRING " memdbg"
-#else
-#define MEMDBG_STRING ""
-#endif
-
 #define _STR_VALUE(arg)			#arg
 #define STR_MACRO(n)			_STR_VALUE(n)
 
 #if JTR_RELEASE_BUILD
 #undef JTR_GIT_VERSION
-#define JTR_GIT_VERSION JOHN_VERSION
+#define JTR_GIT_VERSION JUMBO_VERSION
 #endif
 
 /* Suboptions that can be used before full initialization, like --list=help */

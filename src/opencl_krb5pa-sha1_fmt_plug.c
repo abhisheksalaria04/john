@@ -24,12 +24,12 @@
  *
  * march 09 / kevin devine <wyse101 0x40 gmail.com>
  *
- * This software is Copyright (c) 2012 magnum, and it is hereby released to the
- * general public under the following terms:  Redistribution and use in source
- * and binary forms, with or without modification, are permitted.
- *
- * This software is Copyright (c) 2012 Dhiru Kholia (dhiru at openwall.com) and
- * released under same terms as above
+ * This software is
+ * Copyright (c) 2012-2018 magnum
+ * Copyright (c) 2012 Dhiru Kholia (dhiru at openwall.com)
+ * and it is hereby released to the general public under the following terms:
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted.
  */
 
 #ifdef HAVE_OPENCL
@@ -40,10 +40,7 @@ extern struct fmt_main fmt_opencl_krb5pa_sha1;
 john_register_one(&fmt_opencl_krb5pa_sha1);
 #else
 
-#include <errno.h>
 #include <string.h>
-#include <stdlib.h>
-#include <ctype.h>
 
 #include "arch.h"
 #include "misc.h"
@@ -52,24 +49,22 @@ john_register_one(&fmt_opencl_krb5pa_sha1);
 #include "common.h"
 #include "unicode.h"
 #include "config.h"
-#include "aes.h"
-#include "common-opencl.h"
-#define OUTLEN 32
-#include "opencl_pbkdf2_hmac_sha1.h"
-#include "hmac_sha.h"
 #include "loader.h"
+#include "opencl_common.h"
+#define MAX_OUTLEN 32
+#include "../run/opencl/opencl_pbkdf2_hmac_sha1.h"
 
-#define FORMAT_LABEL		"krb5pa-sha1-opencl"
-#define FORMAT_NAME		"Kerberos 5 AS-REQ Pre-Auth etype 17/18" /* aes-cts-hmac-sha1-96 */
-#define FORMAT_TAG           "$krb5pa$"
-#define FORMAT_TAG_LEN       (sizeof(FORMAT_TAG)-1)
-#define ALGORITHM_NAME		"PBKDF2-SHA1 OpenCL"
-#define BENCHMARK_COMMENT	""
-#define BENCHMARK_LENGTH	-1001
-#define BINARY_SIZE		12
-#define BINARY_ALIGN		4
-#define SALT_SIZE		sizeof(struct custom_salt)
-#define SALT_ALIGN		1
+#define FORMAT_LABEL            "krb5pa-sha1-opencl"
+#define FORMAT_NAME             "Kerberos 5 AS-REQ Pre-Auth etype 17/18" /* aes-cts-hmac-sha1-96 */
+#define FORMAT_TAG              "$krb5pa$"
+#define FORMAT_TAG_LEN          (sizeof(FORMAT_TAG)-1)
+#define ALGORITHM_NAME          "PBKDF2-SHA1 OpenCL"
+#define BENCHMARK_COMMENT       ""
+#define BENCHMARK_LENGTH        0x107
+#define BINARY_SIZE             12
+#define BINARY_ALIGN            4
+#define SALT_SIZE               sizeof(struct custom_salt)
+#define SALT_ALIGN              4
 #define MAX_SALTLEN             52
 #define MAX_REALMLEN            MAX_SALTLEN
 #define MAX_USERLEN             MAX_SALTLEN
@@ -77,13 +72,13 @@ john_register_one(&fmt_opencl_krb5pa_sha1);
 #define CHECKSUM_SIZE           BINARY_SIZE
 #define TOTAL_LENGTH            (14 + 2 * (CHECKSUM_SIZE + TIMESTAMP_SIZE) + MAX_REALMLEN + MAX_USERLEN + MAX_SALTLEN)
 
-#define MIN_KEYS_PER_CRYPT	1
-#define MAX_KEYS_PER_CRYPT	1
+#define MIN_KEYS_PER_CRYPT      1
+#define MAX_KEYS_PER_CRYPT      1
 
 /* This handles all sizes */
-#define GETPOS(i, index)	(((index) % ocl_v_width) * 4 + ((i) & ~3U) * ocl_v_width + (((i) & 3) ^ 3) + ((index) / ocl_v_width) * 64 * ocl_v_width)
+#define GETPOS(i, index)        (((index) % ocl_v_width) * 4 + ((i) & ~3U) * ocl_v_width + (((i) & 3) ^ 3) + ((index) / ocl_v_width) * 64 * ocl_v_width)
 /* This is faster but can't handle size 3 */
-//#define GETPOS(i, index)	(((index) & (ocl_v_width - 1)) * 4 + ((i) & ~3U) * ocl_v_width + (((i) & 3) ^ 3) + ((index) / ocl_v_width) * 64 * ocl_v_width)
+//#define GETPOS(i, index)      (((index) & (ocl_v_width - 1)) * 4 + ((i) & ~3U) * ocl_v_width + (((i) & 3) ^ 3) + ((index) / ocl_v_width) * 64 * ocl_v_width)
 
 static struct fmt_tests tests[] = {
 	{"$krb5pa$18$user1$EXAMPLE.COM$$2a0e68168d1eac344da458599c3a2b33ff326a061449fcbc242b212504e484d45903c6a16e2d593912f56c93883bf697b325193d62a8be9c", "openwall"},
@@ -97,8 +92,9 @@ static struct fmt_tests tests[] = {
 	{NULL},
 };
 
-static cl_mem mem_in, mem_out, mem_salt, mem_state, pinned_in, pinned_out;
-static cl_kernel pbkdf2_init, pbkdf2_loop, pbkdf2_final;
+static cl_mem mem_in, mem_dk, mem_out, mem_salt, mem_state, mem_cleartext;
+static cl_mem pinned_in, pinned_out;
+static cl_kernel pbkdf2_init, pbkdf2_loop, pbkdf2_final, pa_sha1_final;
 static struct fmt_main *self;
 
 static struct custom_salt {
@@ -110,15 +106,20 @@ static struct custom_salt {
 	unsigned char ct[TIMESTAMP_SIZE];
 } *cur_salt;
 
-static unsigned char constant[16];
-static unsigned char ke_input[16];
-static unsigned char ki_input[16];
+typedef struct {
+	pbkdf2_salt pbkdf2;
+	uint32_t etype;
+	unsigned char ct[(TIMESTAMP_SIZE + 63) / 64 * 64];
+} pa_sha1_salt;
+
+typedef struct {
+	uint32_t hash[BINARY_SIZE / sizeof(uint32_t)];
+} krb5pa_out;
 
 static size_t key_buf_size;
 static unsigned int *inbuffer;
-static pbkdf2_salt currentsalt;
-static pbkdf2_out *output;
-static ARCH_WORD_32 (*crypt_out)[BINARY_SIZE / sizeof(ARCH_WORD_32)];
+static pa_sha1_salt currentsalt;
+static krb5pa_out *output;
 
 static int new_keys;
 
@@ -128,14 +129,13 @@ static int new_keys;
 #define SEED			128
 
 static const char * warn[] = {
-	"P xfer: ",  ", init: ",  ", loop: ",  ", inter: ",  ", final: ",  ", res xfer: "
+	"xfer: ",  ", init: ",  ", loop: ",  ", final: ",  ", pa_sha1: ",  ", res xfer: "
 };
 
 static int split_events[] = { 2, -1, -1 };
 
 //This file contains auto-tuning routine(s). Has to be included after formats definitions.
-#include "opencl-autotune.h"
-#include "memdbg.h"
+#include "opencl_autotune.h"
 
 /* ------- Helper functions ------- */
 static size_t get_task_max_work_group_size()
@@ -145,20 +145,21 @@ static size_t get_task_max_work_group_size()
 	s = autotune_get_task_max_work_group_size(FALSE, 0, pbkdf2_init);
 	s = MIN(s, autotune_get_task_max_work_group_size(FALSE, 0, pbkdf2_loop));
 	s = MIN(s, autotune_get_task_max_work_group_size(FALSE, 0, pbkdf2_final));
+	s = MIN(s, autotune_get_task_max_work_group_size(FALSE, 0, pa_sha1_final));
 	return s;
 }
 
-#if 0
-struct fmt_main *me;
-#endif
+static void release_clobj(void);
 
 static void create_clobj(size_t gws, struct fmt_main *self)
 {
+	release_clobj();
+
 	gws *= ocl_v_width;
 
-	key_buf_size = 64 * gws;
+	key_buf_size = PLAINTEXT_LENGTH * gws;
 
-	/// Allocate memory
+	// Allocate memory
 	pinned_in = clCreateBuffer(context[gpu_id], CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, key_buf_size, NULL, &ret_code);
 	HANDLE_CLERROR(ret_code, "Error allocating pinned in");
 	mem_in = clCreateBuffer(context[gpu_id], CL_MEM_READ_ONLY, key_buf_size, NULL, &ret_code);
@@ -166,18 +167,24 @@ static void create_clobj(size_t gws, struct fmt_main *self)
 	inbuffer = clEnqueueMapBuffer(queue[gpu_id], pinned_in, CL_TRUE, CL_MAP_READ | CL_MAP_WRITE, 0, key_buf_size, 0, NULL, NULL, &ret_code);
 	HANDLE_CLERROR(ret_code, "Error mapping page-locked memory");
 
+	pinned_out = clCreateBuffer(context[gpu_id], CL_MEM_WRITE_ONLY | CL_MEM_ALLOC_HOST_PTR, sizeof(krb5pa_out) * gws, NULL, &ret_code);
+	HANDLE_CLERROR(ret_code, "Error allocating pinned out");
+	mem_out = clCreateBuffer(context[gpu_id], CL_MEM_WRITE_ONLY, sizeof(krb5pa_out) * gws, NULL, &ret_code);
+	HANDLE_CLERROR(ret_code, "Error allocating mem out");
+	output = clEnqueueMapBuffer(queue[gpu_id], pinned_out, CL_TRUE, CL_MAP_READ, 0, sizeof(krb5pa_out) * gws, 0, NULL, NULL, &ret_code);
+	HANDLE_CLERROR(ret_code, "Error mapping page-locked memory");
+
+	mem_dk = clCreateBuffer(context[gpu_id], CL_MEM_READ_WRITE, sizeof(pbkdf2_out) * gws, NULL, &ret_code);
+	HANDLE_CLERROR(ret_code, "Error allocating mem dk");
+
 	mem_state = clCreateBuffer(context[gpu_id], CL_MEM_READ_WRITE, sizeof(pbkdf2_state) * gws, NULL, &ret_code);
 	HANDLE_CLERROR(ret_code, "Error allocating mem_state");
 
-	mem_salt = clCreateBuffer(context[gpu_id], CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(pbkdf2_salt), &currentsalt, &ret_code);
+	mem_salt = clCreateBuffer(context[gpu_id], CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(pa_sha1_salt), &currentsalt, &ret_code);
 	HANDLE_CLERROR(ret_code, "Error allocating mem setting");
 
-	pinned_out = clCreateBuffer(context[gpu_id], CL_MEM_WRITE_ONLY | CL_MEM_ALLOC_HOST_PTR, sizeof(pbkdf2_out) * gws, NULL, &ret_code);
-	HANDLE_CLERROR(ret_code, "Error allocating pinned out");
-	mem_out = clCreateBuffer(context[gpu_id], CL_MEM_WRITE_ONLY, sizeof(pbkdf2_out) * gws, NULL, &ret_code);
-	HANDLE_CLERROR(ret_code, "Error allocating mem out");
-	output = clEnqueueMapBuffer(queue[gpu_id], pinned_out, CL_TRUE, CL_MAP_READ, 0, sizeof(pbkdf2_out) * gws, 0, NULL, NULL, &ret_code);
-	HANDLE_CLERROR(ret_code, "Error mapping page-locked memory");
+	mem_cleartext = clCreateBuffer(context[gpu_id], CL_MEM_READ_WRITE, (TIMESTAMP_SIZE + 63) / 64 * 64 * gws, NULL, &ret_code);
+	HANDLE_CLERROR(ret_code, "Error allocating mem cleartext");
 
 	HANDLE_CLERROR(clSetKernelArg(pbkdf2_init, 0, sizeof(mem_in), &mem_in), "Error while setting mem_in kernel argument");
 	HANDLE_CLERROR(clSetKernelArg(pbkdf2_init, 1, sizeof(mem_salt), &mem_salt), "Error while setting mem_salt kernel argument");
@@ -186,131 +193,53 @@ static void create_clobj(size_t gws, struct fmt_main *self)
 	HANDLE_CLERROR(clSetKernelArg(pbkdf2_loop, 0, sizeof(mem_state), &mem_state), "Error while setting mem_state kernel argument");
 
 	HANDLE_CLERROR(clSetKernelArg(pbkdf2_final, 0, sizeof(mem_salt), &mem_salt), "Error while setting mem_salt kernel argument");
-	HANDLE_CLERROR(clSetKernelArg(pbkdf2_final, 1, sizeof(mem_out), &mem_out), "Error while setting mem_out kernel argument");
+	HANDLE_CLERROR(clSetKernelArg(pbkdf2_final, 1, sizeof(mem_dk), &mem_dk), "Error while setting mem_dk kernel argument");
 	HANDLE_CLERROR(clSetKernelArg(pbkdf2_final, 2, sizeof(mem_state), &mem_state), "Error while setting mem_state kernel argument");
 
-	crypt_out = mem_alloc(sizeof(*crypt_out) * gws);
+	HANDLE_CLERROR(clSetKernelArg(pa_sha1_final, 0, sizeof(mem_salt), &mem_salt), "Error while setting mem_salt kernel argument");
+	HANDLE_CLERROR(clSetKernelArg(pa_sha1_final, 1, sizeof(mem_dk), &mem_dk), "Error while setting mem_dk kernel argument");
+	HANDLE_CLERROR(clSetKernelArg(pa_sha1_final, 2, sizeof(mem_cleartext), &mem_cleartext), "Error while setting mem_cleartext kernel argument");
+	HANDLE_CLERROR(clSetKernelArg(pa_sha1_final, 3, sizeof(mem_out), &mem_out), "Error while setting mem_out kernel argument");
 }
 
 static void release_clobj(void)
 {
-	if (crypt_out) {
+	if (mem_state) {
 		HANDLE_CLERROR(clEnqueueUnmapMemObject(queue[gpu_id], pinned_in, inbuffer, 0, NULL, NULL), "Error Unmapping mem in");
-		HANDLE_CLERROR(clEnqueueUnmapMemObject(queue[gpu_id], pinned_out, output, 0, NULL, NULL), "Error Unmapping mem in");
+		HANDLE_CLERROR(clEnqueueUnmapMemObject(queue[gpu_id], pinned_out, output, 0, NULL, NULL), "Error Unmapping mem out");
 		HANDLE_CLERROR(clFinish(queue[gpu_id]), "Error releasing memory mappings");
 
 		HANDLE_CLERROR(clReleaseMemObject(pinned_in), "Release pinned_in");
 		HANDLE_CLERROR(clReleaseMemObject(pinned_out), "Release pinned_out");
-		HANDLE_CLERROR(clReleaseMemObject(mem_in), "Release pinned_in");
+		HANDLE_CLERROR(clReleaseMemObject(mem_in), "Release mem_in");
 		HANDLE_CLERROR(clReleaseMemObject(mem_out), "Release mem_out");
+		HANDLE_CLERROR(clReleaseMemObject(mem_dk), "Release mem_dk");
 		HANDLE_CLERROR(clReleaseMemObject(mem_salt), "Release mem_salt");
 		HANDLE_CLERROR(clReleaseMemObject(mem_state), "Release mem state");
-
-		MEM_FREE(crypt_out);
+		HANDLE_CLERROR(clReleaseMemObject(mem_cleartext), "Release mem_cleartext");
+		mem_state = NULL;
 	}
 }
 
 static void done(void)
 {
-	if (autotuned) {
+	if (program[gpu_id]) {
 		release_clobj();
 
 		HANDLE_CLERROR(clReleaseKernel(pbkdf2_init), "Release Kernel");
 		HANDLE_CLERROR(clReleaseKernel(pbkdf2_loop), "Release Kernel");
 		HANDLE_CLERROR(clReleaseKernel(pbkdf2_final), "Release Kernel");
+		HANDLE_CLERROR(clReleaseKernel(pa_sha1_final), "Release Kernel");
 
 		HANDLE_CLERROR(clReleaseProgram(program[gpu_id]), "Release Program");
 
-		autotuned--;
-	}
-}
-
-/* n-fold(k-bits):
- * l = lcm(n,k)
- * r = l/k
- * s = k-bits | k-bits rot 13 | k-bits rot 13*2 | ... | k-bits rot 13*(r-1)
- * compute the 1's complement sum:
- * n-fold = s[0..n-1]+s[n..2n-1]+s[2n..3n-1]+..+s[(k-1)*n..k*n-1] */
-
-/* representation: msb first, assume n and k are multiples of 8, and
- * that k>=16.  this is the case of all the cryptosystems which are
- * likely to be used.  this function can be replaced if that
- * assumption ever fails.  */
-
-/* input length is in bits */
-static void nfold(unsigned int inbits, const unsigned char *in,
-    unsigned int outbits,unsigned char *out)
-{
-	int a,b,c,lcm;
-	int byte, i, msbit;
-
-	/* the code below is more readable if I make these bytes
-	 * instead of bits */
-
-	inbits >>= 3;
-	outbits >>= 3;
-
-	/* first compute lcm(n,k) */
-
-	a = outbits;
-	b = inbits;
-
-	while (b != 0) {
-		c = b;
-		b = a % b;
-		a = c;
-	}
-
-	lcm = outbits*inbits/a;
-
-	/* now do the real work */
-	memset(out, 0, outbits);
-	byte = 0;
-
-	/* this will end up cycling through k lcm(k,n)/k times, which
-	 * is correct */
-	for (i = lcm - 1; i >= 0; i--) {
-		/* compute the msbit in k which gets added into this byte */
-		msbit = (/* first, start with the msbit in the first, unrotated byte */
-				((inbits << 3) - 1)
-
-				/* then, for each byte, shift to the right for each
-				 * repetition */
-				+(((inbits << 3) + 13) * (i / inbits))
-				/* last, pick out the correct byte within that
-				 * shifted repetition */
-				+((inbits - (i % inbits)) << 3)
-				) % (inbits << 3);
-
-		/* pull out the byte value itself */
-		byte += (((in[((inbits  - 1) - (msbit >> 3)) % inbits] << 8)|
-					(in[((inbits) - (msbit>>3)) % inbits]))
-				>>((msbit & 7) + 1)) & 0xff;
-
-		/* do the addition */
-		byte += out[i % outbits];
-		out[i % outbits] = byte & 0xff;
-
-		/* keep around the carry bit, if any */
-		byte >>= 8;
-	}
-	/* if there's a carry bit left over, add it back in */
-	if (byte) {
-		for (i = outbits - 1; i >= 0; i--) {
-			/* do the addition */
-			byte += out[i];
-			out[i] = byte & 0xff;
-
-			/* keep around the carry bit, if any */
-			byte >>= 8;\
-		}
+		program[gpu_id] = NULL;
 	}
 }
 
 static void init(struct fmt_main *_self)
 {
-	unsigned char usage[5];
-	static char valgo[sizeof(ALGORITHM_NAME) + 8] = "";
+	static char valgo[sizeof(ALGORITHM_NAME) + 12] = "";
 
 	self = _self;
 
@@ -327,32 +256,19 @@ static void init(struct fmt_main *_self)
 		         ALGORITHM_NAME " %ux", ocl_v_width);
 		self->params.algorithm_name = valgo;
 	}
-
-	// generate 128 bits from 40 bits of "kerberos" string
-	nfold(8 * 8, (unsigned char*)"kerberos", 128, constant);
-
-	memset(usage,0,sizeof(usage));
-	usage[3] = 0x01;        // key number in big-endian format
-	usage[4] = 0xAA;        // used to derive Ke
-	nfold(sizeof(usage)*8,usage,sizeof(ke_input)*8,ke_input);
-
-	memset(usage,0,sizeof(usage));
-	usage[3] = 0x01;        // key number in big-endian format
-	usage[4] = 0x55;        // used to derive Ki
-	nfold(sizeof(usage)*8,usage,sizeof(ki_input)*8,ki_input);
 }
 
 static void reset(struct db_main *db)
 {
-	if (!autotuned) {
+	if (!program[gpu_id]) {
 		char build_opts[128];
 
 		snprintf(build_opts, sizeof(build_opts),
-		         "-DHASH_LOOPS=%u -DITERATIONS=%u -DOUTLEN=%u "
+		         "-DHASH_LOOPS=%u -DITERATIONS=%u -DMAX_OUTLEN=%u "
 		         "-DPLAINTEXT_LENGTH=%u -DV_WIDTH=%u",
-		         HASH_LOOPS, ITERATIONS, OUTLEN,
+		         HASH_LOOPS, ITERATIONS, MAX_OUTLEN,
 		         PLAINTEXT_LENGTH, ocl_v_width);
-		opencl_init("$JOHN/kernels/pbkdf2_hmac_sha1_kernel.cl", gpu_id,
+		opencl_init("$JOHN/opencl/krb5_kernel.cl", gpu_id,
 		            build_opts);
 
 		pbkdf2_init = clCreateKernel(program[gpu_id], "pbkdf2_init", &ret_code);
@@ -361,18 +277,18 @@ static void reset(struct db_main *db)
 		HANDLE_CLERROR(ret_code, "Error creating kernel");
 		pbkdf2_final = clCreateKernel(program[gpu_id], "pbkdf2_final", &ret_code);
 		HANDLE_CLERROR(ret_code, "Error creating kernel");
-
-		//Initialize openCL tuning (library) for this format.
-		opencl_init_auto_setup(SEED, 2 * HASH_LOOPS, split_events,
-		                       warn, 2, self, create_clobj,
-		                       release_clobj,
-		                       ocl_v_width * sizeof(pbkdf2_state), 0, db);
-
-		//Auto tune execution from shared/included code.
-		autotune_run(self, 4 * ITERATIONS + 4, 0,
-		             (cpu(device_info[gpu_id]) ?
-		              1000000000 : 5000000000ULL));
+		pa_sha1_final = clCreateKernel(program[gpu_id], "pa_sha1_final", &ret_code);
+		HANDLE_CLERROR(ret_code, "Error creating kernel");
 	}
+
+	//Initialize openCL tuning (library) for this format.
+	opencl_init_auto_setup(SEED, 2 * HASH_LOOPS, split_events,
+	                       warn, 2, self, create_clobj,
+	                       release_clobj,
+	                       ocl_v_width * sizeof(pbkdf2_state), 0, db);
+
+	//Auto tune execution from shared/included code.
+	autotune_run(self, 4 * ITERATIONS + 4, 0, 200);
 }
 
 static int valid(char *ciphertext, struct fmt_main *self)
@@ -419,7 +335,7 @@ static int valid(char *ciphertext, struct fmt_main *self)
 
 	// We support a max. total salt length of 52.
 	// We could opt to emit a warning if rejected here.
-	if(saltlen > MAX_SALTLEN) {
+	if (saltlen > MAX_SALTLEN) {
 		static int warned = 0;
 
 		if (!ldr_in_pot)
@@ -555,225 +471,79 @@ static void *get_binary(char *ciphertext)
 	return out;
 }
 
-static int get_hash_0(int index) { return crypt_out[index][0] & PH_MASK_0; }
-static int get_hash_1(int index) { return crypt_out[index][0] & PH_MASK_1; }
-static int get_hash_2(int index) { return crypt_out[index][0] & PH_MASK_2; }
-static int get_hash_3(int index) { return crypt_out[index][0] & PH_MASK_3; }
-static int get_hash_4(int index) { return crypt_out[index][0] & PH_MASK_4; }
-static int get_hash_5(int index) { return crypt_out[index][0] & PH_MASK_5; }
-static int get_hash_6(int index) { return crypt_out[index][0] & PH_MASK_6; }
+static int get_hash_0(int index) { return output[index].hash[0] & PH_MASK_0; }
+static int get_hash_1(int index) { return output[index].hash[0] & PH_MASK_1; }
+static int get_hash_2(int index) { return output[index].hash[0] & PH_MASK_2; }
+static int get_hash_3(int index) { return output[index].hash[0] & PH_MASK_3; }
+static int get_hash_4(int index) { return output[index].hash[0] & PH_MASK_4; }
+static int get_hash_5(int index) { return output[index].hash[0] & PH_MASK_5; }
+static int get_hash_6(int index) { return output[index].hash[0] & PH_MASK_6; }
 
 static void set_salt(void *salt)
 {
 	cur_salt = (struct custom_salt *)salt;
-	currentsalt.length = strlen((char*)cur_salt->salt);
-	currentsalt.iterations = ITERATIONS;
-	memcpy(currentsalt.salt, cur_salt->salt, currentsalt.length);
-	HANDLE_CLERROR(clEnqueueWriteBuffer(queue[gpu_id], mem_salt, CL_FALSE, 0, sizeof(pbkdf2_salt), &currentsalt, 0, NULL, NULL), "Copy setting to gpu");
-}
 
-static void AES_cts_encrypt(const unsigned char *in, unsigned char *out,
-                            size_t len, const AES_KEY *key,
-                            unsigned char *ivec, const int encryptp)
-{
-	unsigned char tmp[AES_BLOCK_SIZE];
-	unsigned int i;
+	currentsalt.pbkdf2.length = strlen((char*)cur_salt->salt);
+	currentsalt.pbkdf2.iterations = 4096;
+	currentsalt.pbkdf2.outlen = (cur_salt->etype == 17) ? 16 : 32;
 
-	if (encryptp) {
-		while(len > AES_BLOCK_SIZE) {
-			for (i = 0; i < AES_BLOCK_SIZE; i++)
-				tmp[i] = in[i] ^ ivec[i];
-			AES_encrypt(tmp, out, key);
-			memcpy(ivec, out, AES_BLOCK_SIZE);
-			len -= AES_BLOCK_SIZE;
-			in += AES_BLOCK_SIZE;
-			out += AES_BLOCK_SIZE;
-		}
-		for (i = 0; i < len; i++)
-			tmp[i] = in[i] ^ ivec[i];
-
-		for (; i < AES_BLOCK_SIZE; i++)
-			tmp[i] = 0 ^ ivec[i];
-
-		AES_encrypt(tmp, out - AES_BLOCK_SIZE, key);
-		memcpy(out, ivec, len);
-		memcpy(ivec, out - AES_BLOCK_SIZE, AES_BLOCK_SIZE);
-	} else {
-		unsigned char tmp2[AES_BLOCK_SIZE];
-		unsigned char tmp3[AES_BLOCK_SIZE];
-		while(len > AES_BLOCK_SIZE * 2) {
-			memcpy(tmp, in, AES_BLOCK_SIZE);
-			AES_decrypt(in, out, key);
-			for (i = 0; i < AES_BLOCK_SIZE; i++)
-				out[i] ^= ivec[i];
-			memcpy(ivec, tmp, AES_BLOCK_SIZE);
-			len -= AES_BLOCK_SIZE;
-			in += AES_BLOCK_SIZE;
-			out += AES_BLOCK_SIZE;
-		}
-
-		len -= AES_BLOCK_SIZE;
-		memcpy(tmp, in, AES_BLOCK_SIZE); /* save last iv */
-		AES_decrypt(in, tmp2, key);
-		memcpy(tmp3, in + AES_BLOCK_SIZE, len);
-		memcpy(tmp3 + len, tmp2 + len, AES_BLOCK_SIZE - len); /* xor 0 */
-
-		for (i = 0; i < len; i++)
-			out[i + AES_BLOCK_SIZE] = tmp2[i] ^ tmp3[i];
-
-		AES_decrypt(tmp3, out, key);
-		for (i = 0; i < AES_BLOCK_SIZE; i++)
-			out[i] ^= ivec[i];
-		memcpy(ivec, tmp, AES_BLOCK_SIZE);
-	}
-}
-
-// keysize = 32 for 256 bits, 16 for 128 bits
-static void dk(unsigned char key_out[], unsigned char key_in[],
-    size_t key_size, unsigned char ptext[], size_t ptext_size)
-{
-	unsigned char iv[32];
-	unsigned char plaintext[32];
-	AES_KEY ekey;
-
-	memset(iv,0,sizeof(iv));
-	memset(plaintext,0,sizeof(plaintext));
-	memcpy(plaintext,ptext,16);
-
-	AES_set_encrypt_key(key_in,key_size*8,&ekey);
-	AES_cbc_encrypt(plaintext,key_out,key_size,&ekey,iv,AES_ENCRYPT);
-}
-
-static void krb_decrypt(const unsigned char ciphertext[], size_t ctext_size,
-    unsigned char plaintext[], const unsigned char key[], size_t key_size)
-{
-	unsigned char iv[32];
-	AES_KEY ekey;
-
-	memset(iv,0,sizeof(iv));
-	AES_set_decrypt_key(key,key_size*8,&ekey);
-	AES_cts_encrypt(ciphertext,plaintext,ctext_size,&ekey,iv,AES_DECRYPT);
+	currentsalt.etype = cur_salt->etype;
+	memcpy(currentsalt.ct, cur_salt->ct, TIMESTAMP_SIZE);
+	memcpy(currentsalt.pbkdf2.salt, cur_salt->salt, currentsalt.pbkdf2.length);
+	HANDLE_CLERROR(clEnqueueWriteBuffer(queue[gpu_id], mem_salt, CL_FALSE, 0, sizeof(pa_sha1_salt), &currentsalt, 0, NULL, NULL), "Salt transfer");
+	HANDLE_CLERROR(clFlush(queue[gpu_id]), "clFlush failed in set_salt()");
 }
 
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
 	const int count = *pcount;
-	int i;
-	int key_size;
+	int i, j;
 	size_t scalar_gws;
 	size_t *lws = local_work_size ? &local_work_size : NULL;
+	size_t gws = GET_KPC_MULTIPLE(count, local_work_size);
 
-	global_work_size = GET_MULTIPLE_OR_BIGGER_VW(count, local_work_size);
-	scalar_gws = global_work_size * ocl_v_width;
+	scalar_gws = gws * ocl_v_width;
 
-	if (cur_salt->etype == 17)
-		key_size = 16;
-	else
-		key_size = 32;
-
-	/// Copy data to gpu
+	// Copy data to gpu
 	if (ocl_autotune_running || new_keys) {
 		BENCH_CLERROR(clEnqueueWriteBuffer(queue[gpu_id], mem_in, CL_FALSE, 0, key_buf_size, inbuffer, 0, NULL, multi_profilingEvent[0]), "Copy data to gpu");
 		new_keys = 0;
 	}
 
-	/// Run kernel
-	BENCH_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], pbkdf2_init, 1, NULL, &global_work_size, lws, 0, NULL, multi_profilingEvent[1]), "Run initial kernel");
+	// Run kernel
+	BENCH_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], pbkdf2_init, 1, NULL, &gws, lws, 0, NULL, multi_profilingEvent[1]), "Run initial kernel");
 
-	for (i = 0; i < (ocl_autotune_running ? 1 : ITERATIONS / HASH_LOOPS); i++) {
-		BENCH_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], pbkdf2_loop, 1, NULL, &global_work_size, lws, 0, NULL, multi_profilingEvent[2]), "Run loop kernel");
-		BENCH_CLERROR(clFinish(queue[gpu_id]), "Error running loop kernel");
-		opencl_process_event();
-	}
-
-	BENCH_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], pbkdf2_final, 1, NULL, &global_work_size, lws, 0, NULL, multi_profilingEvent[3]), "Run intermediate kernel");
-
-	for (i = 0; i < (ocl_autotune_running ? 1 : ITERATIONS / HASH_LOOPS); i++) {
-		BENCH_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], pbkdf2_loop, 1, NULL, &global_work_size, lws, 0, NULL, NULL), "Run loop kernel (2nd pass)");
-		BENCH_CLERROR(clFinish(queue[gpu_id]), "Error running loop kernel");
-		opencl_process_event();
-	}
-
-	BENCH_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], pbkdf2_final, 1, NULL, &global_work_size, lws, 0, NULL, multi_profilingEvent[4]), "Run final kernel (SHA1)");
-	BENCH_CLERROR(clFinish(queue[gpu_id]), "Failed running final kernel");
-
-	/// Read the result back
-	BENCH_CLERROR(clEnqueueReadBuffer(queue[gpu_id], mem_out, CL_TRUE, 0, sizeof(pbkdf2_out) * scalar_gws, output, 0, NULL, multi_profilingEvent[5]), "Copy result back");
-
-	if (!ocl_autotune_running) {
-#ifdef _OPENMP
-#pragma omp parallel for
-#endif
-		for (i = 0; i < count; i++) {
-			unsigned char base_key[32];
-			unsigned char Ke[32];
-			unsigned char plaintext[TIMESTAMP_SIZE];
-
-			//pbkdf2((const unsigned char*)saved_key[i], len, (unsigned char *)cur_salt->salt,strlen((char*)cur_salt->salt), 4096, (unsigned int*)tkey);
-
-			// generate 128 bits from 40 bits of "kerberos" string
-			// This is precomputed in init()
-			//nfold(8 * 8, (unsigned char*)"kerberos", 128, constant);
-			dk(base_key, (unsigned char*)output[i].dk, key_size, constant, 32);
-
-			/* The "well-known constant" used for the DK function is the key usage number,
-			 * expressed as four octets in big-endian order, followed by one octet indicated below.
-			 * Kc = DK(base-key, usage | 0x99);
-			 * Ke = DK(base-key, usage | 0xAA);
-			 * Ki = DK(base-key, usage | 0x55); */
-
-			// derive Ke for decryption/encryption
-			// This is precomputed in init()
-			//memset(usage,0,sizeof(usage));
-			//usage[3] = 0x01;        // key number in big-endian format
-			//usage[4] = 0xAA;        // used to derive Ke
-
-			//nfold(sizeof(usage)*8,usage,sizeof(ke_input)*8,ke_input);
-			dk(Ke, base_key, key_size, ke_input, 32);
-
-			// decrypt the AS-REQ timestamp encrypted with 256-bit AES
-			// here is enough to check the string, further computation below is required
-			// to fully verify the checksum
-			krb_decrypt(cur_salt->ct, TIMESTAMP_SIZE, plaintext, Ke, key_size);
-
-			// Check a couple bytes from known plain (YYYYMMDDHHMMSSZ) and
-			// bail out if we are out of luck.
-			if (plaintext[22] == '2' && plaintext[23] == '0' && plaintext[36] == 'Z') {
-				unsigned char Ki[32];
-				unsigned char checksum[20];
-
-				// derive Ki used in HMAC-SHA-1 checksum
-				// This is precomputed in init()
-				//memset(usage,0,sizeof(usage));
-				//usage[3] = 0x01;        // key number in big-endian format
-				//usage[4] = 0x55;        // used to derive Ki
-				//nfold(sizeof(usage)*8,usage,sizeof(ki_input)*8,ki_input);
-				dk(Ki, base_key, key_size, ki_input, 32);
-
-				// derive checksum of plaintext (only 96 bits used out of 160)
-				hmac_sha1(Ki, key_size, plaintext, TIMESTAMP_SIZE, checksum, 20);
-				memcpy(crypt_out[i], checksum, BINARY_SIZE);
-			} else {
-				memset(crypt_out[i], 0, BINARY_SIZE);
-			}
+	for (j = 0; j < (ocl_autotune_running ? 1 : ((currentsalt.pbkdf2.outlen + 19) / 20)); j++) {
+		for (i = 0; i < (ocl_autotune_running ? 1 : ITERATIONS / HASH_LOOPS); i++) {
+			BENCH_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], pbkdf2_loop, 1, NULL, &gws, lws, 0, NULL, multi_profilingEvent[2]), "Run loop kernel");
+			BENCH_CLERROR(clFinish(queue[gpu_id]), "Error running loop kernel");
+			opencl_process_event();
 		}
+
+		BENCH_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], pbkdf2_final, 1, NULL, &gws, lws, 0, NULL, multi_profilingEvent[3]), "Run final pbkdf2 kernel");
 	}
+
+	BENCH_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], pa_sha1_final, 1, NULL, &scalar_gws, lws, 0, NULL, multi_profilingEvent[4]), "Run final kernel (SHA1)");
+
+	// Read the result back
+	BENCH_CLERROR(clEnqueueReadBuffer(queue[gpu_id], mem_out, CL_TRUE, 0, sizeof(krb5pa_out) * scalar_gws, output, 0, NULL, multi_profilingEvent[5]), "Copy result back");
 
 	return count;
 }
 
 static int cmp_all(void *binary, int count)
 {
-	int index = 0;
-	for (; index < count; index++)
-		if (!memcmp(binary, crypt_out[index], ARCH_SIZE))
+	int index;
+
+	for (index = 0; index < count; index++)
+		if (((uint32_t*)binary)[0] == output[index].hash[0])
 			return 1;
 	return 0;
 }
 
 static int cmp_one(void *binary, int index)
 {
-	return !memcmp(binary, crypt_out[index], BINARY_SIZE);
+	return !memcmp(binary, output[index].hash, BINARY_SIZE);
 }
 
 static int cmp_exact(char *source, int index)
@@ -796,7 +566,7 @@ struct fmt_main fmt_opencl_krb5pa_sha1 = {
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_CASE | FMT_8_BIT | FMT_SPLIT_UNIFIES_CASE | FMT_OMP,
+		FMT_CASE | FMT_8_BIT | FMT_SPLIT_UNIFIES_CASE,
 		{ NULL },
 		{ FORMAT_TAG },
 		tests

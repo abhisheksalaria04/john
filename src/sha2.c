@@ -28,7 +28,6 @@
 #include "params.h"
 #include "common.h"
 #include "johnswap.h"
-#include "memdbg.h"
 
 static const unsigned char padding[128] = { 0x80, 0 /* 0,0,0,0.... */ };
 
@@ -64,15 +63,15 @@ static const unsigned char padding[128] = { 0x80, 0 /* 0,0,0,0.... */ };
 
 void jtr_sha256_hash_block(jtr_sha256_ctx *ctx, const unsigned char data[64], int perform_endian_swap)
 {
-	ARCH_WORD_32 A, B, C, D, E, F, G, H, tmp, W[16];
+	uint32_t A, B, C, D, E, F, G, H, tmp, W[16];
 #if ARCH_LITTLE_ENDIAN
 	int i;
 	if (perform_endian_swap) {
 		for (i = 0; i < 16; ++i)
-			W[i] = JOHNSWAP(*((ARCH_WORD_32*)&(data[i<<2])));
+			W[i] = JOHNSWAP(*((uint32_t*)&(data[i<<2])));
 	} else
 #endif
-		memcpy(W, data, 16*sizeof(ARCH_WORD_32));
+		memcpy(W, data, 16*sizeof(uint32_t));
 
 	// Load state from all prior blocks (or init state)
 	A = ctx->h[0];
@@ -190,7 +189,7 @@ void jtr_sha256_update(jtr_sha256_ctx *ctx, const void *_input, int ilenlft)
 	int left, fill;
 	const unsigned char *input;
 
-	if(ilenlft <= 0)
+	if (ilenlft <= 0)
 		return;
 
 	input = (const unsigned char*)_input;
@@ -199,7 +198,7 @@ void jtr_sha256_update(jtr_sha256_ctx *ctx, const void *_input, int ilenlft)
 
 	ctx->total += ilenlft;
 
-	if(left && ilenlft >= fill)
+	if (left && ilenlft >= fill)
 	{
 		memcpy(ctx->buffer + left, input, fill);
 		jtr_sha256_hash_block(ctx, ctx->buffer, 1);
@@ -215,23 +214,27 @@ void jtr_sha256_update(jtr_sha256_ctx *ctx, const void *_input, int ilenlft)
 		ilenlft  -= 0x40;
 	}
 
-	if(ilenlft > 0)
+	if (ilenlft > 0)
 		memcpy(ctx->buffer + left, input, ilenlft);
 }
 
 void jtr_sha256_final(void *_output, jtr_sha256_ctx *ctx)
 {
-	ARCH_WORD_32 last, padcnt;
-	ARCH_WORD_32 bits;
+	uint32_t last, padcnt;
+	uint32_t bits;
 	union {
-		ARCH_WORD_32 wlen[2];
+		uint32_t wlen[2];
 		unsigned char mlen[8];  // need aligned on sparc
 	} m;
 	unsigned char *output = (unsigned char*)_output;
 
 	bits = (ctx->total <<  3);
 	m.wlen[0] = 0;
-	OUTBE32(bits, m.mlen, 4);
+#if ARCH_LITTLE_ENDIAN
+	m.wlen[1] = JOHNSWAP(bits);
+#else
+	m.wlen[1] = bits;
+#endif
 
 	last = ctx->total & 0x3F;
 	padcnt = (last < 56) ? (56 - last) : (120 - last);
@@ -251,10 +254,10 @@ void jtr_sha256_final(void *_output, jtr_sha256_ctx *ctx)
 	OUTBE32(ctx->h[4], output, 16);
 	OUTBE32(ctx->h[5], output, 20);
 	OUTBE32(ctx->h[6], output, 24);
-	if(ctx->bIs256)
+	if (ctx->bIs256)
 		OUTBE32(ctx->h[7], output, 28);
 #else
-	if (is_aligned(output,sizeof(ARCH_WORD_32))) {
+	if (is_aligned(output,sizeof(uint32_t))) {
 		OUTBE32(ctx->h[0], output,  0);
 		OUTBE32(ctx->h[1], output,  4);
 		OUTBE32(ctx->h[2], output,  8);
@@ -262,11 +265,11 @@ void jtr_sha256_final(void *_output, jtr_sha256_ctx *ctx)
 		OUTBE32(ctx->h[4], output, 16);
 		OUTBE32(ctx->h[5], output, 20);
 		OUTBE32(ctx->h[6], output, 24);
-		if(ctx->bIs256)
+		if (ctx->bIs256)
 			OUTBE32(ctx->h[7], output, 28);
 	} else {
 		union {
-			ARCH_WORD_32 x[8];
+			uint32_t x[8];
 			unsigned char c[64];
 		} m;
 		unsigned char *tmp = m.c;
@@ -277,7 +280,7 @@ void jtr_sha256_final(void *_output, jtr_sha256_ctx *ctx)
 		OUTBE32(ctx->h[4], tmp, 16);
 		OUTBE32(ctx->h[5], tmp, 20);
 		OUTBE32(ctx->h[6], tmp, 24);
-		if(ctx->bIs256) {
+		if (ctx->bIs256) {
 			OUTBE32(ctx->h[7], tmp, 28);
 			memcpy(output, tmp, 32);
 		} else
@@ -299,6 +302,14 @@ void jtr_sha256_final(void *_output, jtr_sha256_ctx *ctx)
 #undef F1
 #undef R
 
+#define INIT_A 0x6a09e667f3bcc908ULL
+#define INIT_B 0xbb67ae8584caa73bULL
+#define INIT_C 0x3c6ef372fe94f82bULL
+#define INIT_D 0xa54ff53a5f1d36f1ULL
+#define INIT_E 0x510e527fade682d1ULL
+#define INIT_F 0x9b05688c2b3e6c1fULL
+#define INIT_G 0x1f83d9abfb41bd6bULL
+#define INIT_H 0x5be0cd19137e2179ULL
 
 
 #define S0(x) (ROR64(x,28) ^ ROR64(x,34) ^ ROR64(x,39))
@@ -315,7 +326,7 @@ void jtr_sha256_final(void *_output, jtr_sha256_ctx *ctx)
 		d += tmp; \
 	} while(0)
 
-static const ARCH_WORD_64 K[80] =
+static const uint64_t K[80] =
 {
 	0x428A2F98D728AE22ULL,  0x7137449123EF65CDULL,
 	0xB5C0FBCFEC4D3B2FULL,  0xE9B5DBA58189DBBCULL,
@@ -361,13 +372,13 @@ static const ARCH_WORD_64 K[80] =
 
 void jtr_sha512_hash_block(jtr_sha512_ctx *ctx, const unsigned char data[128], int perform_endian_swap)
 {
-	ARCH_WORD_64 A, B, C, D, E, F, G, H, tmp, W[80];
+	uint64_t A, B, C, D, E, F, G, H, tmp, W[80];
 	int i;
 
 #if ARCH_LITTLE_ENDIAN
 	if (perform_endian_swap) {
-		for(i = 0; i < 16; i++) {
-			W[i] = JOHNSWAP64(*((ARCH_WORD_64 *)&(data[i<<3])));
+		for (i = 0; i < 16; i++) {
+			W[i] = JOHNSWAP64(*((uint64_t *)&(data[i<<3])));
 		}
 	} else
 #endif
@@ -376,7 +387,7 @@ void jtr_sha512_hash_block(jtr_sha512_ctx *ctx, const unsigned char data[128], i
 		memcpy(W, data, 128);
 	}
 
-	for(; i < 80; i++)
+	for (; i < 80; i++)
 		W[i] = R1(W[i - 2]) + W[i - 7] + R0(W[i - 15]) + W[i - 16];
 
 	A = ctx->h[0];
@@ -483,7 +494,7 @@ void jtr_sha512_init(jtr_sha512_ctx *ctx, int bIs512)
 {
 	ctx->total = 0;
 	ctx->bIsQnxBuggy = 0;
-	if((ctx->bIs512 = bIs512))
+	if ((ctx->bIs512 = bIs512))
 	{
 		/* SHA-512 */
 		ctx->h[0] = 0x6A09E667F3BCC908ULL;
@@ -514,7 +525,7 @@ void jtr_sha512_update(jtr_sha512_ctx *ctx, const void *_input, int ilenlft)
 	int fill, left;
 	const unsigned char *input;
 
-	if(ilenlft <= 0)
+	if (ilenlft <= 0)
 		return;
 
 	input = (const unsigned char*)_input;
@@ -522,7 +533,7 @@ void jtr_sha512_update(jtr_sha512_ctx *ctx, const void *_input, int ilenlft)
 	fill = 128 - left;
 	ctx->total += ilenlft;
 
-	if(left && ilenlft >= fill)
+	if (left && ilenlft >= fill)
 	{
 		memcpy(ctx->buffer + left, input, fill);
 		jtr_sha512_hash_block(ctx, ctx->buffer, 1);
@@ -538,23 +549,28 @@ void jtr_sha512_update(jtr_sha512_ctx *ctx, const void *_input, int ilenlft)
 		ilenlft  -= 128;
 	}
 
-	if(ilenlft > 0)
+	if (ilenlft > 0)
 		memcpy(ctx->buffer + left, input, ilenlft);
 }
 
 void jtr_sha512_final(void *_output, jtr_sha512_ctx *ctx)
 {
-	ARCH_WORD_32 last, padcnt;
-	ARCH_WORD_64 bits;
+	uint32_t last, padcnt;
+	uint64_t bits;
 	union {
-		ARCH_WORD_64 wlen[2];
+		uint64_t wlen[2];
 		unsigned char mlen[16];  // need aligned on sparc
 	} m;
 	unsigned char *output = (unsigned char *)_output;
 
 	bits = (ctx->total <<  3);
 	m.wlen[0] = 0;
-	OUTBE64(bits, m.mlen, 8);
+#if ARCH_LITTLE_ENDIAN
+	m.wlen[1] = JOHNSWAP64(bits);
+#else
+	m.wlen[1] = bits;
+#endif
+
 
 	last = ctx->total & 0x7F;
 	padcnt = (last < 112) ? (112 - last) : (240 - last);
@@ -594,25 +610,25 @@ void jtr_sha512_final(void *_output, jtr_sha512_ctx *ctx)
 	OUTBE64(ctx->h[3], output, 24);
 	OUTBE64(ctx->h[4], output, 32);
 	OUTBE64(ctx->h[5], output, 40);
-	if(ctx->bIs512) {
+	if (ctx->bIs512) {
 		OUTBE64( ctx->h[6], output, 48 );
 		OUTBE64( ctx->h[7], output, 56 );
 	}
 #else
-	if (is_aligned(output,sizeof(ARCH_WORD_64))) {
+	if (is_aligned(output,sizeof(uint64_t))) {
 		OUTBE64(ctx->h[0], output,  0);
 		OUTBE64(ctx->h[1], output,  8);
 		OUTBE64(ctx->h[2], output, 16);
 		OUTBE64(ctx->h[3], output, 24);
 		OUTBE64(ctx->h[4], output, 32);
 		OUTBE64(ctx->h[5], output, 40);
-		if(ctx->bIs512) {
+		if (ctx->bIs512) {
 			OUTBE64( ctx->h[6], output, 48 );
 			OUTBE64( ctx->h[7], output, 56 );
 		}
 	} else {
 		union {
-			ARCH_WORD_64 x[8];
+			uint64_t x[8];
 			unsigned char c[64];
 		} m;
 		unsigned char *tmp = m.c;
@@ -622,7 +638,7 @@ void jtr_sha512_final(void *_output, jtr_sha512_ctx *ctx)
 		OUTBE64(ctx->h[3], tmp, 24);
 		OUTBE64(ctx->h[4], tmp, 32);
 		OUTBE64(ctx->h[5], tmp, 40);
-		if(ctx->bIs512) {
+		if (ctx->bIs512) {
 			OUTBE64(ctx->h[6], tmp, 48);
 			OUTBE64(ctx->h[7], tmp, 56);
 			memcpy(output, tmp, 64);
@@ -631,3 +647,60 @@ void jtr_sha512_final(void *_output, jtr_sha512_ctx *ctx)
 	}
 #endif
 }
+
+/*********************************************************************/
+/*********************************************************************/
+/*** Reverse SHA512 rounds. The function can be used on OpenCL.    ***/
+/*** - It must be available for a SIMD or non-SIMD build.          ***/
+/*********************************************************************/
+/*********************************************************************/
+#if defined(SIMD_COEF_64) || defined(HAVE_OPENCL)
+void sha512_reverse(uint64_t *hash)
+{
+	uint64_t a, b, c, d, e, f, g, h, s0, maj, tmp;
+
+	a = hash[0] - INIT_A;
+	b = hash[1] - INIT_B;
+	c = hash[2] - INIT_C;
+	d = hash[3] - INIT_D;
+	e = hash[4] - INIT_E;
+	f = hash[5] - INIT_F;
+	g = hash[6] - INIT_G;
+	h = hash[7] - INIT_H;
+
+	s0 = ROR64(b, 28) ^ ROR64(b, 34) ^ ROR64(b, 39);
+	maj = (b & c) ^ (b & d) ^ (c & d);
+	tmp = d;
+	d = e - (a - (s0 + maj));
+	e = f;
+	f = g;
+	g = h;
+	a = b;
+	b = c;
+	c = tmp;
+
+	s0 = ROR64(b, 28) ^ ROR64(b, 34) ^ ROR64(b, 39);
+	maj = (b & c) ^ (b & d) ^ (c & d);
+	tmp = d;
+	d = e - (a - (s0 + maj));
+	e = f;
+	f = g;
+	a = b;
+	b = c;
+	c = tmp;
+
+	s0 = ROR64(b, 28) ^ ROR64(b, 34) ^ ROR64(b, 39);
+	maj = (b & c) ^ (b & d) ^ (c & d);
+	tmp = d;
+	d = e - (a - (s0 + maj));
+	e = f;
+	a = b;
+	b = c;
+	c = tmp;
+
+	s0 = ROR64(b, 28) ^ ROR64(b, 34) ^ ROR64(b, 39);
+	maj = (b & c) ^ (b & d) ^ (c & d);
+
+	hash[0] = e - (a - (s0 + maj));
+}
+#endif

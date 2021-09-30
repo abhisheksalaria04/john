@@ -32,7 +32,6 @@
 #include "mask.h"
 #include "external.h"
 #include "unicode.h"
-#include "memdbg.h"
 
 #define UNICODE
 #define _UNICODE
@@ -128,7 +127,7 @@ static void rexgen_setlocale()
 
 	ret = setlocale(LC_CTYPE, john_locale);
 
-	if (options.verbosity == VERB_MAX) {
+	if (options.verbosity >= VERB_MAX) {
 		if (ret)
 			fprintf(stderr, "regex: Locale set to %s\n", ret);
 		else
@@ -137,13 +136,13 @@ static void rexgen_setlocale()
 }
 
 // Would be nice to have SOME way to be thread safe!!!
-static wchar_t BaseWord[LINE_BUFFER_SIZE];
+static char BaseWord[LINE_BUFFER_SIZE];
 
-size_t callback(wchar_t* dst, const size_t buffer_size)
+size_t callback(char* dst, const size_t buffer_size)
 {
-	size_t len = wcslen(BaseWord);
+	size_t len = strlen(BaseWord);
 
-	memcpy(dst, BaseWord, (len + 1) * SIZEOF_WCHAR_T);
+	memcpy(dst, BaseWord, (len + 1) * sizeof(BaseWord[0]));
 	*BaseWord = 0;
 	return len;
 }
@@ -185,12 +184,16 @@ void SetupAlpha(const char *regex_alpha)
 	}
 }
 
+void parser_error(const char* msg) {
+	fprintf(stderr, "%s\n", msg);
+}
+
 int do_regex_hybrid_crack(struct db_main *db, const char *regex,
                           const char *base_word, int regex_case,
                           const char *regex_alpha)
 {
 	c_simplestring_ptr buffer = c_simplestring_new();
-	char word[PLAINTEXT_BUFFER_SIZE];
+	const char* word;
 	static int bFirst = 1;
 	static int bALPHA = 0;
 	int max_len = db->format->params.plaintext_length;
@@ -198,15 +201,16 @@ int do_regex_hybrid_crack(struct db_main *db, const char *regex,
 
 	cur_regex = regex;
 	if (options.req_maxlength)
-		max_len = options.req_maxlength;
+		max_len = options.eff_maxlength;
 
 	if (bFirst)
 		rexgen_setlocale();
 
-	if (options.internal_cp != UTF_8)
-		cp_to_wcs(BaseWord, sizeof(BaseWord), base_word);
-	else
-		enc_to_wcs(BaseWord, sizeof(BaseWord), base_word);
+	//if (options.internal_cp != UTF_8)
+	//	cp_to_wcs(BaseWord, sizeof(BaseWord), base_word);
+	//else /* options.internal_cp == UTF_8 */
+	//	enc_to_wcs(BaseWord, sizeof(BaseWord), base_word);
+	strcpy(BaseWord, base_word);
 
 	if (bFirst) {
 		bFirst = 0;
@@ -218,7 +222,7 @@ int do_regex_hybrid_crack(struct db_main *db, const char *regex,
 		rec_init_hybrid(save_state_hybrid);
 		crk_set_hybrid_fix_state_func_ptr(rex_hybrid_fix_state);
 
-		regex_ptr = c_regex_cb(regex, callback);
+		regex_ptr = c_regex_cb_mb(regex, callback, parser_error);
 		if (!regex_ptr) {
 			c_simplestring_delete(buffer);
 			fprintf(stderr,
@@ -269,7 +273,7 @@ int do_regex_hybrid_crack(struct db_main *db, const char *regex,
 	}
 
 	if (!regex[0]) {
-		if (options.mask) {
+		if (options.flags & FLG_MASK_CHK) {
 			if (do_mask_crack(fmt_null_key)) {
 				retval = 1;
 				goto out;
@@ -286,19 +290,22 @@ int do_regex_hybrid_crack(struct db_main *db, const char *regex,
 	}
 
 	while (c_iterator_next(iter)) {
-		c_iterator_value(iter, buffer);
-		c_simplestring_to_utf8_string(buffer, &word[0], sizeof(word));
 		c_simplestring_clear(buffer);
-		if (options.internal_cp != UTF_8)
-			utf8_to_cp_r(word, word, sizeof(word));
-		if (options.mask) {
+		c_iterator_value(iter, buffer);
+		word = c_simplestring_to_string(buffer);
+		/**
+		  * rexgen already creates the correct encoding
+		  */
+		//if (options.internal_cp != UTF_8)
+		//	utf8_to_cp_r(word, word, sizeof(word));
+		if (options.flags & FLG_MASK_CHK) {
 			if (do_mask_crack(word)) {
 				retval = 1;
 				goto out;
 			}
 		} else
 		if (ext_filter((char *)word)) {
-			word[max_len] = 0;
+			c_simplestring_truncate_bytes(buffer, max_len);
 			if (crk_process_key((char *)word)) {
 				retval = 1;
 				goto out;
@@ -316,11 +323,11 @@ out:
 void do_regex_crack(struct db_main *db, const char *regex)
 {
 	c_simplestring_ptr buffer = c_simplestring_new();
-	char word[PLAINTEXT_BUFFER_SIZE];
+	const char* word;
 	int max_len = db->format->params.plaintext_length;
 
 	if (options.req_maxlength)
-		max_len = options.req_maxlength;
+		max_len = options.eff_maxlength;
 
 	cur_regex = regex;
 	rexgen_setlocale();
@@ -330,15 +337,26 @@ void do_regex_crack(struct db_main *db, const char *regex)
 	crk_init(db, fix_state, NULL);
 	rec_init_hybrid(save_state_hybrid);
 
-	regex_ptr = c_regex_cb(regex, callback);
+	regex_ptr = c_regex_cb_mb(regex, callback, parser_error);
 	if (!regex_ptr) {
 		fprintf(stderr,
 		        "Error, invalid regex expression.  John exiting now\n");
 		error();
 	}
 
-	if (rec_restored && john_main_process)
-		fprintf(stderr, "Proceeding with regex:%s\n", regex);
+	if (rec_restored && john_main_process) {
+		fprintf(stderr, "Proceeding with regex:%s", regex);
+		if (options.flags & FLG_MASK_CHK)
+			fprintf(stderr, ", hybrid mask:%s", options.mask ?
+			        options.mask : options.eff_mask);
+		if (options.rule_stack)
+			fprintf(stderr, ", rules-stack:%s", options.rule_stack);
+		if (options.req_minlength >= 0 || options.req_maxlength)
+			fprintf(stderr, ", lengths: %d-%d",
+			        options.eff_minlength + mask_add_len,
+			        options.eff_maxlength + mask_add_len);
+		fprintf(stderr, "\n");
+	}
 
 	iter = c_regex_iterator(regex_ptr);
 	if (restore_str) {
@@ -346,15 +364,15 @@ void do_regex_crack(struct db_main *db, const char *regex)
 		restore_str = 0;
 	}
 	while (c_iterator_next(iter)) {
-		c_iterator_value(iter, buffer);
-		c_simplestring_to_utf8_string(buffer, &word[0], sizeof(word));
 		c_simplestring_clear(buffer);
-		if (options.mask) {
+		c_iterator_value(iter, buffer);
+		word = c_simplestring_to_string(buffer);
+		if (options.flags & FLG_MASK_CHK) {
 			if (do_mask_crack(word))
 				break;
 		} else
 		if (ext_filter((char *)word)) {
-			word[max_len] = 0;
+			c_simplestring_truncate_bytes(buffer, max_len);
 			if (crk_process_key((char *)word))
 				break;
 		}
@@ -374,7 +392,7 @@ char *prepare_regex(char *regex, int *bCase, char **regex_alpha)
 		return NULL;
 
 	if (!regex || !bCase || !regex_alpha) {
-		if (options.verbosity == VERB_MAX)
+		if (options.verbosity >= VERB_MAX)
 			log_event("- No Rexgen used");
 		return 0;
 	}

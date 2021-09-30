@@ -10,8 +10,10 @@
 #ifndef _JOHN_CRACKER_H
 #define _JOHN_CRACKER_H
 
+#include <stdint.h>
+
 #include "loader.h"
-#include "stdint.h"
+#include "rules.h"
 
 /* Our last read position in pot file (during crack) */
 extern int64_t crk_pot_pos;
@@ -27,11 +29,26 @@ extern void crk_init(struct db_main *db, void (*fix_state)(void),
 	struct db_keys *guesses);
 
 /*
+ * How many stacked rules will be run, or 1 for none.
+ *
+ * Note: To tell IF stack rules will be run, use rules_stacked_after flag.
+ */
+extern int crk_stacked_rule_count;
+
+/*
  * Tries the key against all passwords in the database (should not be empty).
  * The return value is non-zero if aborted or everything got cracked (the
  * event_abort flag can be used to find out which of these has happened).
  */
-extern int crk_process_key(char *key);
+extern int (*crk_process_key)(char *key);
+
+/*
+ * Process all/any keys already loaded with crk_process_key, regardless of
+ * max_keys_per_crypt.  After this, it's safe to call reset() mid-run.
+ * The return value is non-zero if aborted or everything got cracked (the
+ * event_abort flag can be used to find out which of these has happened).
+ */
+extern int crk_process_buffer(void);
 
 /*
  * Resets the guessed keys buffer and processes all the buffered keys for
@@ -67,4 +84,8 @@ extern void (*crk_fix_state)(void);
  */
 typedef void (*fix_state_fp)();
 extern void crk_set_hybrid_fix_state_func_ptr(fix_state_fp fp);
+
+/* Show Remaining hashes & salts counts */
+extern char *crk_loaded_counts(void);
+
 #endif

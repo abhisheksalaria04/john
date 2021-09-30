@@ -1,4 +1,5 @@
-/* Nuked-Klan CMS DB cracker patch for JtR. Hacked together during
+/*
+ * Nuked-Klan CMS DB cracker patch for JtR. Hacked together during
  * July of 2012 by Dhiru Kholia <dhiru.kholia at gmail.com>.
  *
  * This software is Copyright (c) 2012, Dhiru Kholia <dhiru.kholia at gmail.com>,
@@ -23,6 +24,10 @@ john_register_one(&fmt_nk);
 
 #include <string.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "arch.h"
 #include "md5.h"
 #include "sha.h"
@@ -31,22 +36,6 @@ john_register_one(&fmt_nk);
 #include "formats.h"
 #include "params.h"
 #include "options.h"
-#include "common.h"
-
-#ifdef _OPENMP
-#include <omp.h>
-// Tuned on core i7 quad HT
-//   1  5059K
-//  16  8507k
-//  64  8907k   ** this was chosen.
-// 128  8914k
-// 256  8810k
-#ifndef OMP_SCALE
-#define OMP_SCALE    64
-#endif
-#endif
-
-#include "memdbg.h"
 
 #define FORMAT_LABEL		"nk"
 #define FORMAT_NAME		"Nuked-Klan CMS"
@@ -54,15 +43,19 @@ john_register_one(&fmt_nk);
 #define FORMAT_TAG_LEN	(sizeof(FORMAT_TAG)-1)
 #define ALGORITHM_NAME		"SHA1 MD5 32/" ARCH_BITS_STR
 #define BENCHMARK_COMMENT	""
-#define BENCHMARK_LENGTH	-1 /* change to 0 once there's any speedup for "many salts" */
+#define BENCHMARK_LENGTH	7
 #define PLAINTEXT_LENGTH	32
 #define CIPHERTEXT_LENGTH	(4+32+40+3+1)
 #define BINARY_SIZE		16
 #define SALT_SIZE		sizeof(struct custom_salt)
-#define BINARY_ALIGN		sizeof(ARCH_WORD_32)
+#define BINARY_ALIGN		sizeof(uint32_t)
 #define SALT_ALIGN			sizeof(int)
 #define MIN_KEYS_PER_CRYPT	1
-#define MAX_KEYS_PER_CRYPT	64
+#define MAX_KEYS_PER_CRYPT	256
+
+#ifndef OMP_SCALE
+#define OMP_SCALE			128 // MKPC and scale tuned for i7
+#endif
 
 static struct fmt_tests nk_tests[] = {
 	{"$nk$*379637b4fcde21b2c5fbc9a00af505e997443267*#17737d3661312121d5ae7d5c6156c0298", "openwall"},
@@ -75,16 +68,17 @@ static struct fmt_tests nk_tests[] = {
 };
 
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
-static ARCH_WORD_32 (*crypt_out)[BINARY_SIZE / sizeof(ARCH_WORD_32)];
+static uint32_t (*crypt_out)[BINARY_SIZE / sizeof(uint32_t)];
 
 static struct custom_salt {
 	unsigned char HASHKEY[41];
 	int decal;
 } *cur_salt;
 
-static inline void hex_encode(unsigned char *str, int len, unsigned char *out)
+inline static void hex_encode(unsigned char *str, int len, unsigned char *out)
 {
 	int i;
+
 	for (i = 0; i < len; ++i) {
 		out[0] = itoa16[str[i]>>4];
 		out[1] = itoa16[str[i]&0xF];
@@ -94,13 +88,8 @@ static inline void hex_encode(unsigned char *str, int len, unsigned char *out)
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	static int omp_t = 1;
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
+	omp_autotune(self, OMP_SCALE);
+
 	saved_key = mem_calloc(sizeof(*saved_key), self->params.max_keys_per_crypt);
 	crypt_out = mem_calloc(sizeof(*crypt_out), self->params.max_keys_per_crypt);
 }
@@ -137,7 +126,7 @@ static int valid(char *ciphertext, struct fmt_main *self)
 	if (!(ptr = strtokm(ctcopy, "*")))
 		goto error;
 	/* HASHKEY is of fixed length 40 */
-	if(hexlenl(ptr, &extra) != 40 || extra)
+	if (hexlenl(ptr, &extra) != 40 || extra)
 		goto error;
 	if (!(ptr = strtokm(NULL, "*")))
 		goto error;
@@ -147,7 +136,7 @@ static int valid(char *ciphertext, struct fmt_main *self)
 		goto error;
 	ptr += 2;
 	/* hash is of fixed length 32 */
-	if(hexlenl(ptr, &extra) != 32 || extra)
+	if (hexlenl(ptr, &extra) != 32 || extra)
 		goto error;
 
 	MEM_FREE(keeptr);
@@ -164,6 +153,8 @@ static void *get_salt(char *ciphertext)
 	char _ctcopy[256], *ctcopy=_ctcopy;
 	char *p;
 	int i;
+
+	memset(&cs, 0, sizeof(cs));
 	strnzcpy(ctcopy, ciphertext, 255);
 	ctcopy += FORMAT_TAG_LEN;	/* skip over "$nk$*" */
 	p = strtokm(ctcopy, "*");
@@ -194,13 +185,8 @@ static void *get_binary(char *ciphertext)
 	return out;
 }
 
-static int get_hash_0(int index) { return crypt_out[index][0] & PH_MASK_0; }
-static int get_hash_1(int index) { return crypt_out[index][0] & PH_MASK_1; }
-static int get_hash_2(int index) { return crypt_out[index][0] & PH_MASK_2; }
-static int get_hash_3(int index) { return crypt_out[index][0] & PH_MASK_3; }
-static int get_hash_4(int index) { return crypt_out[index][0] & PH_MASK_4; }
-static int get_hash_5(int index) { return crypt_out[index][0] & PH_MASK_5; }
-static int get_hash_6(int index) { return crypt_out[index][0] & PH_MASK_6; }
+#define COMMON_GET_HASH_VAR crypt_out
+#include "common-get-hash.h"
 
 static void set_salt(void *salt)
 {
@@ -210,7 +196,7 @@ static void set_salt(void *salt)
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
 	const int count = *pcount;
-	int index = 0;
+	int index;
 
 #ifdef _OPENMP
 #pragma omp parallel for
@@ -228,7 +214,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 		hex_encode(out, 20, pass);
 		for (i = 0, k=cur_salt->decal; i < 40; ++i, ++k) {
 			out[idx++] = pass[i];
-			if(k>19) k = 0;
+			if (k>19) k = 0;
 			out[idx++] = cur_salt->HASHKEY[k];
 		}
 		MD5_Init(&c);
@@ -240,16 +226,17 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 static int cmp_all(void *binary, int count)
 {
-	int index = 0;
-	for (; index < count; index++)
-		if (*((ARCH_WORD_32*)binary) == crypt_out[index][0])
+	int index;
+
+	for (index = 0; index < count; index++)
+		if (*((uint32_t*)binary) == crypt_out[index][0])
 			return 1;
 	return 0;
 }
 
 static int cmp_one(void *binary, int index)
 {
-	return *((ARCH_WORD_32*)binary) == crypt_out[index][0];
+	return *((uint32_t*)binary) == crypt_out[index][0];
 }
 
 static int cmp_exact(char *source, int index)
@@ -260,7 +247,7 @@ static int cmp_exact(char *source, int index)
 
 static void nk_set_key(char *key, int index)
 {
-	strcpy(saved_key[index], key);
+	strnzcpyn(saved_key[index], key, sizeof(*saved_key));
 }
 
 static char *get_key(int index)
@@ -315,13 +302,8 @@ struct fmt_main fmt_nk = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,

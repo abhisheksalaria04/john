@@ -67,9 +67,20 @@
 
 #include "arch.h"
 
+#if defined(SIMD_COEF_32) && !ARCH_LITTLE_ENDIAN
+	#undef SIMD_COEF_32
+	#undef SIMD_COEF_64
+	#undef SIMD_PARA_MD5
+	#undef SIMD_PARA_MD4
+	#undef SIMD_PARA_SHA1
+	#undef SIMD_PARA_SHA256
+	#undef SIMD_PARA_SHA512
+	#define BITS ARCH_BITS_STR
+#endif
+
 #if !FAST_FORMATS_OMP
 #ifdef _OPENMP
-# define FORCE_THREAD_MD5_body
+ #define FORCE_THREAD_MD5_body
 #endif
 #undef _OPENMP
 #endif
@@ -84,7 +95,6 @@
 #include "unicode.h"
 
 #include "dynamic.h"
-#include "memdbg.h"
 
 typedef struct Dynamic_Predicate_t
 {
@@ -330,7 +340,9 @@ static Dynamic_Predicate_t Dynamic_Predicate[] =  {
 	LARGE_HASH_FUNCS(SHA3_256)
 	LARGE_HASH_FUNCS(SHA3_384)
 	LARGE_HASH_FUNCS(SHA3_512)
+	LARGE_HASH_FUNCS(KECCAK_224)
 	LARGE_HASH_FUNCS(KECCAK_256)
+	LARGE_HASH_FUNCS(KECCAK_384)
 	LARGE_HASH_FUNCS(KECCAK_512)
 	// LARGE_HASH_EDIT_POINT
 	{ NULL, NULL }};
@@ -395,7 +407,9 @@ static Dynamic_Str_Flag_t Dynamic_Str_Flag[] =  {
 	SALT_AS_HEX_FLAG(SHA3_256)
 	SALT_AS_HEX_FLAG(SHA3_384)
 	SALT_AS_HEX_FLAG(SHA3_512)
+	SALT_AS_HEX_FLAG(KECCAK_224)
 	SALT_AS_HEX_FLAG(KECCAK_256)
+	SALT_AS_HEX_FLAG(KECCAK_384)
 	SALT_AS_HEX_FLAG(KECCAK_512)
 	// LARGE_HASH_EDIT_POINT
 
@@ -469,7 +483,9 @@ static Dynamic_Str_Flag_t Dynamic_Str_sFlag[] =  {
 	SALT_AS_HEX_FLAG2(SHA3_256)
 	SALT_AS_HEX_FLAG2(SHA3_384)
 	SALT_AS_HEX_FLAG2(SHA3_512)
+	SALT_AS_HEX_FLAG2(KECCAK_224)
 	SALT_AS_HEX_FLAG2(KECCAK_256)
+	SALT_AS_HEX_FLAG2(KECCAK_384)
 	SALT_AS_HEX_FLAG2(KECCAK_512)
 	// LARGE_HASH_EDIT_POINT
 

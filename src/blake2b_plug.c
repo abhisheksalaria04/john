@@ -1,4 +1,5 @@
-#if defined(__SSE2__) || defined(__SSE4_1__) || defined(__XOP__)
+#include "arch.h"
+#if !defined(JOHN_NO_SIMD) && (defined(__SSE2__) || defined(__SSE4_1__) || defined(__XOP__))
 /*
    BLAKE2 reference source code package - optimized C implementations
 
@@ -12,7 +13,7 @@
    this software. If not, see <http://creativecommons.org/publicdomain/zero/1.0/>.
 */
 
-#include "stdint.h"
+#include <stdint.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -34,32 +35,34 @@
 #endif
 
 #include "blake2b-round.h"
-#include "memdbg.h"
 
-JTR_ALIGN( 64 ) static const uint64_t blake2b_IV[8] =
-{
+JTR_ALIGN( 64 ) static const union {
+  uint64_t u64[8];
+  __m128i m128[4];
+} blake2b_IV =
+{{
   0x6a09e667f3bcc908ULL, 0xbb67ae8584caa73bULL,
   0x3c6ef372fe94f82bULL, 0xa54ff53a5f1d36f1ULL,
   0x510e527fade682d1ULL, 0x9b05688c2b3e6c1fULL,
   0x1f83d9abfb41bd6bULL, 0x5be0cd19137e2179ULL
-};
+}};
 
 /* Some helper functions, not necessarily useful */
-static inline int blake2b_set_lastnode( blake2b_state *S )
+inline static int blake2b_set_lastnode( blake2b_state *S )
 {
   S->f[1] = ~0ULL;
   return 0;
 }
 
-static inline int blake2b_set_lastblock( blake2b_state *S )
+inline static int blake2b_set_lastblock( blake2b_state *S )
 {
-  if( S->last_node ) blake2b_set_lastnode( S );
+  if ( S->last_node ) blake2b_set_lastnode( S );
 
   S->f[0] = ~0ULL;
   return 0;
 }
 
-static inline int blake2b_increment_counter( blake2b_state *S, const uint64_t inc )
+inline static int blake2b_increment_counter( blake2b_state *S, const uint64_t inc )
 {
 #if __x86_64__
   // ADD/ADC chain
@@ -81,13 +84,13 @@ int blake2b_init_param( blake2b_state *S, const blake2b_param *P )
   uint8_t *p, *h, *v;
   int i;
   //blake2b_init0( S );
-  v = ( uint8_t * )( blake2b_IV );
+  v = ( uint8_t * )( &blake2b_IV );
   h = ( uint8_t * )( S->h );
   p = ( uint8_t * )( P );
   /* IV XOR ParamBlock */
   memset( S, 0, sizeof( blake2b_state ) );
 
-  for( i = 0; i < BLAKE2B_OUTBYTES; ++i ) h[i] = v[i] ^ p[i];
+  for ( i = 0; i < BLAKE2B_OUTBYTES; ++i ) h[i] = v[i] ^ p[i];
 
   return 0;
 }
@@ -135,7 +138,7 @@ int blake2b_init_key( blake2b_state *S, const uint8_t outlen, const void *key, c
 
   if ( ( !keylen ) || keylen > BLAKE2B_KEYBYTES ) return -1;
 
-  if( blake2b_init_param( S, &P ) < 0 )
+  if ( blake2b_init_param( S, &P ) < 0 )
     return 0;
 
   {
@@ -148,7 +151,7 @@ int blake2b_init_key( blake2b_state *S, const uint8_t outlen, const void *key, c
   return 0;
 }
 
-static inline int blake2b_compress( blake2b_state *S, const uint8_t block[BLAKE2B_BLOCKBYTES] )
+inline static int blake2b_compress( blake2b_state *S, const uint8_t block[BLAKE2B_BLOCKBYTES] )
 {
   __m128i row1l, row1h;
   __m128i row2l, row2h;
@@ -191,10 +194,10 @@ static inline int blake2b_compress( blake2b_state *S, const uint8_t block[BLAKE2
   row1h = LOAD( &S->h[2] );
   row2l = LOAD( &S->h[4] );
   row2h = LOAD( &S->h[6] );
-  row3l = LOAD( &blake2b_IV[0] );
-  row3h = LOAD( &blake2b_IV[2] );
-  row4l = _mm_xor_si128( LOAD( &blake2b_IV[4] ), LOAD( &S->t[0] ) );
-  row4h = _mm_xor_si128( LOAD( &blake2b_IV[6] ), LOAD( &S->f[0] ) );
+  row3l = LOAD( &blake2b_IV.m128[0] );
+  row3h = LOAD( &blake2b_IV.m128[1] );
+  row4l = _mm_xor_si128( LOAD( &blake2b_IV.m128[2] ), LOAD( &S->t[0] ) );
+  row4h = _mm_xor_si128( LOAD( &blake2b_IV.m128[3] ), LOAD( &S->f[0] ) );
   ROUND( 0 );
   ROUND( 1 );
   ROUND( 2 );
@@ -226,7 +229,7 @@ int blake2b_update( blake2b_state *S, const uint8_t *in, uint64_t inlen )
     size_t left = S->buflen;
     size_t fill = 2 * BLAKE2B_BLOCKBYTES - left;
 
-    if( inlen > fill )
+    if ( inlen > fill )
     {
       memcpy( S->buf + left, in, fill ); // Fill buffer
       S->buflen += fill;
@@ -252,7 +255,7 @@ int blake2b_update( blake2b_state *S, const uint8_t *in, uint64_t inlen )
 
 int blake2b_final( blake2b_state *S, uint8_t *out, uint8_t outlen )
 {
-  if( S->buflen > BLAKE2B_BLOCKBYTES )
+  if ( S->buflen > BLAKE2B_BLOCKBYTES )
   {
     blake2b_increment_counter( S, BLAKE2B_BLOCKBYTES );
     blake2b_compress( S, S->buf );
@@ -278,15 +281,15 @@ int blake2b( uint8_t *out, const void *in, const void *key, const uint8_t outlen
 
   if ( NULL == out ) return -1;
 
-  if( NULL == key ) keylen = 0;
+  if ( NULL == key ) keylen = 0;
 
-  if( keylen )
+  if ( keylen )
   {
-    if( blake2b_init_key( S, outlen, key, keylen ) < 0 ) return -1;
+    if ( blake2b_init_key( S, outlen, key, keylen ) < 0 ) return -1;
   }
   else
   {
-    if( blake2b_init( S, outlen ) < 0 ) return -1;
+    if ( blake2b_init( S, outlen ) < 0 ) return -1;
   }
 
   blake2b_update( S, ( uint8_t * )in, inlen );

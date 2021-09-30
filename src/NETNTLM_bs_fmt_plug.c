@@ -62,7 +62,6 @@ john_register_one(&fmt_NETNTLM_old);
 #include "options.h"
 #include "md5.h"
 #include "unicode.h"
-#include "memdbg.h"
 
 #ifndef uchar
 #define uchar unsigned char
@@ -74,7 +73,7 @@ john_register_one(&fmt_NETNTLM_old);
 #define FORMAT_TAG_LEN       (sizeof(FORMAT_TAG)-1)
 #define ALGORITHM_NAME       "MD4 DES (ESS MD5) " DES_BS_ALGORITHM_NAME " naive"
 #define BENCHMARK_COMMENT    ""
-#define BENCHMARK_LENGTH     0
+#define BENCHMARK_LENGTH     7
 #define PLAINTEXT_LENGTH     125
 #define BINARY_SIZE          24
 #define BINARY_ALIGN         4
@@ -162,29 +161,32 @@ static char *prepare(char *split_fields[10], struct fmt_main *self)
 {
 	char *cp;
 	char clientChal[17];
+	char *srv_challenge = split_fields[3];
+	char *nethashv2     = split_fields[4];
+	char *cli_challenge = split_fields[5];
 
 	if (!strncmp(split_fields[1], FORMAT_TAG, FORMAT_TAG_LEN))
 		return split_fields[1];
-	if (!split_fields[3]||!split_fields[4]||!split_fields[5])
+	if (!srv_challenge || !nethashv2 || !cli_challenge)
 		return split_fields[1];
 
-	if (strlen(split_fields[4]) != CIPHERTEXT_LENGTH)
+	if (strlen(nethashv2) != CIPHERTEXT_LENGTH)
 		return split_fields[1];
 
 	// this string suggests we have an improperly formatted NTLMv2
-	if (!strncmp(&split_fields[4][32], "0101000000000000", 16))
+	if (!strncmp(&nethashv2[32], "0101000000000000", 16))
 		return split_fields[1];
 
 	// Handle ESS (8 byte client challenge in "LM" field padded with zeros)
-	if (strlen(split_fields[3]) == 48 && !strncmp(&split_fields[3][16],
+	if (strlen(srv_challenge) == 48 && !strncmp(&srv_challenge[16],
 	        "00000000000000000000000000000000", 32)) {
-		memcpy(clientChal, split_fields[3],16);
+		memcpy(clientChal, srv_challenge,16);
 		clientChal[16] = 0;
 	}
 	else
 		clientChal[0] = 0;
-	cp = mem_alloc(FORMAT_TAG_LEN+strlen(split_fields[5])+strlen(clientChal)+1+strlen(split_fields[4])+1);
-	sprintf(cp, "%s%s%s$%s", FORMAT_TAG, split_fields[5], clientChal, split_fields[4]);
+	cp = mem_alloc(FORMAT_TAG_LEN+strlen(cli_challenge)+strlen(clientChal)+1+strlen(nethashv2)+1);
+	sprintf(cp, "%s%s%s$%s", FORMAT_TAG, cli_challenge, clientChal, nethashv2);
 
 	if (valid(cp,self)) {
 		char *cp2 = str_alloc_copy(cp);
@@ -206,9 +208,9 @@ static char *split(char *ciphertext, int index, struct fmt_main *self)
 	return out;
 }
 
-static ARCH_WORD_32 *generate_des_format(uchar* binary)
+static uint32_t *generate_des_format(uchar* binary)
 {
-	static ARCH_WORD_32 out[6];
+	static uint32_t out[6];
 	ARCH_WORD block[6];
 	int chr, src,dst,i;
 	uchar value, mask;
@@ -219,7 +221,7 @@ static ARCH_WORD_32 *generate_des_format(uchar* binary)
 	for (chr = 0; chr < 24; chr=chr + 8)
 	{
 		dst = 0;
-		for(i=0; i<8; i++)
+		for (i=0; i<8; i++)
 		{
 			value = binary[chr + i];
 			mask = 0x80;
@@ -234,7 +236,7 @@ static ARCH_WORD_32 *generate_des_format(uchar* binary)
 	}
 
 	/* Apply initial permutation on ciphertext blocks */
-	for(i=0; i<6; i=i+2)
+	for (i=0; i<6; i=i+2)
 	{
 		ptr = DES_do_IP(&block[i]);
 		out[i] = ptr[1];
@@ -248,7 +250,7 @@ static void *get_binary(char *ciphertext)
 {
 	uchar binary[BINARY_SIZE];
 	int i;
-	ARCH_WORD_32 *ptr;
+	uint32_t *ptr;
 
 	ciphertext = strrchr(ciphertext, '$') + 1;
 	for (i=0; i<BINARY_SIZE; i++) {
@@ -261,7 +263,7 @@ static void *get_binary(char *ciphertext)
 	return ptr;
 }
 
-static inline void setup_des_key(unsigned char key_56[], int index)
+inline static void setup_des_key(unsigned char key_56[], int index)
 {
 	char key[8];
 
@@ -316,17 +318,17 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 static int cmp_all(void *binary, int count)
 {
-	return DES_bs_cmp_all((ARCH_WORD_32 *)binary, count);
+	return DES_bs_cmp_all((uint32_t *)binary, count);
 }
 
 static int cmp_one(void *binary, int index)
 {
-	return DES_bs_cmp_one((ARCH_WORD_32 *)binary, 32, index);
+	return DES_bs_cmp_one((uint32_t *)binary, 32, index);
 }
 
 static int cmp_exact(char *source, int index)
 {
-	ARCH_WORD_32 *binary = get_binary(source);
+	uint32_t *binary = get_binary(source);
 
 	if (!DES_bs_cmp_one(binary, 64, index))
 		return 0;
@@ -407,8 +409,7 @@ static void set_salt(void *salt)
 
 static void netntlm_set_key(char *key, int index)
 {
-	saved_len[index] = strlen(key);
-	memcpy(saved_plain[index], key, saved_len[index]+1);
+	saved_len[index] = strnzcpyn(saved_plain[index], key, sizeof(*saved_plain));
 	keys_prepared = 0;
 }
 
@@ -419,7 +420,7 @@ static char *get_key(int index)
 
 static int salt_hash(void *salt)
 {
-	return *(ARCH_WORD_32 *)salt & (SALT_HASH_SIZE - 1);
+	return *(uint32_t *)salt & (SALT_HASH_SIZE - 1);
 }
 
 struct fmt_main fmt_NETNTLM_old = {
@@ -443,7 +444,7 @@ struct fmt_main fmt_NETNTLM_old = {
 		FMT_OMP |
 #endif
 #endif
-		FMT_CASE | FMT_8_BIT | FMT_SPLIT_UNIFIES_CASE | FMT_UNICODE | FMT_UTF8,
+		FMT_CASE | FMT_8_BIT | FMT_SPLIT_UNIFIES_CASE | FMT_UNICODE | FMT_ENC,
 		{ NULL },
 		{ FORMAT_TAG },
 		tests

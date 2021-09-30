@@ -1,6 +1,6 @@
 /*
  * This file is part of John the Ripper password cracker,
- * Copyright (c) 1996-2001,2008,2010-2012 by Solar Designer
+ * Copyright (c) 1996-2001,2008,2010-2012,2017 by Solar Designer
  *
  * ...with changes in the jumbo patch, by bartavelle and magnum.
  *
@@ -18,7 +18,7 @@
 #include "MD5_std.h"
 #include "common.h"
 #include "formats.h"
-#include "cryptmd5_common.h"
+#include "md5crypt_common.h"
 
 #if defined(_OPENMP) && defined(SIMD_PARA_MD5)
 #ifndef OMP_SCALE
@@ -26,13 +26,12 @@
 #endif
 #include <omp.h>
 #endif
-#include "memdbg.h"
 
 #define FORMAT_LABEL			"md5crypt"
-#define FORMAT_NAME			"crypt(3) $1$"
+#define FORMAT_NAME			"crypt(3) $1$ (and variants)"
 
 #define BENCHMARK_COMMENT		""
-#define BENCHMARK_LENGTH		-1
+#define BENCHMARK_LENGTH		7
 
 #define PLAINTEXT_LENGTH		15
 #define CIPHERTEXT_LENGTH		22
@@ -51,6 +50,7 @@
 
 static struct fmt_tests tests[] = {
 	{"$1$12345678$aIccj83HRDBo6ux1bVx7D1", "0123456789ABCDE"},
+	{"$1$7Uu2iTBB$Y4hQl2WvrOA3LBbLDxbAf0", "12345"},
 	{"$apr1$Q6ZYh...$RV6ft2bZ8j.NGrxLYaJt9.", "test"},
 	{"$1$12345678$f8QoJuo0DpBRfQSD0vglc1", "12345678"},
 	{"$1$$qRPK7m23GJusamGpoGLby/", ""},
@@ -78,7 +78,6 @@ static struct fmt_tests tests[] = {
 	 * lpa_options = std_hash=true */
 	{"$1$JVDbGx8K$T9h8HK4LZxeLPMTAxCfpc1", "password"},
 	{"$1$1Cu6fEvv$42kuaJ5fMEqyVStPuFG040", "0123456789ABCDE"},
-	{"$1$ql5x.xXL$vYVDhExol2xUBBpERRWcn1", "jtr>hashcat"},
 	{"$1$27iyq7Ya$miN09fW1Scj0DHVNyewoU/", ""},
 	{"$1$84Othc1n$v1cuReaa5lRdGuHaOa76n0", "a"},
 	{"$1$4zq0BsCR$U2ua9WZtDEhzy4gFSiLxN1", "aa"},
@@ -307,9 +306,9 @@ static int cmp_all(void *binary, int count)
 #ifdef SIMD_PARA_MD5
 	unsigned int x,y;
 
-	for(y=0;y<SIMD_PARA_MD5*omp_para;y++) for(x=0;x<SIMD_COEF_32;x++)
+	for (y=0;y<SIMD_PARA_MD5*omp_para;y++) for (x=0;x<SIMD_COEF_32;x++)
 	{
-		if( ((MD5_word *)binary)[0] == ((MD5_word *)sout)[x+y*SIMD_COEF_32*4] )
+		if ( ((MD5_word *)binary)[0] == ((MD5_word *)sout)[x+y*SIMD_COEF_32*4] )
 			return 1;
 	}
 	return 0;
@@ -338,13 +337,13 @@ static int cmp_one(void *binary, int index)
 	x = index&(SIMD_COEF_32-1);
 	y = (unsigned int)index/SIMD_COEF_32;
 
-	if(((unsigned int*)binary)[0] != ((unsigned int*)sout)[x+y*SIMD_COEF_32*4+0*SIMD_COEF_32])
+	if (((unsigned int*)binary)[0] != ((unsigned int*)sout)[x+y*SIMD_COEF_32*4+0*SIMD_COEF_32])
 		return 0;
-	if(((unsigned int*)binary)[1] != ((unsigned int*)sout)[x+y*SIMD_COEF_32*4+1*SIMD_COEF_32])
+	if (((unsigned int*)binary)[1] != ((unsigned int*)sout)[x+y*SIMD_COEF_32*4+1*SIMD_COEF_32])
 		return 0;
-	if(((unsigned int*)binary)[2] != ((unsigned int*)sout)[x+y*SIMD_COEF_32*4+2*SIMD_COEF_32])
+	if (((unsigned int*)binary)[2] != ((unsigned int*)sout)[x+y*SIMD_COEF_32*4+2*SIMD_COEF_32])
 		return 0;
-	if(((unsigned int*)binary)[3] != ((unsigned int*)sout)[x+y*SIMD_COEF_32*4+3*SIMD_COEF_32])
+	if (((unsigned int*)binary)[3] != ((unsigned int*)sout)[x+y*SIMD_COEF_32*4+3*SIMD_COEF_32])
 		return 0;
 	return 1;
 #else

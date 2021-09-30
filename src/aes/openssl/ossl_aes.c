@@ -40,7 +40,7 @@ void JTR_AES_cbc_encrypt(const unsigned char *in, unsigned char *out, size_t len
 
 #endif
 
-static inline void aes_key_mgmt(AES_KEY *akey, unsigned char *key, unsigned int key_length, int direction) {
+inline static void aes_key_mgmt(AES_KEY *akey, unsigned char *key, unsigned int key_length, int direction) {
 	if (direction == AES_ENCRYPT) {
 		AES_set_encrypt_key(key, key_length, akey);
 	} else {
@@ -48,7 +48,7 @@ static inline void aes_key_mgmt(AES_KEY *akey, unsigned char *key, unsigned int 
 	}
 }
 
-static inline void aes_cbc(unsigned char *in, unsigned char *out, unsigned char *key, size_t num_blocks, unsigned char *iv, unsigned int key_length, int direction) {
+inline static void aes_cbc(unsigned char *in, unsigned char *out, unsigned char *key, size_t num_blocks, unsigned char *iv, unsigned int key_length, int direction) {
 	AES_KEY akey;
 	aes_key_mgmt(&akey, key, key_length, direction);
 	AES_cbc_encrypt(in, out, num_blocks * AES_BLOCK_SIZE, &akey, iv, direction);
@@ -77,11 +77,11 @@ void JTR_AES_decrypt(const unsigned char *in, unsigned char *out, const AES_KEY 
 }
 
 #undef AES_set_encrypt_key
-void JTR_AES_set_encrypt_key(const unsigned char *userKey, const int bits, AES_KEY *key) {
-	AES_set_encrypt_key(userKey, bits, key);
+int JTR_AES_set_encrypt_key(const unsigned char *userKey, const int bits, AES_KEY *key) {
+	return AES_set_encrypt_key(userKey, bits, key);
 }
 
 #undef AES_set_decrypt_key
-void JTR_AES_set_decrypt_key(const unsigned char *userKey, const int bits, AES_KEY *key) {
-	AES_set_decrypt_key(userKey, bits, key);
+int JTR_AES_set_decrypt_key(const unsigned char *userKey, const int bits, AES_KEY *key) {
+	return AES_set_decrypt_key(userKey, bits, key);
 }

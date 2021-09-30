@@ -57,7 +57,6 @@
 #include <string.h>
 #include <ctype.h>
 #include "memory.h"
-#include "memdbg.h"
 #include "common.h"
 
 
@@ -248,12 +247,22 @@ upcase(char *string)
   return (string);
 }
 
+#ifdef HAVE_LIBFUZZER
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+	return 0;
+}
+#endif
+
+#ifdef HAVE_LIBFUZZER
+int main_dummy(int argc, char **argv)
+#else
 int
 main(int argc, char *argv[])
+#endif
 {
-  signed char c;
   char *p, *host, *realm, user[128];
-  int i;
+  int c, i;
 
   host = realm = NULL;
 
@@ -296,7 +305,7 @@ main(int argc, char *argv[])
 #else
 #include <stdio.h>
 int main() {
-	printf ("tgtsnarf could NOT be compiled on this system, due to lack of support libraries\n");
+	printf("tgtsnarf could NOT be compiled on this system, due to lack of support libraries\n");
 	return 1;
 }
 #endif

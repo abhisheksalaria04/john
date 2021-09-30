@@ -1,5 +1,6 @@
-/* whirlpool cracker patch for JtR. Hacked together during April of 2013 by Dhiru
- * Kholia <dhiru at openwall.com>.
+/*
+ * Whirlpool cracker patch for JtR. Hacked together during April of 2013 by
+ * Dhiru Kholia <dhiru at openwall.com>.
  *
  * This software is Copyright (c) 2013 Dhiru Kholia <dhiru at openwall.com> and
  * it is hereby released to the general public under the following terms:
@@ -19,43 +20,51 @@ john_register_one(&fmt_whirlpool);
 #else
 
 #include <string.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "arch.h"
-#include "openssl_local_overrides.h"
-#include "sph_whirlpool.h"
 #include "misc.h"
 #include "common.h"
 #include "formats.h"
 #include "params.h"
 #include "options.h"
+#include "sph_whirlpool.h"
+#include "openssl_local_overrides.h"
+#if AC_BUILT
+#include "autoconfig.h"
+#endif
+#if HAVE_LIBCRYPTO
 #include <openssl/opensslv.h>
+#endif
 #if (AC_BUILT && HAVE_WHIRLPOOL) ||	\
    (!AC_BUILT && OPENSSL_VERSION_NUMBER >= 0x10000000 && !HAVE_NO_SSL_WHIRLPOOL)
 #include <openssl/whrlpool.h>
 #endif
-#ifdef _OPENMP
-static int omp_t = 1;
-#include <omp.h>
-#ifndef OMP_SCALE
-#define OMP_SCALE               256
-#endif
-#endif
-#include "memdbg.h"
 
-#define FORMAT_LABEL		"Whirpool"
-#define FORMAT_NAME		""
-#define FORMAT_TAG		"$whirlpool$"
-#define TAG_LENGTH		11
-#define ALGORITHM_NAME		"32/" ARCH_BITS_STR
-#define BENCHMARK_COMMENT	""
-#define BENCHMARK_LENGTH	-1
-#define PLAINTEXT_LENGTH	125
-#define CIPHERTEXT_LENGTH	128
-#define BINARY_SIZE		64
-#define SALT_SIZE		0
-#define MIN_KEYS_PER_CRYPT	1
-#define MAX_KEYS_PER_CRYPT	1
-#define BINARY_ALIGN		4
-#define SALT_ALIGN		1
+#define FORMAT_LABEL            "Whirpool"
+#define FORMAT_NAME             ""
+#define FORMAT_TAG              "$whirlpool$"
+#define TAG_LENGTH              11
+#define ALGORITHM_NAME          "32/" ARCH_BITS_STR
+#define BENCHMARK_COMMENT       ""
+#define BENCHMARK_LENGTH        0x107
+#define PLAINTEXT_LENGTH        125
+#define CIPHERTEXT_LENGTH       128
+#define BINARY_SIZE             64
+#define BINARY_ALIGN            4
+#define SALT_SIZE               0
+#define SALT_ALIGN              1
+#define MIN_KEYS_PER_CRYPT      1
+#define MAX_KEYS_PER_CRYPT_W    512 // Whirlpool
+#define MAX_KEYS_PER_CRYPT_W0   512 // Whirlpool0
+#define MAX_KEYS_PER_CRYPT_W1   64  // Whirlpool1
+
+#ifndef OMP_SCALE
+#define OMP_SCALE               4 // Tuned w/ MKPC for core i7
+#endif
 
 static struct fmt_tests whirlpool_0_tests[] = {
 	{"B3E1AB6EAF640A34F784593F2074416ACCD3B8E62C620175FCA0997B1BA2347339AA0D79E754C308209EA36811DFA40C1C32F1A2B9004725D987D3635165D3C8", ""},
@@ -79,16 +88,12 @@ static struct fmt_tests whirlpool_tests[] = {
 };
 
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
-static ARCH_WORD_32 (*crypt_out)[BINARY_SIZE / sizeof(ARCH_WORD_32)];
+static uint32_t (*crypt_out)[BINARY_SIZE / sizeof(uint32_t)];
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
+	omp_autotune(self, OMP_SCALE);
+
 	saved_key = mem_calloc(self->params.max_keys_per_crypt,
 	                       sizeof(*saved_key));
 	crypt_out = mem_calloc(self->params.max_keys_per_crypt,
@@ -139,10 +144,8 @@ static void *get_binary(char *ciphertext)
 	char *p;
 	int i;
 
-	if (!strncmp(ciphertext, FORMAT_TAG, TAG_LENGTH))
-		p = strrchr(ciphertext, '$') + 1;
-	else
-		p = ciphertext;
+	p = ciphertext + TAG_LENGTH;
+
 	for (i = 0; i < BINARY_SIZE; i++) {
 		out[i] =
 		    (atoi16[ARCH_INDEX(*p)] << 4) |
@@ -153,62 +156,57 @@ static void *get_binary(char *ciphertext)
 	return out;
 }
 
-static int get_hash_0(int index) { return crypt_out[index][0] & PH_MASK_0; }
-static int get_hash_1(int index) { return crypt_out[index][0] & PH_MASK_1; }
-static int get_hash_2(int index) { return crypt_out[index][0] & PH_MASK_2; }
-static int get_hash_3(int index) { return crypt_out[index][0] & PH_MASK_3; }
-static int get_hash_4(int index) { return crypt_out[index][0] & PH_MASK_4; }
-static int get_hash_5(int index) { return crypt_out[index][0] & PH_MASK_5; }
-static int get_hash_6(int index) { return crypt_out[index][0] & PH_MASK_6; }
+
+#define COMMON_GET_HASH_VAR crypt_out
+#include "common-get-hash.h"
 
 static int crypt_0(int *pcount, struct db_salt *salt)
 {
 	int count = *pcount;
-	int index = 0;
+	int index;
 
 #ifdef _OPENMP
 #pragma omp parallel for
-	for (index = 0; index < count; index++)
 #endif
-	{
+	for (index = 0; index < count; index++) {
 		sph_whirlpool0_context ctx;
 
 		sph_whirlpool0_init(&ctx);
 		sph_whirlpool0(&ctx, saved_key[index], strlen(saved_key[index]));
 		sph_whirlpool0_close(&ctx, (unsigned char*)crypt_out[index]);
 	}
+
 	return count;
 }
 
 static int crypt_1(int *pcount, struct db_salt *salt)
 {
 	int count = *pcount;
-	int index = 0;
+	int index;
 
 #ifdef _OPENMP
 #pragma omp parallel for
-	for (index = 0; index < count; index++)
 #endif
-	{
+	for (index = 0; index < count; index++) {
 		sph_whirlpool1_context ctx;
 
 		sph_whirlpool1_init(&ctx);
 		sph_whirlpool1(&ctx, saved_key[index], strlen(saved_key[index]));
 		sph_whirlpool1_close(&ctx, (unsigned char*)crypt_out[index]);
 	}
+
 	return count;
 }
 
 static int crypt_2(int *pcount, struct db_salt *salt)
 {
 	int count = *pcount;
-	int index = 0;
+	int index;
 
 #ifdef _OPENMP
 #pragma omp parallel for
-	for (index = 0; index < count; index++)
 #endif
-	{
+	for (index = 0; index < count; index++) {
 #if (AC_BUILT && HAVE_WHIRLPOOL) ||	\
    (!AC_BUILT && OPENSSL_VERSION_NUMBER >= 0x10000000 && !HAVE_NO_SSL_WHIRLPOOL)
 		WHIRLPOOL_CTX ctx;
@@ -224,15 +222,15 @@ static int crypt_2(int *pcount, struct db_salt *salt)
 		sph_whirlpool_close(&ctx, (unsigned char*)crypt_out[index]);
 #endif
 	}
+
 	return count;
 }
 
 static int cmp_all(void *binary, int count)
 {
-	int index = 0;
-#ifdef _OPENMP
-	for (; index < count; index++)
-#endif
+	int index;
+
+	for (index = 0; index < count; index++)
 		if (!memcmp(binary, crypt_out[index], ARCH_SIZE))
 			return 1;
 	return 0;
@@ -250,11 +248,7 @@ static int cmp_exact(char *source, int index)
 
 static void whirlpool_set_key(char *key, int index)
 {
-	int saved_len = strlen(key);
-	if (saved_len > PLAINTEXT_LENGTH)
-		saved_len = PLAINTEXT_LENGTH;
-	memcpy(saved_key[index], key, saved_len);
-	saved_key[index][saved_len] = 0;
+	strnzcpy(saved_key[index], key, sizeof(*saved_key));
 }
 
 static char *get_key(int index)
@@ -276,7 +270,7 @@ struct fmt_main fmt_whirlpool_0 = {
 		SALT_SIZE,
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
-		MAX_KEYS_PER_CRYPT,
+		MAX_KEYS_PER_CRYPT_W0,
 		FMT_CASE | FMT_8_BIT | FMT_OMP | FMT_OMP_BAD |
 		FMT_SPLIT_UNIFIES_CASE,
 		{ NULL },
@@ -310,13 +304,8 @@ struct fmt_main fmt_whirlpool_0 = {
 		fmt_default_clear_keys,
 		crypt_0,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,
@@ -339,7 +328,7 @@ struct fmt_main fmt_whirlpool_1 = {
 		SALT_SIZE,
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
-		MAX_KEYS_PER_CRYPT,
+		MAX_KEYS_PER_CRYPT_W1,
 		FMT_CASE | FMT_8_BIT | FMT_OMP | FMT_OMP_BAD |
 		FMT_SPLIT_UNIFIES_CASE,
 		{ NULL },
@@ -374,13 +363,8 @@ struct fmt_main fmt_whirlpool_1 = {
 		fmt_default_clear_keys,
 		crypt_1,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,
@@ -402,7 +386,7 @@ struct fmt_main fmt_whirlpool = {
 		SALT_SIZE,
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
-		MAX_KEYS_PER_CRYPT,
+		MAX_KEYS_PER_CRYPT_W,
 		FMT_CASE | FMT_8_BIT | FMT_OMP | FMT_OMP_BAD |
 		FMT_SPLIT_UNIFIES_CASE,
 		{ NULL },
@@ -436,13 +420,8 @@ struct fmt_main fmt_whirlpool = {
 		fmt_default_clear_keys,
 		crypt_2,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,

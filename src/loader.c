@@ -29,6 +29,7 @@
 #include "misc.h"
 #include "params.h"
 #include "path.h"
+#include "mem_map.h"
 #include "memory.h"
 #include "list.h"
 #include "signals.h"
@@ -42,15 +43,21 @@
 #include "fake_salts.h"
 #include "john.h"
 #include "cracker.h"
-#include "config.h"
 #include "logger.h" /* Beware: log_init() happens after most functions here */
 #include "base64_convert.h"
 #include "md5.h"
-#include "memdbg.h"
+#include "single.h"
+#include "showformats.h"
+#include "mgetl.h"
 
 #ifdef HAVE_CRYPT
 extern struct fmt_main fmt_crypt;
 #endif
+
+/*
+ * Jumbo may bump this at runtime
+ */
+static int ldr_words_max = LDR_WORDS_MAX;
 
 /*
  * If this is set, we are loading john.pot so we should
@@ -88,11 +95,33 @@ static int pristine_gecos;
 static int single_skip_login;
 #endif
 
-/* There should be legislation against adding a BOM to UTF-8 */
-static char *skip_bom(char *string)
+static int jumbo_split_string;
+
+/*
+ * There should be legislation against adding a BOM to UTF-8, not to
+ * mention calling UTF-16 a "text file".
+ */
+static MAYBE_INLINE char *check_bom(char *string)
 {
-	if (!memcmp(string, "\xEF\xBB\xBF", 3))
-		string += 3;
+	if (((unsigned char*)string)[0] < 0xef)
+		return string;
+
+	if (!memcmp(string, "\xEF\xBB\xBF", 3)) {
+		static int warned;
+
+		if (options.input_enc == UTF_8)
+			string += 3;
+		else if (john_main_process && !warned++)
+			fprintf(stderr,
+			        "Warning: UTF-8 BOM seen in password hash file. You probably want --input-encoding=UTF8\n");
+	}
+	if (options.input_enc == UTF_8 && (!memcmp(string, "\xFE\xFF", 2) || !memcmp(string, "\xFF\xFE", 2))) {
+		static int warned;
+
+		if (john_main_process && !warned++)
+			fprintf(stderr, "Warning: UTF-16 BOM seen in password hash file. "
+			        "File may not be read properly unless you re-encode it\n");
+	}
 	return string;
 }
 
@@ -177,8 +206,8 @@ static void read_file(struct db_main *db, char *name, int flags,
 	char line_buf[LINE_BUFFER_SIZE], *line, *ex_size_line;
 	int warn_enc;
 
-	warn_enc = john_main_process && (options.target_enc != ASCII) &&
-		cfg_get_bool(SECTION_OPTIONS, NULL, "WarnEncoding", 0);
+	warn_enc = (john_main_process && (options.target_enc != ENC_RAW) &&
+	            cfg_get_bool(SECTION_OPTIONS, NULL, "WarnEncoding", 0));
 
 	if (flags & RF_ALLOW_DIR) {
 		if (stat(name, &file_stat)) {
@@ -196,7 +225,7 @@ static void read_file(struct db_main *db, char *name, int flags,
 
 	dyna_salt_init(db->format);
 	while ((ex_size_line = fgetll(line_buf, sizeof(line_buf), file))) {
-		line = skip_bom(ex_size_line);
+		line = check_bom(ex_size_line);
 
 		if (warn_enc) {
 			char *u8check;
@@ -270,10 +299,8 @@ void ldr_init_database(struct db_main *db, struct db_options *db_options)
 		db->cracked_hash = mem_calloc(
 			CRACKED_HASH_SIZE, sizeof(struct db_cracked *));
 	} else {
-		db->salt_hash = mem_alloc(
-			SALT_HASH_SIZE * sizeof(struct db_salt *));
-		memset(db->salt_hash, 0,
-			SALT_HASH_SIZE * sizeof(struct db_salt *));
+		db->salt_hash = mem_calloc(
+			SALT_HASH_SIZE, sizeof(struct db_salt *));
 
 		db->cracked_hash = NULL;
 	}
@@ -283,6 +310,9 @@ void ldr_init_database(struct db_main *db, struct db_options *db_options)
 	db->salt_count = db->password_count = db->guess_count = 0;
 
 	db->format = NULL;
+
+	jumbo_split_string =
+		cfg_get_bool(SECTION_OPTIONS, NULL, "JumboSingleWords", 1);
 }
 
 /*
@@ -339,6 +369,40 @@ static char *ldr_get_field(char **ptr, char field_sep_char)
 	return res;
 }
 
+static int wild_cmp(const char *search_str, const char *full_str)
+{
+	char *pos = strchr(search_str, '*');
+
+	if (pos) {
+		if (pos != strrchr(search_str, '*')) {
+			if (john_main_process)
+				fprintf(stderr, "Only one wildcard allowed in name\n");
+			error();
+		}
+
+		/* Check string before wildcard, if any */
+		if (strncasecmp(full_str, search_str,
+		                (int)(pos - search_str)))
+			return 1;
+		/* Check string after wildcard, if any */
+		if (pos[1]) {
+			int wild_len = strlen(++pos);
+			int full_str_len = strlen(full_str);
+			const char *p;
+
+			if (wild_len > full_str_len)
+				return 1;
+
+			p = &full_str[full_str_len - wild_len];
+
+			return strcasecmp(p, pos);
+		}
+		return 0;
+	} else
+		/* Case-sensitive compare unless wildcard was used */
+		return strcmp(search_str, full_str);
+}
+
 static int ldr_check_list(struct list_main *list, char *s1, char *s2)
 {
 	struct list_entry *current;
@@ -350,13 +414,13 @@ static int ldr_check_list(struct list_main *list, char *s1, char *s2)
 	if (*current->data == '-') {
 		data = current->data + 1;
 		do {
-			if (!strcmp(s1, data) || !strcmp(s2, data)) return 1;
+			if (!wild_cmp(data, s1) || !wild_cmp(data, s2)) return 1;
 			if ((current = current->next)) data = current->data;
 		} while (current);
 	} else {
 		do {
 			data = current->data;
-			if (!strcmp(s1, data) || !strcmp(s2, data)) return 0;
+			if (!wild_cmp(data, s1) || !wild_cmp(data, s2)) return 0;
 		} while ((current = current->next));
 		return 1;
 	}
@@ -376,25 +440,22 @@ static MAYBE_INLINE int ldr_check_shells(struct list_main *list, char *shell)
 	return 0;
 }
 
-static void ldr_set_encoding(struct fmt_main *format)
+void ldr_set_encoding(struct fmt_main *format)
 {
 	if ((!options.target_enc || options.default_target_enc) &&
 	    !options.internal_cp) {
-		if (!strcasecmp(format->params.label, "LM") ||
-		    !strcasecmp(format->params.label, "lm-opencl") ||
+		if (!strncasecmp(format->params.label, "LM", 2) ||
 		    !strcasecmp(format->params.label, "netlm") ||
 		    !strcasecmp(format->params.label, "nethalflm")) {
 			options.target_enc =
-				cp_name2id(cfg_get_param(SECTION_OPTIONS,
-				                         NULL,
-				                         "DefaultMSCodepage"));
+				cp_name2id(cfg_get_param(SECTION_OPTIONS, NULL, "DefaultMSCodepage"), 1);
 			if (options.target_enc)
 				options.default_target_enc = 1;
 			else
 				options.target_enc = options.input_enc;
 		} else if (options.internal_cp &&
 		           (format->params.flags & FMT_UNICODE) &&
-		           (format->params.flags & FMT_UTF8)) {
+		           (format->params.flags & FMT_ENC)) {
 			options.target_enc = options.internal_cp;
 		}
 	}
@@ -410,23 +471,19 @@ static void ldr_set_encoding(struct fmt_main *format)
 	}
 
 	/* john.conf alternative for --internal-codepage */
-	if (options.flags &
-	    (FLG_RULES | FLG_SINGLE_CHK | FLG_BATCH_CHK | FLG_MASK_CHK))
-	if ((!options.target_enc || options.target_enc == UTF_8) &&
-	    !options.internal_cp) {
+	if (options.flags & (FLG_RULES_IN_USE | FLG_SINGLE_CHK | FLG_BATCH_CHK | FLG_MASK_CHK))
+	if ((!options.target_enc || options.target_enc == UTF_8) && !options.internal_cp) {
 		if (!(options.internal_cp =
-			cp_name2id(cfg_get_param(SECTION_OPTIONS, NULL,
-			                         "DefaultInternalCodepage"))))
+		      cp_name2id(cfg_get_param(SECTION_OPTIONS, NULL, "DefaultInternalCodepage"), 1)))
 			options.internal_cp =
-			    cp_name2id(cfg_get_param(SECTION_OPTIONS, NULL,
-			                         "DefaultInternalEncoding"));
+				cp_name2id(cfg_get_param(SECTION_OPTIONS, NULL, "DefaultInternalEncoding"), 1);
 	}
 
 	/* Performance opportunity - avoid unneccessary conversions */
 	if (options.internal_cp && options.internal_cp != UTF_8 &&
 	    (!options.target_enc || options.target_enc == UTF_8)) {
 		if ((format->params.flags & FMT_UNICODE) &&
-		    (format->params.flags & FMT_UTF8))
+		    (format->params.flags & FMT_ENC))
 			options.target_enc = options.internal_cp;
 	}
 
@@ -441,21 +498,21 @@ static int ldr_split_line(char **login, char **ciphertext,
 	struct fmt_main *alt;
 	char *fields[10], *gid, *shell;
 	int i, retval;
+	int huge_line = 0;
+	static int line_no = 0;
 
 	fields[0] = *login = ldr_get_field(&line, db_opts->field_sep_char);
 	fields[1] = *ciphertext = ldr_get_field(&line, db_opts->field_sep_char);
 
+	line_no++;
+
 /* Check for NIS stuff */
 	if (((*login)[0] == '+' && (!(*login)[1] || (*login)[1] == '@')) &&
-	    (*ciphertext)[0] != '$' && strnlen(*ciphertext, 10) < 10 &&
-	    strncmp(*ciphertext, "$dummy$", 7)) {
-		if (db_opts->showtypes) {
-			int fs = db_opts->field_sep_char;
-			printf("%s%c%s%c2%c\n",
-			       *login,
-			       fs, *ciphertext,
-			       fs, /* 2, */
-			       fs);
+	    strnlen(*ciphertext, 10) < 10 && strncmp(*ciphertext, "$dummy$", 7) &&
+	    strncmp(*ciphertext, "$0$", 3)) {
+		if (db_opts->showformats) {
+			showformats_skipped("NIS", login, ciphertext,
+			                    db_opts, line_no);
 		}
 		return 0;
 	}
@@ -483,13 +540,12 @@ static int ldr_split_line(char **login, char **ciphertext,
 			if (p - *ciphertext == 12 && *ciphertext - *login == 1)
 				(*ciphertext)--;
 			if (p - *ciphertext < 13) {
-				if (db_opts->showtypes) {
-					int fs = db_opts->field_sep_char;
-					printf("%c%s%c3%c\n",
-					       /* empty, */
-					       fs, *ciphertext,
-					       fs, /* 3, */
-					       fs);
+				if (db_opts->showformats) {
+/* login is not set at this point, so we pass NULL. */
+					showformats_skipped("lonely",
+					                    NULL,
+					                    ciphertext,
+					                    db_opts, line_no);
 				}
 				return 0;
 			}
@@ -497,6 +553,9 @@ static int ldr_split_line(char **login, char **ciphertext,
 		*p = 0;
 		fields[0] = *login = no_username;
 		fields[1] = *ciphertext;
+		if (strnlen(*ciphertext, MAX_CIPHERTEXT_SIZE + 1) > MAX_CIPHERTEXT_SIZE) {
+			huge_line = 1;
+		}
 	}
 
 	if (source)
@@ -530,13 +589,16 @@ static int ldr_split_line(char **login, char **ciphertext,
 	*gecos = fields[4];
 	*home = fields[5];
 
-	if (fields[0] == no_username && !db_opts->showtypes)
+	if (fields[0] == no_username && !db_opts->showformats)
 		goto find_format;
 
 	gid = fields[3];
 	shell = fields[6];
 
-	if (SPLFLEN(2) == 32 || SPLFLEN(3) == 32) {
+	if (SPLFLEN(1) > MAX_CIPHERTEXT_SIZE) {
+		huge_line = 1;
+	}
+	else if (SPLFLEN(2) == 32 || SPLFLEN(3) == 32) {
 		/* PWDUMP */
 		/* user:uid:LMhash:NThash:comment:homedir: */
 		*uid = fields[1];
@@ -578,138 +640,26 @@ static int ldr_split_line(char **login, char **ciphertext,
 	if (ldr_check_list(db_opts->groups, gid, gid)) return 0;
 	if (ldr_check_shells(db_opts->shells, shell)) return 0;
 
-	if (db_opts->showtypes) {
-		int fs = db_opts->field_sep_char;
-		/* Flag: the format is not the first valid format. The
-		 * first format should not print the first field
-		 * separator. */
-		int not_first_format = 0;
-		/* \0 and \n are not possible in any field. */
-		/* field_sep_char should not be possible in any field too.
-		 * But it is possible with --field-separator-char=/ due to
-		 * default value "/" for home field. Also ? may come from
-		 * empty login. */
-		/* Flag: no fields contain \n or field separator. */
-		int bad_char = 0;
-#ifndef DYNAMIC_DISABLED
-		int bare_always_valid = 0;
-		if ((options.dynamic_bare_hashes_always_valid == 'Y')
-		    || (options.dynamic_bare_hashes_always_valid != 'N'
-			&& cfg_get_bool(SECTION_OPTIONS, NULL, "DynamicAlwaysUseBareHashes", 1)))
-			bare_always_valid = 1;
-#endif
-		/* We output 1 or 0, so 0 and 1 are bad field separators. */
-		if (fs == '0' || fs == '1')
-			bad_char = 1;
-#define check_field_separator(str) bad_char |= strchr((str), fs) || strchr((str), '\n')
-		/* To suppress warnings, particularly from
-		 * generic crypt's valid() (c3_fmt.c). */
-		ldr_in_pot = 1;
-		/* The format:
-		 * Once for each hash even if it can't be loaded (7 fields):
-		 *   login,
-		 *   ciphertext,
-		 *   uid,
-		 *   gid,
-		 *   gecos,
-		 *   home,
-		 *   shell.
-		 * For each valid format (may be nothing):
-		 *   label,
-		 *   is format disabled? (1/0),
-		 *   is format dynamic? (1/0),
-		 *   does format use the ciphertext field as is? (1/0),
-		 *   canonical hash or hashes (if there are several parts).
-		 * All fields above are separated by field_sep_char.
-		 * Formats are separated by empty field.
-		 * Additionally on the end:
-		 *   separator,
-		 *   line consistency mark (0/1/2/3):
-		 *     0 - the line is consistent and can be parsed easily,
-		 *     1 - field separator char occurs in fields, line can't
-		 *         be parsed easily,
-		 *     2 - the line was skipped as bad NIS stuff, only login
-		 *         and ciphertext are shown,
-		 *     3 - the line was skipped parsing descrypt with
-		 *         invalid salt, only ciphertext is shown (together
-		 *         with empty login); empty lines fall here,
-		 *   separator.
-		 * The additional field_sep_char at the end of line does not
-		 * break numeration of fields but allows parser to get
-		 * field_sep_char from the line.
-		 * A parser have to check the last 3 chars.
-		 * If the format does not use the ciphertext field as is,
-		 * then a parser have to match input line with output line
-		 * by number of line.
-		 */
-		printf("%s%c%s%c%s%c%s%c%s%c%s%c%s",
-		       *login,
-		       fs, *ciphertext,
-		       fs, *uid,
-		       fs, gid,
-		       fs, *gecos,
-		       fs, *home,
-		       fs, shell);
-		check_field_separator(*login);
-		check_field_separator(*ciphertext);
-		check_field_separator(*uid);
-		check_field_separator(gid);
-		check_field_separator(*gecos);
-		check_field_separator(*home);
-		check_field_separator(shell);
-		/* Fields above may be empty. */
-		/* Empty fields are separators after this point. */
-		alt = fmt_list;
-		do {
-			char *prepared;
-			int disabled = 0;
-			int prepared_eq_ciphertext;
-			int valid;
-			int part;
-			int is_dynamic = ((alt->params.flags & FMT_DYNAMIC) == FMT_DYNAMIC);
-/* We enforce DynamicAlwaysUseBareHashes for each format. By default
- * dynamics do that only if a bare hash occurs on the first line. */
-#ifndef DYNAMIC_DISABLED
-			if (bare_always_valid)
-				dynamic_allow_rawhash_fixup = 1;
-#endif
-			prepared = alt->methods.prepare(fields, alt);
-			if (!prepared)
-				continue;
-			prepared_eq_ciphertext = (*ciphertext == prepared || !strcmp(*ciphertext, prepared));
-			valid = alt->methods.valid(prepared, alt);
-			if (!valid)
-				continue;
-			ldr_set_encoding(alt);
-			/* Empty field between valid formats */
-			if (not_first_format) {
-				printf("%c", fs);
-			}
-			not_first_format = 1;
-			printf("%c%s%c%d%c%d%c%d",
-			       fs, alt->params.label,
-			       fs, disabled,
-			       fs, is_dynamic,
-			       fs, prepared_eq_ciphertext);
-			check_field_separator(alt->params.label);
-			/* Canonical hash or hashes (like halves of LM) */
-			for (part = 0; part < valid; part++) {
-				char *split = alt->methods.split(prepared, part, alt);
-				printf("%c%s", fs, split);
-				check_field_separator(split);
-			}
-		} while ((alt = alt->next));
-		printf("%c%d%c\n", fs, bad_char, fs);
+	if (db_opts->showformats) {
+		showformats_regular(login, ciphertext,
+				    gecos, home, uid,
+				    source, db_opts, line_no,
+				    fields, gid, shell, huge_line);
 		return 0;
-#undef check_field_separator
 	}
+
+	if (options.format && !strncasecmp(options.format, "wpapsk", 6))
+		*uid = fields[3];
 
 find_format:
 	if (*format) {
 		char *prepared;
 		int valid;
 
-		prepared = (*format)->methods.prepare(fields, *format);
+		if (huge_line && !((*format)->params.flags & FMT_HUGE_INPUT))
+			prepared = NULL;
+		else
+			prepared = (*format)->methods.prepare(fields, *format);
 		if (prepared)
 			valid = (*format)->methods.valid(prepared, *format);
 		else
@@ -735,6 +685,10 @@ find_format:
 
 		alt = fmt_list;
 		do {
+			if (huge_line &&
+			    !(alt->params.flags & FMT_HUGE_INPUT))
+				continue;
+
 			if (alt == *format)
 				continue;
 			if (alt->params.flags & FMT_WARNED)
@@ -779,6 +733,8 @@ find_format:
 		char *prepared;
 		int valid;
 
+		if (huge_line && !(alt->params.flags & FMT_HUGE_INPUT))
+			continue;
 #ifdef HAVE_CRYPT
 /*
  * Only probe for support by the current system's crypt(3) if this is forced
@@ -813,13 +769,15 @@ find_format:
 			retval = valid;
 			*ciphertext = prepared;
 			ldr_set_encoding(alt);
+			*format = alt;
 #ifdef HAVE_OPENCL
-			if (options.gpu_devices->count && options.fork &&
-			    strstr(alt->params.label, "-opencl"))
-				*format = alt;
-			else
+			if (options.acc_devices->count && options.fork &&
+			    strstr(alt->params.label, "-opencl")) {
+				/* skip format initialization here */
+			} else
 #endif
-			fmt_init(*format = alt);
+			if (!source) /* not --show */
+				fmt_init(alt);
 #ifdef LDR_WARN_AMBIGUOUS
 			if (!source) /* not --show */
 				continue;
@@ -843,12 +801,76 @@ find_format:
 
 static char* ldr_conv(char *word)
 {
-	if (options.input_enc == UTF_8 && options.target_enc != UTF_8) {
+	if (options.input_enc == UTF_8 && options.internal_cp != UTF_8) {
 		static char u8[PLAINTEXT_BUFFER_SIZE + 1];
 
 		word = utf8_to_cp_r(word, u8, PLAINTEXT_BUFFER_SIZE);
 	}
 	return word;
+}
+
+/*
+ * Optional Jumbo-specific inner pass for ldr_split_string,
+ * JEdgarHoover -> J Edgar Hoover and other stuff.
+ */
+static void ldr_split_more(struct list_main *dst, char *src)
+{
+	int l, u, d = 0;
+
+	l = enc_haslower(src);
+	u = enc_hasupper(src);
+
+	if (l + u == 0)
+		return;
+	else if (l + u == 1)
+		if (!(d = enc_hasdigit(src)))
+			return;
+
+	/* Don't try to split MAC addresses, eg. from WPA gecos field */
+	if (strlen(src) == 12) {
+		if (l) {
+			if (ishexlc(src))
+				return;
+		} else
+			if (ishexuc(src))
+				return;
+	}
+
+	/* If we got here, the word is probably worth trying to split */
+	char *word, *pos;
+	char c;
+
+	pos = src;
+	do {
+		word = pos;
+		if (enc_isdigit(*word))
+			while (*pos && enc_isdigit(pos[1]))
+				pos++;
+		else if (enc_isupper(*word) && !l)
+			while (*pos && enc_isupper(pos[1]))
+				pos++;
+		else if (enc_islower(*word) && !u)
+			while (*pos && enc_islower(pos[1]))
+				pos++;
+		else if (enc_hasupper(&pos[1]))
+			while (*pos && !enc_isupper(pos[1]))
+				pos++;
+		else
+			while (*pos && !enc_isdigit(pos[1]))
+				pos++;
+
+		if (!*pos) {
+			if (word > src)
+				list_add_global_unique(dst, single_seed, word);
+			break;
+		}
+
+		c = *++pos;
+		*pos = 0;
+		list_add_global_unique(dst, single_seed, word);
+		*pos = c;
+
+	} while (c && dst->count < ldr_words_max);
 }
 
 static void ldr_split_string(struct list_main *dst, char *src)
@@ -859,16 +881,26 @@ static void ldr_split_string(struct list_main *dst, char *src)
 	pos = src;
 	do {
 		word = pos;
-		while (*word && CP_isSeparator[ARCH_INDEX(*word)]) word++;
-		if (!*word) break;
+		while (*word && CP_isSeparator[ARCH_INDEX(*word)])
+			word++;
+
+		if (!*word)
+			break;
 
 		pos = word;
-		while (!CP_isSeparator[ARCH_INDEX(*pos)]) pos++;
+		while (!CP_isSeparator[ARCH_INDEX(*pos)])
+			pos++;
+
 		c = *pos;
 		*pos = 0;
-		list_add_unique(dst, word);
+		list_add_global_unique(dst, single_seed, word);
+
+		if (jumbo_split_string)
+			ldr_split_more(dst, word);
+
 		*pos++ = c;
-	} while (c && dst->count < LDR_WORDS_MAX);
+
+	} while (c && dst->count < ldr_words_max);
 }
 
 static struct list_main *ldr_init_words(char *login, char *gecos, char *home)
@@ -879,15 +911,21 @@ static struct list_main *ldr_init_words(char *login, char *gecos, char *home)
 	list_init(&words);
 
 	if (*login && login != no_username && !single_skip_login)
+		/* Never mind global dupes, this must be first in list */
 		list_add(words, ldr_conv(login));
-	ldr_split_string(words, ldr_conv(gecos));
-	if (login != no_username && !single_skip_login)
+	if (options.seed_per_user && ldr_words_max != INT_MAX)
+		return words;
+	if (*gecos)
+		ldr_split_string(words, ldr_conv(gecos));
+	if ((pos = strrchr(home, '/')) && pos[1])
+		list_add_global_unique(words, single_seed, ldr_conv(&pos[1]));
+	if (*login && login != no_username && !single_skip_login)
 		ldr_split_string(words, ldr_conv(login));
 	if (pristine_gecos && *gecos)
-		list_add_unique(words, ldr_conv(gecos));
+		list_add_global_unique(words, single_seed, ldr_conv(gecos));
 
-	if ((pos = strrchr(home, '/')) && pos[1])
-		list_add_unique(words, ldr_conv(&pos[1]));
+	/* Add the global seeds onto this list (just a link added!) */
+	list_add_list(words, single_seed);
 
 	return words;
 }
@@ -898,7 +936,7 @@ void ldr_load_pw_line(struct db_main *db, char *line)
 static void ldr_load_pw_line(struct db_main *db, char *line)
 #endif
 {
-	static int skip_dupe_checking = 0;
+	static int dupe_checking = 1;
 	struct fmt_main *format;
 	int index, count;
 	char *login, *ciphertext, *gecos, *home, *uid;
@@ -916,7 +954,7 @@ static void ldr_load_pw_line(struct db_main *db, char *line)
 
 	line_sb = line;
 	if (options.flags & FLG_FUZZ_CHK)
-		line_sb = skip_bom(line);
+		line_sb = check_bom(line);
 	count = ldr_split_line(&login, &ciphertext, &gecos, &home, &uid,
 		NULL, &db->format, db->options, line_sb);
 #else
@@ -933,13 +971,12 @@ static void ldr_load_pw_line(struct db_main *db, char *line)
 
 	if (!db->password_hash) {
 		ldr_init_password_hash(db);
-		if (cfg_get_bool(SECTION_OPTIONS, NULL,
-		                 "NoLoaderDupeCheck", 0)) {
-			skip_dupe_checking = 1;
-			if (john_main_process)
-				fprintf(stderr, "No dupe-checking performed "
-				        "when loading hashes.\n");
-		}
+		if ((dupe_checking = options.loader_dupecheck) == -1)
+			/* Config option is deprecated; Drop after 1.9.0-Jumbo-2 */
+			dupe_checking = !cfg_get_bool(SECTION_OPTIONS, NULL, "NoLoaderDupeCheck", 0);
+
+		if (john_main_process && !dupe_checking)
+			fprintf(stderr, "No dupe-checking performed when loading hashes.\n");
 	}
 
 	for (index = 0; index < count; index++) {
@@ -951,26 +988,26 @@ static void ldr_load_pw_line(struct db_main *db, char *line)
 		if (options.flags & FLG_REJECT_PRINTABLE) {
 			int i = 0;
 
-			while (isprint((int)((unsigned char*)binary)[i]) &&
-			       i < format->params.binary_size)
+			while (isprint((int)((uint8_t*)BLOB_BINARY(format, binary))[i]) &&
+			       i < BLOB_SIZE(format, binary))
 				i++;
 
-			if (i == format->params.binary_size) {
+			if (i == BLOB_SIZE(format, binary)) {
 				if (john_main_process)
 				fprintf(stderr, "rejecting printable binary"
 				        " \"%.*s\" (%s)\n",
-				        format->params.binary_size,
-				        (char*)binary, piece);
+				        (int)BLOB_SIZE(format, binary),
+				        (char*)BLOB_BINARY(format, binary), piece);
+				BLOB_FREE(format, binary);
 				continue;
 			}
 		}
 
-		if (!(db->options->flags & DB_WORDS) && !skip_dupe_checking) {
+		if (!(db->options->flags & DB_WORDS) && dupe_checking) {
 			int collisions = 0;
 			if ((current_pw = db->password_hash[pw_hash]))
 			do {
-				if (!memcmp(binary, current_pw->binary,
-				    format->params.binary_size) &&
+				if (!fmt_bincmp(binary, current_pw->binary, format) &&
 				    !strcmp(piece, format->methods.source(
 				    current_pw->source, current_pw->binary))) {
 					db->options->flags |= DB_NODUP;
@@ -994,12 +1031,15 @@ static void ldr_load_pw_line(struct db_main *db, char *line)
 					    "check for duplicates partially "
 					    "bypassed to speedup loading\n");
 				}
-				skip_dupe_checking = 1;
+				dupe_checking = 0;
 				current_pw = NULL; /* no match */
 				break;
 			} while ((current_pw = current_pw->next_hash));
 
-			if (current_pw) continue;
+			if (current_pw) {
+				BLOB_FREE(format, binary);
+				continue;
+			}
 		}
 
 		salt = format->methods.salt(piece);
@@ -1108,10 +1148,52 @@ static void ldr_load_pw_line(struct db_main *db, char *line)
 
 void ldr_load_pw_file(struct db_main *db, char *name)
 {
-	pristine_gecos = cfg_get_bool(SECTION_OPTIONS, NULL,
-	        "PristineGecos", 0);
-	single_skip_login = cfg_get_bool(SECTION_OPTIONS, NULL,
-	        "SingleSkipLogin", 0);
+	static int init;
+
+	if (!init) {
+		struct cfg_list *conf_seeds;
+
+		list_init(&single_seed);
+
+		if (options.seed_per_user && options.activesinglerules && strcmp(options.activesinglerules, "none"))
+			ldr_words_max = INT_MAX;
+
+		if (options.seed_word)
+			ldr_split_string(single_seed, ldr_conv(options.seed_word));
+
+		if (options.seed_files) {
+			struct list_entry *file_list = options.seed_files->head;
+
+			do {
+				FILE *file;
+				const char *name = path_expand(file_list->data);
+				char line[LINE_BUFFER_SIZE];
+
+				if (!(file = fopen(name, "r")))
+					pexit("fopen: %s", name);
+				while (fgetl(line, sizeof(line), file))
+					ldr_split_string(single_seed, ldr_conv(line));
+				if (fclose(file))
+					pexit("fclose");
+			} while ((file_list = file_list->next));
+		}
+
+		if ((conf_seeds = cfg_get_list("List.Single:", "SeedWords"))) {
+			struct cfg_line *word;
+
+			if ((word = conf_seeds->head))
+			do {
+				list_add_unique(single_seed,
+				                ldr_conv(word->data));
+			} while ((word = word->next));
+		}
+
+		pristine_gecos = cfg_get_bool(SECTION_OPTIONS, NULL,
+		                              "PristineGecos", 0);
+		single_skip_login = cfg_get_bool(SECTION_OPTIONS, NULL,
+		                                 "SingleSkipLogin", 0);
+		init = 1;
+	}
 
 	read_file(db, name, RF_ALLOW_DIR, ldr_load_pw_line);
 }
@@ -1120,12 +1202,13 @@ int ldr_trunc_valid(char *ciphertext, struct fmt_main *format)
 {
 	int i;
 
-	if (!format->params.signature[0] || !ldr_in_pot)
+	if (!ldr_in_pot || !format->params.signature[0] ||
+	    !strstr(ciphertext, "$SOURCE_HASH$"))
 		goto plain_valid;
 
 	for (i = 0; i < FMT_SIGNATURES && format->params.signature[i]; ++i) {
-		if (!strncmp(ciphertext, format->params.signature[i],
-		    strlen(format->params.signature[i])) &&
+		int len = strlen(format->params.signature[i]);
+		if (len && !strncmp(ciphertext, format->params.signature[i], len) &&
 		    strnlen(ciphertext, MAX_CIPHERTEXT_SIZE + 1) <=
 		    MAX_CIPHERTEXT_SIZE &&
 		    ldr_isa_pot_source(ciphertext))
@@ -1146,7 +1229,8 @@ static void ldr_load_pot_line(struct db_main *db, char *line)
 	struct db_password *current;
 
 	ciphertext = ldr_get_field(&line, db->options->field_sep_char);
-	if (ldr_trunc_valid(ciphertext, format) != 1) return;
+	if (ldr_trunc_valid(ciphertext, format) != 1)
+		return;
 	ciphertext = format->methods.split(ciphertext, 0, format);
 	binary = format->methods.binary(ciphertext);
 	hash = db->password_hash_func(binary);
@@ -1164,17 +1248,19 @@ static void ldr_load_pot_line(struct db_main *db, char *line)
 		 * can't treat with memcmp().
 		 */
 		if (hash || !ldr_isa_pot_source(ciphertext))
-		if (memcmp(binary, current->binary, format->params.binary_size))
+		if (fmt_bincmp(binary, current->binary, format))
 			continue;
 		if (ldr_pot_source_cmp(ciphertext,
 		    format->methods.source(current->source, current->binary)))
 			continue;
+		BLOB_FREE(format, current->binary);
 		current->binary = NULL; /* mark for removal */
 		need_removal = 1;
 	} while ((current = current->next_hash));
 
 	if (need_removal)
 		db->options->flags |= DB_NEED_REMOVAL;
+	BLOB_FREE(format, binary);
 }
 
 struct db_main *ldr_init_test_db(struct fmt_main *format, struct db_main *real)
@@ -1183,7 +1269,6 @@ struct db_main *ldr_init_test_db(struct fmt_main *format, struct db_main *real)
 	struct fmt_main fake_list;
 	struct db_main *testdb;
 	struct fmt_tests *current;
-	extern volatile int bench_running;
 
 	if (!(current = format->params.tests))
 		return NULL;
@@ -1203,17 +1288,20 @@ struct db_main *ldr_init_test_db(struct fmt_main *format, struct db_main *real)
 	ldr_init_password_hash(testdb);
 
 	ldr_loading_testdb = 1;
-	bench_running++;
+	self_test_running++;
 	while (current->ciphertext) {
-		char *ex_len_line = NULL, _line[LINE_BUFFER_SIZE], *line = _line;
+		char *ex_len_line = NULL;
+		char _line[LINE_BUFFER_SIZE], *line = _line;
 		int i, pos = 0;
 
 		/*
 		 * FIXME: Change the "200" and "300" to something less arbitrary
 		 * or document why they are used.
 		 */
-		if (strlen(current->ciphertext) > LINE_BUFFER_SIZE-200) {
-			ex_len_line = mem_alloc(strlen(current->ciphertext)+300);
+		if (strnlen(current->ciphertext, LINE_BUFFER_SIZE) >
+		    LINE_BUFFER_SIZE - 200) {
+			ex_len_line =
+				mem_alloc(strlen(current->ciphertext) + 300);
 			line = ex_len_line;
 		}
 		if (!current->fields[0])
@@ -1230,12 +1318,12 @@ struct db_main *ldr_init_test_db(struct fmt_main *format, struct db_main *real)
 		current++;
 		MEM_FREE(ex_len_line);
 	}
-	bench_running--;
+	self_test_running--;
 
 	ldr_fix_database(testdb);
 	ldr_loading_testdb = 0;
 
-	if (options.verbosity == VERB_MAX)
+	if (options.verbosity >= VERB_MAX && john_main_process)
 		fprintf(stderr,
 		        "Loaded %d hashes with %d different salts to test db from test vectors\n",
 		        testdb->password_count, testdb->salt_count);
@@ -1244,21 +1332,32 @@ struct db_main *ldr_init_test_db(struct fmt_main *format, struct db_main *real)
 	return testdb;
 }
 
-void ldr_free_test_db(struct db_main *db)
+void ldr_free_db(struct db_main *db, int base)
 {
 	if (db) {
 		if (db->format &&
-		    (db->format->params.flags & FMT_DYNA_SALT) == FMT_DYNA_SALT)
-		{
+		    (db->format->params.flags & (FMT_DYNA_SALT | FMT_BLOB))) {
 			struct db_salt *psalt = db->salts;
 			while (psalt) {
-				dyna_salt_remove(psalt->salt);
+				struct db_password *pw = psalt->list;
+
+				if ((db->format->params.flags & FMT_BLOB) &&
+				    pw && pw->binary &&
+				    ((fmt_data*)pw->binary)->flags == FMT_DATA_ALLOC) {
+					do {
+						fmt_data *bin = pw->binary;
+						BLOB_FREE(db->format, bin);
+					} while ((pw = pw->next));
+				}
+				if (db->format->params.flags & FMT_DYNA_SALT)
+					dyna_salt_remove(psalt->salt);
 				psalt = psalt->next;
 			}
 		}
 		MEM_FREE(db->salt_hash);
 		MEM_FREE(db->cracked_hash);
-		MEM_FREE(db);
+		if (base)
+			MEM_FREE(db);
 	}
 }
 
@@ -1312,7 +1411,16 @@ static void ldr_init_sqid(struct db_main *db)
 	} while ((current = current->next));
 }
 
-/* #define DEBUG_SALT_SORT */
+static void ldr_gen_salt_md5(struct db_salt *s, int dynamic)
+{
+#ifndef DYNAMIC_DISABLED
+	if (dynamic) {
+		dynamic_salt_md5(s);
+		return;
+	}
+#endif
+	dyna_salt_md5(s, ldr_fmt_salt_size);
+}
 
 /*
  * This was done as a structure to allow more data to be
@@ -1324,14 +1432,8 @@ static void ldr_init_sqid(struct db_main *db)
  * so for ease of debugging, I have left this as a simple
  * structure
  */
-typedef struct salt_cmp_s
-{
+typedef struct salt_cmp_s {
 	struct db_salt *p;
-#ifdef DEBUG_SALT_SORT
-	/* used by JimF in debugging.  Left in for now */
-	int org_idx;
-	char str[36];
-#endif
 } salt_cmp_t;
 
 /*
@@ -1351,90 +1453,70 @@ static int (*fmt_salt_compare)(const void *x, const void *y);
  * since qsort is pretty quick, and does not call compare any more than
  * is needed to partition sort the data.
  */
-static int ldr_salt_cmp(const void *x, const void *y) {
+static int ldr_salt_cmp(const void *x, const void *y)
+{
 	salt_cmp_t *X = (salt_cmp_t *)x;
 	salt_cmp_t *Y = (salt_cmp_t *)y;
 	int cmp = fmt_salt_compare(X->p->salt, Y->p->salt);
 	return cmp;
 }
 
-static int ldr_salt_cmp_num(const void *x, const void *y) {
+static int ldr_salt_cmp_default(const void *x, const void *y)
+{
 	salt_cmp_t *X = (salt_cmp_t *)x;
 	salt_cmp_t *Y = (salt_cmp_t *)y;
 	int cmp = dyna_salt_cmp(X->p->salt, Y->p->salt, ldr_fmt_salt_size);
 	return cmp;
 }
 
-static void ldr_gen_salt_md5(struct db_salt *s, int dynamic) {
-	if (dynamic) {
-		dynamic_salt_md5(s);
-		return;
-	}
-	dyna_salt_md5(s, ldr_fmt_salt_size);
+/* Sort by salt's number of hashes (for --salt option) */
+static int ldr_salt_cmp_num(const void *x, const void *y)
+{
+	salt_cmp_t *X = (salt_cmp_t *)x;
+	salt_cmp_t *Y = (salt_cmp_t *)y;
+
+	if (X->p->count > Y->p->count) return -1;
+	if (X->p->count < Y->p->count) return 1;
+	return 0;
 }
+
 /*
- * If there are more than 1 salt AND the format exports a salt_compare
- * function, then we reorder the salt array into the order the format
- * wants them in.  The rationale is usually that the format can
- * gain speed if some of the salts are grouped together.  This was first
- * done for the WPAPSK format so that the format could group all ESSID's
- * in the salts. So the PBKDF2 is computed once (for the first instance
- * of the ESSID), then all of the other salts which are different but
- * have the same ESSID will not have to perform the very costly PBKDF2.
- * The format is designed to work that way, IF the salts come to it in
- * the right order.
- *
- * Later, a bug was found in dynamic (hopefully not in other formats)
- * where formats like md5(md5($p).$s) would fail if there were salts of
- * varying length within the same input file. The longer salts would
- * leave stale data. If we sort the salts based on salt string length,
- * this issue goes away with no performance overhead.  So this function
- * is now also used for dynamic.
- *
- * we sort salts always, so that they are put into a deterministic order.
+ * We always sort salts, so that they are put into a deterministic order.
  * That way, we can restore a session and skip ahead until we find the
  * last salt being worked on. Without a deterministic sort, that logic
  * would fail under many situations.
- *
  */
-static void ldr_sort_salts(struct db_main *db)
+static void ldr_sort_salts(struct db_main *db, int by_count)
 {
 	int i;
 	struct db_salt *s;
-#ifndef DEBUG_SALT_SORT
 	salt_cmp_t *ar;
-#else
-	salt_cmp_t ar[100];  /* array is easier to debug in VC */
-#endif
+
 	if (db->salt_count < 2)
 		return;
 
-	log_event("Sorting salts, for performance");
+	if (john_main_process)
+		log_event("Sorting salts, for %s", by_count ? "picking ones with most hashes" : "deterministic salt-resume");
 
 	fmt_salt_compare = db->format->methods.salt_compare;
-#ifndef DEBUG_SALT_SORT
 	ar = (salt_cmp_t *)mem_alloc(sizeof(salt_cmp_t)*db->salt_count);
-#endif
 	s = db->salts;
 
 	/* load our array of pointers. */
 	for (i = 0; i < db->salt_count; ++i) {
 		ar[i].p = s;
-#ifdef DEBUG_SALT_SORT
-		ar[i].org_idx = i;
-		strncpy(ar[i].str, (char*)s->salt, 36);
-		ar[i].str[35] = 0; /*just in case*/
-#endif
 		s = s->next;
 	}
 
 	ldr_fmt_salt_size = db->format->params.salt_size;
 
 	dyna_salt_init(db->format);
-	if (fmt_salt_compare)
-		qsort(ar, db->salt_count, sizeof(ar[0]), ldr_salt_cmp);
-	else /* Most used salt first */
+	if (by_count)
 		qsort(ar, db->salt_count, sizeof(ar[0]), ldr_salt_cmp_num);
+	else if (fmt_salt_compare)
+		qsort(ar, db->salt_count, sizeof(ar[0]), ldr_salt_cmp);
+	else /* Default sort function, ensuring salt resume works if possible */
+		qsort(ar, db->salt_count, sizeof(ar[0]), ldr_salt_cmp_default);
 
 	/* Reset salt hash table, if we still have one */
 	if (db->salt_hash) {
@@ -1463,14 +1545,7 @@ static void ldr_sort_salts(struct db_main *db)
 	}
 	s->next = 0;
 
-#ifndef DEBUG_SALT_SORT
 	MEM_FREE(ar);
-#else
-	/* setting s here, allows me to debug quick-watch s=s->next
-	 * over and over again while watching the char* value of s->salt
-	 */
-	s = db->salts;
-#endif
 }
 
 /*
@@ -1515,7 +1590,8 @@ static void ldr_remove_marked(struct db_main *db)
 	struct db_salt *current_salt, *last_salt;
 	struct db_password *current_pw, *last_pw;
 
-	if (!(db->options->flags & DB_NEED_REMOVAL))
+	if (!options.loader.showuncracked &&
+	    !(db->options->flags & DB_NEED_REMOVAL))
 		return;
 
 	last_salt = NULL;
@@ -1571,6 +1647,39 @@ static void ldr_filter_salts(struct db_main *db)
 	if ((current = db->salts))
 	do {
 		if (current->count < min || current->count > max) {
+			dyna_salt_remove(current->salt);
+			if (last)
+				last->next = current->next;
+			else
+				db->salts = current->next;
+
+			db->salt_count--;
+			db->password_count -= current->count;
+		} else
+			last = current;
+	} while ((current = current->next));
+}
+
+/*
+ * Keep [m-]n best salts in terms of number of password hashes.
+ */
+static void ldr_filter_n_best_salts(struct db_main *db)
+{
+	struct db_salt *current, *last;
+	int from = db->options->min_pps;
+	int to = db->options->max_pps;
+	int num = 0;
+
+	if (!from) {
+		if (!to) return;
+		from = to;
+	}
+
+	last = NULL;
+	if ((current = db->salts))
+	do {
+		num++;
+		if (num > to || num < from) {
 			dyna_salt_remove(current->salt);
 			if (last)
 				last->next = current->next;
@@ -1646,6 +1755,15 @@ static void ldr_init_hash_for_salt(struct db_main *db, struct db_salt *salt)
 		return;
 	}
 
+	do {
+		int (*get_func)(int index);
+
+		get_func = db->format->methods.get_hash[salt->hash_size];
+		if (get_func && get_func != fmt_default_get_hash)
+			break;
+		salt->hash_size--;
+	} while (salt->hash_size > 0);
+
 	bitmap_size = password_hash_sizes[salt->hash_size];
 	{
 		size_t size = (bitmap_size +
@@ -1698,6 +1816,10 @@ static void ldr_init_hash(struct db_main *db)
  * comparing it against less than 1 loaded hash on average due to the use of a
  * hash table) vs. the complexity of DES_bs_cmp_all() for all computed hashes
  * at once (but calling it for each loaded hash individually).
+ *
+ * FIXME: This isn't yet aware of our use of SIMD for the comparisons embedded
+ * in crypt_all() for descrypt and LM, nor of our use of OpenMP there and in
+ * DES_bs_cmp_all().  The threshold should be much higher for those cases.
  */
 		threshold = 5 * ARCH_BITS / ARCH_BITS_LOG + 1;
 	}
@@ -1711,7 +1833,10 @@ static void ldr_init_hash(struct db_main *db)
 				    password_hash_thresholds[size] &&
 				    db->format->methods.binary_hash[size] &&
 				    db->format->methods.binary_hash[size] !=
-				    fmt_default_binary_hash)
+				    fmt_default_binary_hash &&
+				    db->format->methods.get_hash[size] &&
+				    db->format->methods.get_hash[size] !=
+					fmt_default_get_hash)
 					break;
 
 		if (mem_saving_level >= 2)
@@ -1758,6 +1883,188 @@ static void ldr_cost_ranges(struct db_main *db)
 	} while ((current = current->next));
 }
 
+#define MAYBE		4
+#define SORTED		2
+#define ASCII		1
+#define NO			0
+
+static void ldr_fill_user_words(struct db_main *db)
+{
+	struct db_salt *salt;
+	struct list_main *last_words = NULL;
+	int last_count = 0;
+	FILE *file;
+	const char *name = path_expand(options.seed_per_user);
+	union {
+		char buffer[LINE_BUFFER_SIZE];
+#if MGETL_HAS_SIMD
+		vtype dummy;
+#else
+		ARCH_WORD dummy;
+#endif
+	} aligned;
+	char *line = aligned.buffer;
+	size_t file_len;
+	int tot_num = 0;
+	int seeds_sorted = MAYBE | SORTED;
+
+	if (!(file = fopen(name, "r")))
+		pexit("fopen: %s", name);
+
+	jtr_fseek64(file, 0, SEEK_END);
+	if ((file_len = jtr_ftell64(file)) == -1)
+		pexit(STR_MACRO(jtr_ftell64));
+	jtr_fseek64(file, 0, SEEK_SET);
+	if (file_len < 3) {
+		if (john_main_process)
+			fprintf(stderr, "Error, per-user seed file is empty\n");
+		error();
+	}
+
+#ifdef HAVE_MMAP
+#if (SIZEOF_SIZE_T < 8)
+	mem_map = MAP_FAILED;
+	if (file_len < ((1LL)<<32))
+#endif
+	mem_map = mmap(NULL, file_len, PROT_READ, MAP_SHARED, fileno(file), 0);
+
+	if (mem_map == MAP_FAILED) {
+		mem_map = NULL;
+		log_event("- memory mapping failed (%s) - but we'll do fine without it.", strerror(errno));
+	} else {
+		map_pos = mem_map;
+		map_end = mem_map + file_len;
+		map_scan_end = map_end - VSCANSZ;
+	}
+#endif /* HAVE_MMAP */
+
+	fprintf(stderr, "Loading per-user seeds%s",
+	        options.verbosity > VERB_DEFAULT ? "\n" : "... ");
+
+	if ((salt = db->salts))
+	do {
+		struct db_password *passwd;
+		int num = 0;
+
+		if ((passwd = salt->list))
+		do {
+			struct list_main *words = passwd->words;
+			char *ret, *login;
+#if HAVE_MMAP
+			char *reset_pos = map_pos;
+#else
+			long reset_pos = ftell(file);
+#endif
+
+			if (!words || !words->head || !(login = words->head->data))
+				continue;
+
+			if (login[0] == '?' && !login[1])
+				continue;
+
+			if (last_words && !strcmp(login, last_words->head->data)) {
+				if (last_count)
+					list_add_list(words, last_words);
+				continue;
+			}
+
+			last_words = words;
+			last_count = 0;
+
+			while ((ret = GET_LINE(line, file))) {
+				char *user = line;
+				char *pw;
+
+				if (!*line || !(pw = strchr(line, ':'))) {
+#if HAVE_MMAP
+					reset_pos = map_pos;
+#else
+					reset_pos = ftell(file);
+#endif
+					continue;
+				}
+				*pw++ = 0;
+
+#if HAVE_MMAP
+				if ((seeds_sorted == (MAYBE | SORTED | ASCII)) &&
+				    (unsigned char)*line < 128 && (unsigned char)*reset_pos < 128 &&
+				    strncmp(line, reset_pos, strlen(line)) < 0) {
+					fprintf(stderr, "User-seed file isn't sorted, slow load.\n");
+					seeds_sorted = NO;
+				} else if (seeds_sorted == (MAYBE | SORTED) && strncmp(line, reset_pos, strlen(line)) < 0)
+					seeds_sorted |= ASCII;
+#endif
+				if (!*pw) {
+#if HAVE_MMAP
+					reset_pos = map_pos;
+#else
+					reset_pos = ftell(file);
+#endif
+					continue;
+				}
+
+				int s = strcmp(user, login);
+
+				if (s < 0) {
+#if HAVE_MMAP
+					reset_pos = map_pos;
+#else
+					reset_pos = ftell(file);
+#endif
+					continue;
+				} else if (s && (seeds_sorted & ASCII)) {
+#if HAVE_MMAP
+					map_pos = ((unsigned char)*user < 128) ? reset_pos : mem_map;
+#else
+					fseek(file, ((unsigned char)*user < 128) ? reset_pos : 0, SEEK_SET);
+#endif
+					break;
+				} else if (s) {
+#if HAVE_MMAP
+					map_pos = (seeds_sorted & SORTED) ? reset_pos : mem_map;
+#else
+					fseek(file, (seeds_sorted & SORTED) ? reset_pos : 0, SEEK_SET);
+#endif
+					break;
+				}
+
+				num++;
+				list_add_global_unique(words, single_seed, ldr_conv(pw));
+				ldr_split_string(words, ldr_conv(pw));
+			}
+			if (!ret) {
+#if HAVE_MMAP
+				map_pos = mem_map;
+#else
+				fseek(file, 0, SEEK_SET);
+#endif
+				if (seeds_sorted & MAYBE)
+					seeds_sorted &= ~MAYBE;
+			}
+			last_count = num;
+		} while ((passwd = passwd->next));
+
+		tot_num += num;
+
+		if (num && options.verbosity > VERB_DEFAULT)
+			fprintf(stderr, "'%s' seeded with %d passwords\n", ((struct db_password*)salt->list)->login, num);
+		if (!num && options.verbosity >= VERB_DEBUG)
+			fprintf(stderr, "Found no passwords for '%s'\n", ((struct db_password*)salt->list)->login);
+		if (options.verbosity >= VERB_DEBUG)
+			getchar();
+	} while ((salt = salt->next));
+
+	fprintf(stderr, "Total of %d seeds loaded.\n", tot_num);
+
+#ifdef HAVE_MMAP
+	if (mem_map)
+		munmap(mem_map, file_len);
+	map_pos = map_end = NULL;
+#endif
+	if (fclose(file))
+		pexit("fclose");
+}
+
 void ldr_fix_database(struct db_main *db)
 {
 	int total = db->password_count;
@@ -1770,12 +2077,17 @@ void ldr_fix_database(struct db_main *db)
 		MEM_FREE(db->salt_hash);
 
 	if (!ldr_loading_testdb) {
-		ldr_filter_salts(db);
+		if (db->options->best_pps) {
+			ldr_sort_salts(db, 1);
+			ldr_filter_n_best_salts(db);
+		} else
+			ldr_filter_salts(db);
 		ldr_filter_costs(db);
 		ldr_remove_marked(db);
-		ldr_cost_ranges(db);
 	}
-	ldr_sort_salts(db);
+	ldr_cost_ranges(db);
+	if (!ldr_loading_testdb)
+		ldr_sort_salts(db, 0);
 	ldr_init_hash(db);
 
 	ldr_init_sqid(db);
@@ -1788,9 +2100,11 @@ void ldr_fix_database(struct db_main *db)
 			fprintf(stderr, "%s%d password hash%s cracked,"
 			        " %d left\n", total ? "\n" : "", total,
 			        total != 1 ? "es" : "", db->password_count);
-		MEMDBG_PROGRAM_EXIT_CHECKS(stderr);
 		exit(0);
 	}
+
+	if (!ldr_loading_testdb && options.seed_per_user)
+		ldr_fill_user_words(db);
 }
 
 static int ldr_cracked_hash(char *ciphertext)
@@ -1854,62 +2168,51 @@ out:
 	return hash;
 }
 
+static int drop_regen_salt(char *line)
+{
+	char *sdl;
+
+	if ((sdl= strrchr(line, '$'))) {
+		*sdl = 0;
+		return 1;
+	}
+	return 0;
+}
+
 static void ldr_show_pot_line(struct db_main *db, char *line)
 {
 	char *ciphertext, *pos;
 	int hash;
 	struct db_cracked *current, *last;
+	static struct fmt_main *last_fmt;
 
 	ciphertext = ldr_get_field(&line, db->options->field_sep_char);
 
-	if (options.format &&
-	    !strcasecmp(options.format, "raw-sha1-linkedin")) {
-		if (!strncmp(ciphertext, "$dynamic_26$", 12))
-			memset(ciphertext + 12, '0', 5);
-		else if (!strncmp(ciphertext, "{SHA}", 5)) {
-			char out[40+1];
-			static char tmp[40+5+1]; // larger than needed, but we know its big enough.
-			base64_convert(ciphertext + 5, e_b64_mime,
-			    strlen(ciphertext) - 5, out, e_b64_hex, sizeof(out), 0, 0);
-			memcpy(out, "00000", 5);
-			ciphertext = tmp;
-			strcpy(tmp, "{SHA}");
-			base64_convert(out, e_b64_hex, 40, ciphertext + 5,
-			    e_b64_mime, sizeof(tmp)-5, flg_Base64_MIME_TRAIL_EQ, 0);
-		}
-	}
-#ifndef DYNAMIC_DISABLED
-	else
-	if (!strncmp(ciphertext, "$dynamic_", 9) && strstr(ciphertext, "$HEX$"))
-	{
-		char Tmp[512], *cp=Tmp;
-		int alloced=0;
-		if (strlen(ciphertext)>sizeof(Tmp)) {
-			cp = (char*)mem_alloc(strlen(ciphertext)+1);
-			alloced = 1;
-		}
-		RemoveHEX(Tmp, ciphertext);
-			// tmp will always be 'shorter' or equal length to ciphertext
-			strcpy(ciphertext, Tmp);
-		if (alloced)
-			MEM_FREE(cp);
-	}
-#endif
 	if (line) {
-/* If just one format was forced on the command line, insist on it */
-		if (!fmt_list->next) {
-			if (strstr(ciphertext, "$SOURCE_HASH$")) {
-				int fnd = 0, i;
-				for (i = 0;  !fnd && fmt_list->params.signature[i]; ++i) {
-					if (!strncmp(ciphertext, fmt_list->params.signature[i], strlen(fmt_list->params.signature[i])))
-						fnd = 1;
-				}
-				if (!fnd)
-					return;
-			}
-			else if (!fmt_list->methods.valid(ciphertext, fmt_list))
-				return;
+/*
+ * Jumbo-specific; split() needed for legacy pot entries so we need to
+ * enumerate formats to know which to call.
+ * This also takes care of the situation where specific format(s) was
+ * requested for --make-charset.
+ */
+		struct fmt_main *format = fmt_list;
+
+		if (last_fmt && (ldr_trunc_valid(ciphertext, last_fmt) == 1))
+			format = last_fmt;
+		else
+		if (!(db->options->flags & DB_PLAINTEXTS) || (options.flags & FLG_FORMAT)) {
+			do {
+				if (format != last_fmt && ldr_trunc_valid(ciphertext, format) == 1)
+					break;
+			} while ((format = format->next));
+
+			if (format)
+				last_fmt = format;
 		}
+
+/* If format(s) was forced on the command line, insist on it (them) */
+		if (!format && (options.flags & FLG_FORMAT))
+			return;
 
 		pos = line;
 		do {
@@ -1917,12 +2220,52 @@ static void ldr_show_pot_line(struct db_main *db, char *line)
 		} while (*pos++);
 
 		if (db->options->flags & DB_PLAINTEXTS) {
+			if (options.flags & FLG_MAKECHR_CHK) {
+				if (options.target_enc > ASCII && options.target_enc < UTF_8) {
+					char *plain = ldr_conv(line);
+
+					/* Only load words that fit our selected codepage */
+					if (plain != line && strlen(plain) != strlen8((UTF8*)line))
+						return;
+					else
+						line = plain;
+				} else if (options.target_enc == UTF_8) {
+					/* Only load words that are valid UTF-8 */
+					if (!valid_utf8((UTF8*)line))
+						return;
+				}
+			}
 			list_add(db->plaintexts, line);
 			return;
 		}
 
-		/* Jumbo-specific; needed for legacy pot entries */
-		ciphertext = fmt_list->methods.split(ciphertext, 0, fmt_list);
+		/*
+		 * Bodge for --show to work w/ --regen-lost-salts
+		 *
+		 * This requires you to supply the same --regen-lost-salts parameters with --show
+		 * as what what used during cracking (actually just the total length need to match)
+		 */
+		if (options.regen_lost_salts) {
+			char *p;
+
+			if (!strncmp(ciphertext, "$dynamic_", 9)) {
+				p = ciphertext + 10;
+				if ((p = strchr(p, '$')))
+					p++;
+				if (drop_regen_salt(p))
+					ciphertext = p;
+			} else
+			if (!strncmp(ciphertext, "@dynamic=", 9)) {
+				p = ciphertext + 10;
+				if ((p = strchr(p, '@')))
+					p++;
+				if (drop_regen_salt(p))
+					ciphertext = p;
+			}
+		}
+
+		if (format)
+			ciphertext = format->methods.split(ciphertext, 0, format);
 
 		hash = ldr_cracked_hash(ciphertext);
 
@@ -1951,7 +2294,7 @@ static void ldr_show_pw_line(struct db_main *db, char *line)
 	char *orig_line = NULL;
 	struct fmt_main *format;
 	char *(*split)(char *ciphertext, int index, struct fmt_main *self);
-	int index, count, unify;
+	int index, count;
 	char *login, *ciphertext, *gecos, *home, *uid;
 	char *piece;
 	int pass, found, chars;
@@ -1975,7 +2318,7 @@ static void ldr_show_pw_line(struct db_main *db, char *line)
 	if (db->options->showinvalid) {
 		if (count == -1) {
 			db->password_count++;
-			printf ("%s\n", orig_line);
+			printf("%s\n", orig_line);
 		} else
 			db->guess_count += count;
 		goto free_and_return;
@@ -1992,7 +2335,6 @@ static void ldr_show_pw_line(struct db_main *db, char *line)
 
 	if (format) {
 		split = format->methods.split;
-		unify = format->params.flags & FMT_SPLIT_UNIFIES_CASE;
 		if (format->params.flags & FMT_UNICODE) {
 			static int setting = -1;
 			if (setting < 0)
@@ -2002,15 +2344,13 @@ static void ldr_show_pw_line(struct db_main *db, char *line)
 		} else {
 			static int setting = -1;
 			if (setting < 0)
-				setting = options.target_enc != ASCII &&
-				    cfg_get_bool(SECTION_OPTIONS, NULL,
-				    "CPstoreUTF8", 0);
+				setting = (options.target_enc != ENC_RAW &&
+				           cfg_get_bool(SECTION_OPTIONS, NULL, "CPstoreUTF8", 0));
 			options.store_utf8 = setting;
 		}
 	} else {
 		split = fmt_default_split;
 		count = 1;
-		unify = 0;
 	}
 
 	if (options.target_enc != UTF_8 &&
@@ -2022,7 +2362,7 @@ static void ldr_show_pw_line(struct db_main *db, char *line)
 		utf8source = mem_alloc(line_size + 3 * login_size);
 		login = cp_to_utf8_r(login, utf8login, 4 * login_size);
 		line_size += 3 * login_size;
-		source = realloc(source, line_size);
+		source = mem_realloc(source, line_size);
 		cp_to_utf8_r(source, utf8source, line_size);
 		strnzcpy(source, utf8source, line_size);
 		MEM_FREE(utf8source);
@@ -2038,8 +2378,6 @@ static void ldr_show_pw_line(struct db_main *db, char *line)
 	for (found = pass = 0; pass == 0 || (pass == 1 && found); pass++)
 	for (index = 0; index < count; index++) {
 		piece = split(ciphertext, index, format);
-		if (unify)
-			piece = strcpy(mem_alloc(strlen(piece) + 1), piece);
 
 		hash = ldr_cracked_hash(piece);
 
@@ -2049,18 +2387,7 @@ static void ldr_show_pw_line(struct db_main *db, char *line)
 
 			if (!ldr_pot_source_cmp(pot, piece))
 				break;
-/* This extra check, along with ldr_cracked_hash() being case-insensitive,
- * is only needed for matching some pot file records produced by older
- * versions of John and contributed patches where split() didn't unify the
- * case of hex-encoded hashes. */
-			if (unify &&
-			    format->methods.valid(pot, format) == 1 &&
-			    !strcmp(split(pot, 0, format), piece))
-				break;
 		} while ((current = current->next));
-
-		if (unify)
-			MEM_FREE(piece);
 
 		if (pass) {
 			chars = 0;

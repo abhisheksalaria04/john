@@ -1,24 +1,25 @@
 /*
- * KRB5_fmt.c
- *
- *  Kerberos 5 module for John the Ripper, based on the
- *  KRB4 module by Dug Song.
+ * Kerberos 5 module for John the Ripper, based on the
+ * KRB4 module by Dug Song.
  *
  * Author: Nasko Oskov <nasko at netsekure.org>
  *
  * Licensing:
  *
- *  The module contains code derived or copied from the Heimdal project.
+ *  The module contains code derived or copied from the Heimdal project, which
+ *  is distribution of Kerberos based on M.I.T. implementation.
  *
- *  Copyright (c) 1997-2000 Kungliga Tekniska Högskolan
- *  (Royal Institute of Technology, Stockholm, Sweden).
- *  All rights reserved.
+ *  Copyright (c) 1997-2000 Kungliga Tekniska Högskolan (Royal Institute of
+ *  Technology, Stockholm, Sweden). All rights reserved.
  *
- *  Which is distribution of Kerberos based on M.I.T. implementation.
- *
- *  Copyright (C) 1990 by the Massachusetts Institute of Technology
- *
+ *  Copyright (C) 1990 by the Massachusetts Institute of Technology.
  */
+
+#if AC_BUILT
+#include "autoconfig.h"
+#endif
+
+#if HAVE_LIBCRYPTO
 
 #if FMT_EXTERNS_H
 extern struct fmt_main fmt_KRB5;
@@ -26,33 +27,17 @@ extern struct fmt_main fmt_KRB5;
 john_register_one(&fmt_KRB5);
 #else
 
-#if AC_BUILT
-#include "autoconfig.h"
-#endif
-
+#include <ctype.h> // required
 #include <stdlib.h>
-
-#include <sys/types.h>
-#include <sys/stat.h>
-#if !AC_BUILT || HAVE_FCNTL_H
-#include <fcntl.h>
-#endif
-#include <errno.h>
-
 #include <string.h>
 #include <openssl/des.h>
 
-#include <ctype.h>
-
 #include "arch.h"
 #include "misc.h"
-#include "formats.h"    // needed for format structs
+#include "formats.h"
 #include "memory.h"
 #include "KRB5_std.h"
-#include "memdbg.h"
 
-
-// defines
 #define MAGIC_PREFIX        "$krb5$"
 #define MAGIC_PREFIX_LEN    (sizeof(MAGIC_PREFIX)-1)
 #define MAX_REALM_LEN       64
@@ -64,7 +49,7 @@ john_register_one(&fmt_KRB5);
 #define FORMAT_NAME         "Kerberos v5 TGT"
 #define ALGORITHM_NAME      "3DES 32/" ARCH_BITS_STR
 #define BENCHMARK_COMMENT   ""
-#define BENCHMARK_LENGTH    -1
+#define BENCHMARK_LENGTH    0x107
 #define PLAINTEXT_LENGTH    32
 #define BINARY_SIZE         0
 #define BINARY_ALIGN        MEM_ALIGN_NONE
@@ -157,10 +142,9 @@ static int decrypt_compare() {
     memset(krb5key->key, 0x00, DES3_KEY_SIZE);
     memset(krb5key->schedule, 0x00, DES3_KEY_SCHED_SIZE);
 
-/* NUL padding is intentional */
-    strncpy(username, psalt->user, MAX_USER_LEN);
-    strncpy(realm, psalt->realm, MAX_REALM_LEN);
-    strncpy(password, skey.passwd, MAX_PASS_LEN);
+    strncpy_pad(username, psalt->user, MAX_USER_LEN, 0);
+    strncpy_pad(realm, psalt->realm, MAX_REALM_LEN, 0);
+    strncpy_pad(password, skey.passwd, MAX_PASS_LEN, 0);
 
     // do str2key
     str2key(username, realm, password, krb5key);
@@ -168,11 +152,10 @@ static int decrypt_compare() {
 /* Possible optimization: we might not have to decrypt the entire thing */
     des3_decrypt(krb5key, psalt->tgt_ebin, plain, TGT_SIZE);
 
-    for(i=0;i<TGT_SIZE;++i)
+    for (i=0;i<TGT_SIZE;++i)
         if (plain[i] == 'k')
             if (strncmp(plain + i, KRBTGT, strlen(KRBTGT)) == 0) {
-/* NUL padding is intentional */
-                strncpy(psalt->passwd, skey.passwd, MAX_PASS_LEN);
+	            strncpy_pad(psalt->passwd, skey.passwd, MAX_PASS_LEN, 0);
                 return 1;
             }
     return 0;
@@ -379,3 +362,4 @@ struct fmt_main fmt_KRB5 = {
 };
 
 #endif /* plugin stanza */
+#endif /* HAVE_LIBCRYPTO */

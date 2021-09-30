@@ -52,18 +52,22 @@
 #include "john.h"
 #include "status.h"
 #include "signals.h"
+#include "john_mpi.h"
 #ifdef HAVE_MPI
-#include "john-mpi.h"
+#include "tty.h" /* For tty_has_keyboard() */
 #endif
-#include "memdbg.h"
 
 volatile int event_pending = 0, event_reload = 0;
-volatile int event_abort = 0, event_save = 0, event_status = 0;
+volatile int event_abort = 0, event_save = 0, event_status = 0, event_delayed_status = 0;
 volatile int event_ticksafety = 0;
 volatile int event_mpiprobe = 0, event_poll_files = 0;
+volatile int event_fix_state = 0, event_refresh_salt = 0;
 
 volatile int timer_abort = 0, timer_status = 0;
-static int timer_save_interval, timer_save_value;
+static int timer_save_interval;
+#ifndef BENCH_BUILD
+static int timer_save_value;
+#endif
 static clock_t timer_ticksafety_interval, timer_ticksafety_value;
 volatile int aborted_by_timer = 0;
 static int abort_grace_time = 30;
@@ -75,6 +79,7 @@ static int abort_grace_time = 30;
 #include <sys/times.h>
 #endif
 
+static int timer_emu_running;
 static clock_t timer_emu_interval = 0;
 static unsigned int timer_emu_count = 0, timer_emu_max = 0;
 
@@ -82,6 +87,7 @@ void sig_timer_emu_init(clock_t interval)
 {
 	timer_emu_interval = interval;
 	timer_emu_count = 0; timer_emu_max = 0;
+	timer_emu_running = 1;
 }
 
 void sig_timer_emu_tick(void)
@@ -92,7 +98,10 @@ void sig_timer_emu_tick(void)
 	struct tms buf;
 #endif
 
-	if (++timer_emu_count < timer_emu_max) return;
+	if (!timer_emu_running)
+		return;
+	if (++timer_emu_count < timer_emu_max)
+		return;
 
 #if defined (__MINGW32__) || defined (_MSC_VER)
 	current = clock();
@@ -166,26 +175,27 @@ static void sig_remove_reload(void)
 
 void check_abort(int be_async_signal_safe)
 {
+	char *abort_msg = (aborted_by_timer) ?
+		"Session stopped (max run-time reached)\n" :
+		"Session aborted\n";
+
 	if (!event_abort) return;
 
 	tty_done();
 
-	MEMDBG_PROGRAM_EXIT_CHECKS(stderr);
+#ifndef BENCH_BUILD
+	if (john_max_cands && status.cands >= john_max_cands)
+		abort_msg = "Session stopped (max candidates reached)\n";
+#endif
 
 	if (be_async_signal_safe) {
-		if (john_main_process) {
-			if (aborted_by_timer)
-				write_loop(2, "Session stopped (max run-time"
-				           " reached)\n", 39);
-			else
-				write_loop(2, "Session aborted\n", 16);
-		}
+		if (john_main_process)
+			write_loop(2, abort_msg, strlen(abort_msg));
 		_exit(1);
 	}
 
 	if (john_main_process)
-		fprintf(stderr, "Session %s\n", (aborted_by_timer) ?
-		        "stopped (max run-time reached)" : "aborted");
+		fprintf(stderr, "%s", abort_msg);
 	error();
 }
 
@@ -196,7 +206,7 @@ static void sig_handle_abort(int signum)
 	int saved_errno = errno;
 
 #if OS_FORK
-	if (john_main_process) {
+	if (john_main_process && !aborted_by_timer) {
 /*
  * We assume that our children are running on the same tty with us, so if we
  * receive a SIGINT they probably do as well without us needing to forward the
@@ -298,6 +308,17 @@ static void sig_handle_reload(int signum);
 #endif
 #endif
 
+void sig_reset_timer(void)
+{
+#ifndef BENCH_BUILD
+#if OS_TIMER
+	timer_save_value = timer_save_interval;
+#else
+	timer_save_value = status_get_time() + timer_save_interval;
+#endif
+#endif
+}
+
 static void sig_handle_timer(int signum)
 {
 	int saved_errno = errno;
@@ -306,9 +327,8 @@ static void sig_handle_timer(int signum)
 #endif
 #ifndef BENCH_BUILD
 #if OS_TIMER
-	/* Some stuff only done every few seconds */
-	if (timer_save_interval < 4 ||
-	    ((timer_save_interval - timer_save_value) & 3) == 3) {
+	/* Some stuff only done every fourth second */
+	if (((timer_save_interval - timer_save_value) & 3) == 0) {
 #ifdef HAVE_MPI
 		if (!event_reload && mpi_p > 1) {
 			event_pending = event_mpiprobe = 1;
@@ -320,7 +340,6 @@ static void sig_handle_timer(int signum)
 #endif
 	}
 	if (!--timer_save_value) {
-		timer_save_value = timer_save_interval;
 		event_save = event_pending = 1;
 		event_reload = options.reload_at_save;
 	}
@@ -341,8 +360,8 @@ static void sig_handle_timer(int signum)
 #else /* no OS_TIMER */
 	time = status_get_time();
 
-	/* Some stuff only done every few seconds */
-	if ((time & 3) == 3) {
+	/* Some stuff only done every fourth second */
+	if ((time & 3) == 0) {
 #ifdef HAVE_MPI
 		if (!event_reload && mpi_p > 1) {
 			event_pending = event_mpiprobe = 1;
@@ -373,6 +392,10 @@ static void sig_handle_timer(int signum)
 		event_status = event_pending = 1;
 	}
 #endif /* OS_TIMER */
+
+	event_fix_state = 1;
+	event_refresh_salt++;
+
 #endif /* !BENCH_BUILD */
 
 	if (!--timer_ticksafety_value) {
@@ -381,7 +404,9 @@ static void sig_handle_timer(int signum)
 		event_ticksafety = event_pending = 1;
 	}
 
-#ifndef HAVE_MPI
+#ifdef HAVE_MPI
+	if (tty_has_keyboard())
+#else
 	if (john_main_process)
 #endif
 	{
@@ -390,11 +415,31 @@ static void sig_handle_timer(int signum)
 		int new_abort = 0, new_status = 0;
 #endif
 		while ((c = tty_getchar()) >= 0) {
+#ifndef BENCH_BUILD
+			char verb_msg[] = "Verbosity now 0\n";
+#endif
 			if (c == 3 || c == 'q') {
 #if OS_FORK
 				new_abort = 1;
 #endif
 				sig_handle_abort(0);
+#ifndef BENCH_BUILD
+			} else if (c == '>' && options.verbosity < VERB_DEBUG) {
+				options.verbosity++;
+				if (john_main_process) {
+					verb_msg[14] += options.verbosity;
+					write_loop(2, verb_msg, sizeof(verb_msg) - 1);
+				}
+			} else if (c == '<' && options.verbosity > 1) {
+				options.verbosity--;
+				if (john_main_process) {
+					verb_msg[14] += options.verbosity;
+					write_loop(2, verb_msg, sizeof(verb_msg) - 1);
+				}
+			} else if (c == 'd') {
+				event_delayed_status = 1;
+				write_loop(2, "Delayed status pending...\r", 26);
+#endif
 			} else {
 #if OS_FORK
 				new_status = 1;
@@ -541,11 +586,7 @@ void sig_init(void)
 		abort_grace_time =
 			cfg_get_int(SECTION_OPTIONS, NULL, "AbortGraceTime");
 	}
-#if OS_TIMER
-	timer_save_value = timer_save_interval;
-#elif !defined(BENCH_BUILD)
-	timer_save_value = status_get_time() + timer_save_interval;
-#endif
+
 	timer_ticksafety_interval = (clock_t)1 << (sizeof(clock_t) * 8 - 4);
 	timer_ticksafety_interval /= clk_tck;
 	if ((timer_ticksafety_interval /= TIMER_INTERVAL) <= 0)
@@ -554,9 +595,33 @@ void sig_init(void)
 
 	atexit(sig_done);
 
-	sig_install(sig_handle_update, SIGHUP);
 	sig_install_abort();
+}
+
+void sig_init_late(void)
+{
+#ifndef BENCH_BUILD
+	unsigned int time;
+
+#if OS_TIMER
+	timer_save_value = timer_save_interval + ((NODE + 1) & 63);
+
+	time = 0;
+#else
+	timer_save_value =
+		status_get_time() + timer_save_interval + ((NODE + 1) & 63);
+	time = status_get_time();
+#endif
+#endif
+
+	sig_install(sig_handle_update, SIGHUP);
 	sig_install_timer();
+#ifndef BENCH_BUILD
+	if (options.max_run_time)
+		timer_abort = time + abs(options.max_run_time);
+	if (options.status_interval)
+		timer_status = time + options.status_interval;
+#endif
 }
 
 void sig_init_child(void)
@@ -566,9 +631,6 @@ void sig_init_child(void)
 #endif
 #ifdef SIGUSR2
 	sig_remove_reload();
-#endif
-#if OS_TIMER
-	sig_init_timer();
 #endif
 }
 

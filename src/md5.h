@@ -16,12 +16,12 @@
 #define _MD5_H
 
 /* Any 32-bit or wider unsigned integer data type will do */
-/* this needs to be defined no matter if building with HAVE_LIBSSL or not */
+/* this needs to be defined no matter if building with HAVE_LIBCRYPTO or not */
 typedef unsigned int MD5_u32plus;
 
-#include "arch.h"
+#include "arch.h" /* also includes autoconfig.h for HAVE_LIBCRYPTO */
 
-#ifdef HAVE_LIBSSL
+#if HAVE_LIBCRYPTO
 #include <openssl/md5.h>
 
 #else
@@ -34,13 +34,15 @@ typedef struct {
 	MD5_u32plus A, B, C, D;
 	MD5_u32plus lo, hi;
 	unsigned char buffer[64];
+#if !ARCH_ALLOWS_UNALIGNED
 	MD5_u32plus block[16];
+#endif
 } MD5_CTX;
 
 extern void MD5_Init(MD5_CTX *ctx);
 extern void MD5_Update(MD5_CTX *ctx, const void *data, unsigned long size);
 extern void MD5_PreFinal(MD5_CTX *ctx);
 extern void MD5_Final(unsigned char *result, MD5_CTX *ctx);
-#endif /* HAVE_LIBSSL */
 
+#endif /* HAVE_LIBCRYPTO */
 #endif /* _MD5_H */

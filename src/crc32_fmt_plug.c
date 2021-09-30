@@ -30,28 +30,20 @@ extern struct fmt_main fmt_crc32;
 john_register_one(&fmt_crc32);
 #else
 
-/* Uncomment to try out a non-SSE4.2 build (bench with -cost=1:1) */
-//#undef __SSE4_2__
-//#undef __AVX2__
-
 #include <string.h>
+
+#include "arch.h"
+#if !FAST_FORMATS_OMP
+#undef _OPENMP
+#endif
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "common.h"
 #include "formats.h"
 #include "crc32.h"
 #include "loader.h"
-
-#if !FAST_FORMATS_OMP
-#undef _OPENMP
-#endif
-
-#ifdef _OPENMP
-#include <omp.h>
-#ifndef OMP_SCALE
-#define OMP_SCALE       256	// tuned on core i7
-#endif
-#endif
-#include "memdbg.h"
 
 #define FORMAT_LABEL			"CRC32"
 #define FORMAT_NAME			""
@@ -61,7 +53,7 @@ john_register_one(&fmt_crc32);
 #define FORMAT_TAGc_LEN		(sizeof(FORMAT_TAG)-1)
 #define ALGORITHM_NAME			"CRC32 32/" ARCH_BITS_STR " CRC-32C " CRC32_C_ALGORITHM_NAME
 #define BENCHMARK_COMMENT		""
-#define BENCHMARK_LENGTH		0
+#define BENCHMARK_LENGTH		7
 
 #define PLAINTEXT_LENGTH		31
 
@@ -70,8 +62,12 @@ john_register_one(&fmt_crc32);
 #define SALT_SIZE			5
 #define SALT_ALIGN			4
 
+#ifndef OMP_SCALE
+#define OMP_SCALE       2 // tuned w/ MKPC for core i7
+#endif
+
 #define MIN_KEYS_PER_CRYPT		1
-#define MAX_KEYS_PER_CRYPT		8192 // per thread
+#define MAX_KEYS_PER_CRYPT		8192
 
 static struct fmt_tests tests[] = {
 	{"$crc32$00000000.fa455f6b", "ripper"},
@@ -95,15 +91,8 @@ static unsigned int crctype;
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	int n = omp_get_max_threads();
-	if (n > 4) {
-		n = 4; // it just won't scale further
-		omp_set_num_threads(n);
-	}
-	self->params.max_keys_per_crypt *= (n*OMP_SCALE);
-#endif
-	//printf("Using %u x %u = %u keys per crypt\n", MAX_KEYS_PER_CRYPT, n, self->params.max_keys_per_crypt);
+	omp_autotune(self, OMP_SCALE);
+
 	saved_key = mem_calloc(self->params.max_keys_per_crypt,
 	                       sizeof(*saved_key));
 	crcs      = mem_calloc(self->params.max_keys_per_crypt,
@@ -145,20 +134,15 @@ static int valid(char *ciphertext, struct fmt_main *self)
 	return 1;
 }
 
-static int get_hash_0(int index) { return crcs[index] & PH_MASK_0; }
-static int get_hash_1(int index) { return crcs[index] & PH_MASK_1; }
-static int get_hash_2(int index) { return crcs[index] & PH_MASK_2; }
-static int get_hash_3(int index) { return crcs[index] & PH_MASK_3; }
-static int get_hash_4(int index) { return crcs[index] & PH_MASK_4; }
-static int get_hash_5(int index) { return crcs[index] & PH_MASK_5; }
-static int get_hash_6(int index) { return crcs[index] & PH_MASK_6; }
+#define COMMON_GET_HASH_VAR crcs
+#include "common-get-hash.h"
 
 static void *get_binary(char *ciphertext)
 {
-	static ARCH_WORD_32 *out;
+	static uint32_t *out;
 	char *p;
 	if (!out)
-		out = mem_alloc_tiny(sizeof(ARCH_WORD_32), MEM_ALIGN_WORD);
+		out = mem_alloc_tiny(sizeof(uint32_t), MEM_ALIGN_WORD);
 	p = strchr(ciphertext, '.');
 	sscanf(&p[1], "%x", out);
 	// Performing the complement here, allows us to not have to complement
@@ -169,11 +153,11 @@ static void *get_binary(char *ciphertext)
 
 static void *get_salt(char *ciphertext)
 {
-	static ARCH_WORD_32 *out;
+	static uint32_t *out;
 	char *cp;
 
 	if (!out)
-		out = mem_alloc_tiny(sizeof(ARCH_WORD_32)*2, MEM_ALIGN_WORD);
+		out = mem_alloc_tiny(sizeof(uint32_t)*2, MEM_ALIGN_WORD);
 	cp = strrchr(ciphertext, '$');
 	sscanf(&cp[1], "%x", out);
 	// since we ask for the crc of a file, or zero, we need to complement here,
@@ -188,9 +172,7 @@ static void *get_salt(char *ciphertext)
 
 static void set_key(char *key, int index)
 {
-	char *p = saved_key[index];
-	while ( (*p++ = *key++) )
-		;
+	strnzcpy(saved_key[index], key, sizeof(*saved_key));
 }
 
 static char *get_key(int index)
@@ -239,13 +221,13 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 static void set_salt(void *salt)
 {
-	crcsalt = *((ARCH_WORD_32 *)salt);
+	crcsalt = *((uint32_t *)salt);
 	crctype = ((char*)salt)[4];
 }
 
 static int cmp_all(void *binary, int count)
 {
-	ARCH_WORD_32 crc=*((ARCH_WORD_32*)binary), i;
+	uint32_t crc=*((uint32_t*)binary), i;
 	for (i = 0; i < count; ++i)
 		if (crc == crcs[i]) return 1;
 	return 0;
@@ -253,7 +235,7 @@ static int cmp_all(void *binary, int count)
 
 static int cmp_one(void *binary, int index)
 {
-	return *((ARCH_WORD_32*)binary) == crcs[index];
+	return *((uint32_t*)binary) == crcs[index];
 }
 
 static int cmp_exact(char *source, int index)
@@ -263,7 +245,7 @@ static int cmp_exact(char *source, int index)
 
 static int salt_hash(void *salt)
 {
-	return *(ARCH_WORD_32*)salt & (SALT_HASH_SIZE - 1);
+	return *(uint32_t*)salt & (SALT_HASH_SIZE - 1);
 }
 
 static unsigned int crc32_ver(void *salt)
@@ -293,7 +275,7 @@ struct fmt_main fmt_crc32 = {
 #endif
 		FMT_CASE | FMT_8_BIT,
 		{
-			"version: 0 = CRC-32, 1 = CRC-32C",
+			"version [0:CRC-32 1:CRC-32C]",
 		},
 		{ FORMAT_TAG, FORMAT_TAGc },
 		tests
@@ -327,13 +309,8 @@ struct fmt_main fmt_crc32 = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,

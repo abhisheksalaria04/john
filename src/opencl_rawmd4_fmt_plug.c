@@ -19,7 +19,6 @@ john_register_one(&FMT_STRUCT);
 #else
 
 #include <string.h>
-#include <assert.h>
 #include <sys/time.h>
 
 #include "arch.h"
@@ -34,15 +33,15 @@ john_register_one(&FMT_STRUCT);
 
 #define PLAINTEXT_LENGTH    55 /* Max. is 55 with current kernel */
 #define BUFSIZE             ((PLAINTEXT_LENGTH+3)/4*4)
-#define FORMAT_LABEL        "Raw-MD4-opencl"
+#define FORMAT_LABEL        "raw-MD4-opencl"
 #define FORMAT_NAME         ""
 #define ALGORITHM_NAME      "MD4 OpenCL"
 #define BENCHMARK_COMMENT   ""
-#define BENCHMARK_LENGTH    -1
+#define BENCHMARK_LENGTH    0x107
 #define CIPHERTEXT_LENGTH   32
 #define DIGEST_SIZE         16
 #define BINARY_SIZE         16
-#define BINARY_ALIGN        1
+#define BINARY_ALIGN        sizeof(int)
 #define SALT_SIZE           0
 #define SALT_ALIGN          1
 
@@ -62,7 +61,6 @@ static struct fmt_main *self;
 #define MIN_KEYS_PER_CRYPT      1
 #define MAX_KEYS_PER_CRYPT      1
 
-#include "memdbg.h"
 
 static struct fmt_tests tests[] = {
 	{"8a9d093f14f8701df17732b2bb182c74", "password"},
@@ -97,8 +95,13 @@ static void set_kernel_args()
 	HANDLE_CLERROR(clSetKernelArg(crypt_kernel, 3, sizeof(buffer_int_keys), (void *) &buffer_int_keys), "Error setting argument 4.");
 }
 
+static void release_clobj_kpc(void);
+static void release_clobj(void);
+
 static void create_clobj_kpc(size_t kpc)
 {
+	release_clobj_kpc();
+
 	pinned_saved_keys = clCreateBuffer(context[gpu_id], CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, BUFSIZE * kpc, NULL, &ret_code);
 	if (ret_code != CL_SUCCESS) {
 		saved_plain = (cl_uint *) mem_alloc(BUFSIZE * kpc);
@@ -135,6 +138,8 @@ static void create_clobj(void)
 {
 	cl_uint dummy = 0;
 
+	release_clobj();
+
 	//dummy is used as dummy parameter
 	buffer_int_keys = clCreateBuffer(context[gpu_id], CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, 4 * mask_int_cand.num_int_cand, mask_int_cand.int_cand ? mask_int_cand.int_cand : (void *)&dummy, &ret_code);
 	HANDLE_CLERROR(ret_code, "Error creating buffer argument buffer_int_keys.");
@@ -160,6 +165,7 @@ static void release_clobj_kpc(void)
 		HANDLE_CLERROR(clReleaseMemObject(pinned_saved_idx), "Error Releasing pinned_saved_idx.");
 		HANDLE_CLERROR(clReleaseMemObject(pinned_int_key_loc), "Error Releasing pinned_int_key_loc.");
 		buffer_idx = 0;
+		pinned_saved_keys = 0;
 	}
 }
 
@@ -168,8 +174,9 @@ static void release_clobj(void)
 	if (buffer_int_keys) {
 		HANDLE_CLERROR(clReleaseMemObject(buffer_int_keys), "Error Releasing buffer_int_keys.");
 		buffer_int_keys = 0;
+
+		ocl_hc_128_rlobj();
 	}
-	ocl_hc_128_rlobj();
 }
 
 static void done(void)
@@ -191,13 +198,18 @@ static void init_kernel(unsigned int num_ld_hashes, char *bitmap_para)
 	int i;
 	cl_ulong const_cache_size;
 
-	clReleaseKernel(crypt_kernel);
+	if (crypt_kernel) {
+		HANDLE_CLERROR(clReleaseKernel(crypt_kernel), "Release kernel.");
+		HANDLE_CLERROR(clReleaseProgram(program[gpu_id]), "Release Program.");
+
+		crypt_kernel = NULL;
+	}
 
 	shift64_ht_sz = (((1ULL << 63) % hash_table_size_128) * 2) % hash_table_size_128;
 	shift64_ot_sz = (((1ULL << 63) % offset_table_size) * 2) % offset_table_size;
 
 	for (i = 0; i < MASK_FMT_INT_PLHDR; i++)
-		if (mask_skip_ranges!= NULL && mask_skip_ranges[i] != -1)
+		if (mask_skip_ranges && mask_skip_ranges[i] != -1)
 			static_gpu_locations[i] = mask_int_cand.int_cpu_mask_ctx->
 				ranges[mask_skip_ranges[i]].pos;
 		else
@@ -232,7 +244,7 @@ static void init_kernel(unsigned int num_ld_hashes, char *bitmap_para)
 #endif
 	);
 
-	opencl_build_kernel("$JOHN/kernels/md4_kernel.cl", gpu_id, build_opts, 0);
+	opencl_build_kernel("$JOHN/opencl/md4_kernel.cl", gpu_id, build_opts, 0);
 	crypt_kernel = clCreateKernel(program[gpu_id], "md4", &ret_code);
 	HANDLE_CLERROR(ret_code, "Error creating kernel. Double-check kernel name?");
 }
@@ -300,12 +312,13 @@ static int get_hash_6(int index) { return hash_table_128[hash_ids[3 + 3 * index]
 
 static void clear_keys(void)
 {
+	memset(saved_idx, 0, sizeof(cl_uint) * global_work_size);
 	key_idx = 0;
 }
 
 static void set_key(char *_key, int index)
 {
-	const ARCH_WORD_32 *key = (ARCH_WORD_32*)_key;
+	const uint32_t *key = (uint32_t*)_key;
 	int len = strlen(_key);
 
 	if (mask_int_cand.num_int_cand > 1 && !mask_gpu_is_static) {
@@ -362,7 +375,7 @@ static char *get_key(int index)
 		out[i] = *key++;
 	out[i] = 0;
 
-	if (mask_skip_ranges && mask_int_cand.num_int_cand > 1) {
+	if (len && mask_skip_ranges && mask_int_cand.num_int_cand > 1) {
 		for (i = 0; i < MASK_FMT_INT_PLHDR && mask_skip_ranges[i] != -1; i++)
 			if (mask_gpu_is_static)
 				out[static_gpu_locations[i]] =
@@ -381,9 +394,9 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 	size_t *lws = local_work_size ? &local_work_size : NULL;
 
-	global_work_size = GET_MULTIPLE_OR_BIGGER(count, local_work_size);
+	global_work_size = GET_NEXT_MULTIPLE(count, local_work_size);
 
-	//fprintf(stderr, "%s(%d) lws "Zu" gws "Zu" idx %u int_cand%d\n", __FUNCTION__, count, local_work_size, global_work_size, key_idx, mask_int_cand.num_int_cand);
+	//fprintf(stderr, "%s(%d) lws "Zu" gws "Zu" idx %u int_cand %d\n", __FUNCTION__, count, local_work_size, global_work_size, key_idx, mask_int_cand.num_int_cand);
 
 	// copy keys to the device
 	if (key_idx)
@@ -408,7 +421,7 @@ static void auto_tune(struct db_main *db, long double kernel_run_ms)
 	size_t pcount, count;
 	size_t i;
 
-	int tune_gws, tune_lws;
+	int tune_gws = 1, tune_lws = 1;
 
 	char key[PLAINTEXT_LENGTH + 1];
 
@@ -444,11 +457,13 @@ static void auto_tune(struct db_main *db, long double kernel_run_ms)
 	if (gws_init < lws_init)
 		lws_init = gws_init;
 
-	local_work_size = 0;
-	global_work_size = 0;
-	tune_gws = 1;
-	tune_lws = 1;
-	opencl_get_user_preferences(FORMAT_LABEL);
+	if (self_test_running) {
+		opencl_get_sane_lws_gws_values();
+	} else {
+		local_work_size = 0;
+		global_work_size = 0;
+		opencl_get_user_preferences(FORMAT_LABEL);
+	}
 	if (local_work_size) {
 		tune_lws = 0;
 		if (local_work_size & (local_work_size - 1))
@@ -459,12 +474,6 @@ static void auto_tune(struct db_main *db, long double kernel_run_ms)
 	if (global_work_size)
 		tune_gws = 0;
 
-#if 0
-	 fprintf(stderr, "lws_init:"Zu" lws_limit:"Zu""
-			 " gws_init:"Zu" gws_limit:"Zu"\n",
-			  lws_init, lws_limit, gws_init,
-			  gws_limit);
-#endif
 	/* Auto tune start.*/
 	pcount = gws_init;
 	count = 0;
@@ -474,6 +483,7 @@ static void auto_tune(struct db_main *db, long double kernel_run_ms)
 	if (tune_gws) {
 		create_clobj_kpc(pcount);
 		set_kernel_args_kpc();
+		clear_keys();
 		for (i = 0; i < pcount; i++)
 			set_key(key, i);
 		gettimeofday(&startc, NULL);
@@ -548,7 +558,7 @@ static void auto_tune(struct db_main *db, long double kernel_run_ms)
 	/* Auto tune finish.*/
 
 	if (global_work_size % local_work_size) {
-		global_work_size = GET_MULTIPLE_OR_BIGGER(global_work_size, local_work_size);
+		global_work_size = GET_NEXT_MULTIPLE(global_work_size, local_work_size);
 		get_power_of_two(global_work_size);
 		release_clobj_kpc();
 		if (global_work_size > gws_limit)
@@ -565,16 +575,12 @@ static void auto_tune(struct db_main *db, long double kernel_run_ms)
 
 	clear_keys();
 
-	assert(!(local_work_size & (local_work_size -1)));
-	assert(!(global_work_size % local_work_size));
-	assert(local_work_size <= lws_limit);
-	assert(global_work_size <= gws_limit);
-
 	self->params.max_keys_per_crypt = global_work_size;
-	if (options.verbosity > VERB_LEGACY)
-		fprintf(stdout, "%s GWS: "Zu", LWS: "Zu"\n",
-		        db ? "Cracking" : "Self test",
-		        global_work_size, local_work_size);
+
+	if ((!self_test_running && options.verbosity >= VERB_DEFAULT) ||
+	    ocl_always_show_ws)
+		fprintf(stderr, "LWS="Zu" GWS="Zu"%s", local_work_size,
+		        global_work_size, benchmark_running ? " " : "\n");
 #undef calc_ms
 }
 
@@ -593,10 +599,10 @@ static void reset(struct db_main *db)
 		create_clobj();
 		set_kernel_args();
 
-		auto_tune(db, 300);
+		auto_tune(db, 100);
 	}
 	else {
-		int tune_time = (options.flags & FLG_MASK_CHK) ? 300 : 50;
+		int tune_time = (options.flags & FLG_MASK_CHK) ? 100 : 50;
 
 		ocl_hc_128_prepare_table_test();
 
@@ -627,7 +633,7 @@ struct fmt_main FMT_STRUCT = {
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_CASE | FMT_8_BIT | FMT_REMOVE,
+		FMT_CASE | FMT_8_BIT | FMT_REMOVE | FMT_MASK,
 		{ NULL },
 		{ FORMAT_TAG },
 		tests

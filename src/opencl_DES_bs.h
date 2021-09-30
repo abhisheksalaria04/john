@@ -9,14 +9,12 @@
 #ifndef _JOHN_DES_BS_H
 #define _JOHN_DES_BS_H
 
-#include "arch.h"
-#include "common-opencl.h"
-#include "opencl_DES_hst_dev_shared.h"
-#include "loader.h"
+#include <fcntl.h>
 
-#if (!AC_BUILT || HAVE_FCNTL_H)
-#include <fcntl.h>		// For file locks.
-#endif
+#include "arch.h"
+#include "opencl_common.h"
+#include "../run/opencl/opencl_DES_hst_dev_shared.h"
+#include "loader.h"
 
 #define DES_BS_OPENCL_ALGORITHM_NAME	"DES OpenCL"
 
@@ -62,7 +60,7 @@ extern int restore_lws_config(const char *, int, size_t *, size_t, unsigned int 
 
 typedef unsigned WORD vtype;
 
-unsigned int CC_CACHE_ALIGN opencl_DES_bs_index768[0x300];
+extern unsigned int CC_CACHE_ALIGN opencl_DES_bs_index768[0x300];
 
 struct fmt_main;
 

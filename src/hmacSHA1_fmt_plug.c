@@ -7,29 +7,24 @@
  */
 
 #if FMT_EXTERNS_H
-extern struct fmt_main fmt_hmacSHA1;
+extern struct fmt_main fmt__hmacSHA1;
 #elif FMT_REGISTERS_H
-john_register_one(&fmt_hmacSHA1);
+john_register_one(&fmt__hmacSHA1);
 #else
 
 #include <string.h>
 
-#include "arch.h"
-
 #ifdef _OPENMP
 #include <omp.h>
-#ifndef OMP_SCALE
-#define OMP_SCALE 2048 // tuned for i7 using SSE2 and w/o HT
-#endif
 #endif
 
+#include "arch.h"
 #include "misc.h"
 #include "common.h"
 #include "formats.h"
 #include "sha.h"
 #include "johnswap.h"
 #include "simd-intrinsics.h"
-#include "memdbg.h"
 
 #define FORMAT_LABEL            "HMAC-SHA1"
 #define FORMAT_NAME             ""
@@ -41,13 +36,13 @@ john_register_one(&fmt_hmacSHA1);
 #define ALGORITHM_NAME          "password is key, SHA1 " SHA1_ALGORITHM_NAME
 
 #define BENCHMARK_COMMENT       ""
-#define BENCHMARK_LENGTH        0
+#define BENCHMARK_LENGTH        7
 
 #define PLAINTEXT_LENGTH        125
 
 #define PAD_SIZE                64
 #define BINARY_SIZE             20
-#define BINARY_ALIGN            sizeof(ARCH_WORD_32)
+#define BINARY_ALIGN            sizeof(uint32_t)
 #define SALT_LENGTH             PAD_SIZE
 #define SALT_ALIGN              MEM_ALIGN_NONE
 #define CIPHERTEXT_LENGTH       (2 * SALT_LENGTH + 2 * BINARY_SIZE)
@@ -56,12 +51,20 @@ john_register_one(&fmt_hmacSHA1);
 
 #ifdef SIMD_COEF_32
 #define MIN_KEYS_PER_CRYPT      SHA1_N
-#define MAX_KEYS_PER_CRYPT      SHA1_N
+#define MAX_KEYS_PER_CRYPT      (SHA1_N * 1024)
+#if ARCH_LITTLE_ENDIAN==1
 #define GETPOS(i, index)        ((index & (SIMD_COEF_32 - 1)) * 4 + ((i) & (0xffffffff - 3)) * SIMD_COEF_32 + (3 - ((i) & 3)) + (unsigned int)index/SIMD_COEF_32 * SHA_BUF_SIZ * 4 * SIMD_COEF_32)
+#else
+#define GETPOS(i, index)        ((index & (SIMD_COEF_32 - 1)) * 4 + ((i) & (0xffffffff - 3)) * SIMD_COEF_32 + ((i) & 3) + (unsigned int)index/SIMD_COEF_32 * SHA_BUF_SIZ * 4 * SIMD_COEF_32)
+#endif
 
 #else
 #define MIN_KEYS_PER_CRYPT      1
-#define MAX_KEYS_PER_CRYPT      1
+#define MAX_KEYS_PER_CRYPT      512
+#endif
+
+#ifndef OMP_SCALE
+#define OMP_SCALE 4 // tuned w/ MKPC for core i7
 #endif
 
 static struct fmt_tests tests[] = {
@@ -85,7 +88,7 @@ static int bufsize;
 #else
 static unsigned char cur_salt[SALT_LENGTH];
 
-static ARCH_WORD_32 (*crypt_key)[BINARY_SIZE / sizeof(ARCH_WORD_32)];
+static uint32_t (*crypt_key)[BINARY_SIZE / sizeof(uint32_t)];
 static unsigned char (*ipad)[PAD_SIZE];
 static unsigned char (*opad)[PAD_SIZE];
 static SHA_CTX *ipad_ctx;
@@ -109,13 +112,9 @@ static void init(struct fmt_main *self)
 #ifdef SIMD_COEF_32
 	unsigned int i;
 #endif
-#ifdef _OPENMP
-	int omp_t = omp_get_num_threads();
 
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
+	omp_autotune(self, OMP_SCALE);
+
 #ifdef SIMD_COEF_32
 	bufsize = sizeof(*opad) * self->params.max_keys_per_crypt * SHA_BUF_SIZ * 4;
 	crypt_key = mem_calloc_align(1, bufsize, MEM_ALIGN_SIMD);
@@ -170,9 +169,9 @@ static int valid(char *ciphertext, struct fmt_main *self)
 	if (!p || p > &ciphertext[strlen(ciphertext) - 1]) return 0;
 	i = (int)(p - ciphertext);
 #if SIMD_COEF_32
-	if(i > 55) return 0;
+	if (i > 55) return 0;
 #else
-	if(i > SALT_LENGTH) return 0;
+	if (i > SALT_LENGTH) return 0;
 #endif
 	pos = i + 1;
 	if (strlen(ciphertext+pos) != BINARY_SIZE * 2) return 0;
@@ -190,7 +189,8 @@ static char *split(char *ciphertext, int index, struct fmt_main *self)
 {
 	static char out[CIPHERTEXT_LENGTH + 1];
 
-	if (strstr(ciphertext, "$SOURCE_HASH$"))
+	if (strnlen(ciphertext, LINE_BUFFER_SIZE) < LINE_BUFFER_SIZE &&
+	    strstr(ciphertext, "$SOURCE_HASH$"))
 		return ciphertext;
 
 	strnzcpy(out, ciphertext, CIPHERTEXT_LENGTH + 1);
@@ -208,9 +208,14 @@ static void set_key(char *key, int index)
 {
 	int len;
 #ifdef SIMD_COEF_32
-	ARCH_WORD_32 *ipadp = (ARCH_WORD_32*)&ipad[GETPOS(3, index)];
-	ARCH_WORD_32 *opadp = (ARCH_WORD_32*)&opad[GETPOS(3, index)];
-	const ARCH_WORD_32 *keyp = (ARCH_WORD_32*)key;
+#if ARCH_LITTLE_ENDIAN==1
+	uint32_t *ipadp = (uint32_t*)&ipad[GETPOS(3, index)];
+	uint32_t *opadp = (uint32_t*)&opad[GETPOS(3, index)];
+#else
+	uint32_t *ipadp = (uint32_t*)&ipad[GETPOS(0, index)];
+	uint32_t *opadp = (uint32_t*)&opad[GETPOS(0, index)];
+#endif
+	const uint32_t *keyp = (uint32_t*)key;
 	unsigned int temp;
 
 	len = strlen(key);
@@ -227,21 +232,36 @@ static void set_key(char *key, int index)
 		SHA1_Final(k0, &ctx);
 
 		keyp = (unsigned int*)k0;
-		for(i = 0; i < BINARY_SIZE / 4; i++, ipadp += SIMD_COEF_32, opadp += SIMD_COEF_32)
+		for (i = 0; i < BINARY_SIZE / 4; i++, ipadp += SIMD_COEF_32, opadp += SIMD_COEF_32)
 		{
+#if ARCH_LITTLE_ENDIAN==1
 			temp = JOHNSWAP(*keyp++);
+#else
+			temp = *keyp++;
+#endif
 			*ipadp ^= temp;
 			*opadp ^= temp;
 		}
 	}
 	else
+#if ARCH_LITTLE_ENDIAN==1
 	while(((temp = JOHNSWAP(*keyp++)) & 0xff000000)) {
+#else
+	while(((temp = *keyp++) & 0xff000000)) {
+#endif
 		if (!(temp & 0x00ff0000) || !(temp & 0x0000ff00))
 		{
+#if ARCH_LITTLE_ENDIAN==1
 			((unsigned short*)ipadp)[1] ^=
 				(unsigned short)(temp >> 16);
 			((unsigned short*)opadp)[1] ^=
 				(unsigned short)(temp >> 16);
+#else
+			((unsigned short*)ipadp)[0] ^=
+				(unsigned short)(temp >> 16);
+			((unsigned short*)opadp)[0] ^=
+				(unsigned short)(temp >> 16);
+#endif
 			break;
 		}
 		*ipadp ^= temp;
@@ -271,14 +291,14 @@ static void set_key(char *key, int index)
 
 		len = BINARY_SIZE;
 
-		for(i = 0; i < len; i++)
+		for (i = 0; i < len; i++)
 		{
 			ipad[index][i] ^= k0[i];
 			opad[index][i] ^= k0[i];
 		}
 	}
 	else
-	for(i = 0; i < len; i++)
+	for (i = 0; i < len; i++)
 	{
 		ipad[index][i] ^= key[i];
 		opad[index][i] ^= key[i];
@@ -295,23 +315,22 @@ static char *get_key(int index)
 static int cmp_all(void *binary, int count)
 {
 #ifdef SIMD_COEF_32
-	unsigned int x, y = 0;
+	unsigned int x, y;
 
-	for(; y < (unsigned int)(count + SIMD_COEF_32 - 1) / SIMD_COEF_32; y++)
-		for(x = 0; x < SIMD_COEF_32; x++)
-		{
+	for (y = 0; y < (unsigned int)(count + SIMD_COEF_32 - 1) / SIMD_COEF_32; y++) {
+		for (x = 0; x < SIMD_COEF_32; x++) {
 			// NOTE crypt_key is in input format (4 * SHA_BUF_SIZ * SIMD_COEF_32)
-			if(((ARCH_WORD_32*)binary)[0] == ((ARCH_WORD_32*)crypt_key)[x + y * SIMD_COEF_32 * SHA_BUF_SIZ])
+			if (((uint32_t*)binary)[0] == ((uint32_t*)crypt_key)[x + y * SIMD_COEF_32 * SHA_BUF_SIZ])
 				return 1;
 		}
+	}
+
 	return 0;
 #else
-	int index = 0;
+	int index;
 
-#if defined(_OPENMP) || (MAX_KEYS_PER_CRYPT > 1)
 	for (index = 0; index < count; index++)
-#endif
-		if (((ARCH_WORD_32*)binary)[0] == crypt_key[index][0])
+		if (((uint32_t*)binary)[0] == crypt_key[index][0])
 			return 1;
 	return 0;
 #endif
@@ -321,9 +340,10 @@ static int cmp_one(void *binary, int index)
 {
 #ifdef SIMD_COEF_32
 	int i;
-	for(i = 0; i < (BINARY_SIZE/4); i++)
+
+	for (i = 0; i < (BINARY_SIZE/4); i++)
 		// NOTE crypt_key is in input format (4 * SHA_BUF_SIZ * SIMD_COEF_32)
-		if (((ARCH_WORD_32*)binary)[i] != ((ARCH_WORD_32*)crypt_key)[i * SIMD_COEF_32 + (index&(SIMD_COEF_32-1)) + (unsigned int)index/SIMD_COEF_32 * SHA_BUF_SIZ * SIMD_COEF_32])
+		if (((uint32_t*)binary)[i] != ((uint32_t*)crypt_key)[i * SIMD_COEF_32 + (index&(SIMD_COEF_32-1)) + (unsigned int)index/SIMD_COEF_32 * SHA_BUF_SIZ * SIMD_COEF_32])
 			return 0;
 	return 1;
 #else
@@ -333,19 +353,18 @@ static int cmp_one(void *binary, int index)
 
 static int cmp_exact(char *source, int index)
 {
-	return (1);
+	return 1;
 }
 
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
 	const int count = *pcount;
-	int index = 0;
+	int index;
 
 #if _OPENMP
 #pragma omp parallel for
-	for (index = 0; index < count; index += MAX_KEYS_PER_CRYPT)
 #endif
-	{
+	for (index = 0; index < count; index += MIN_KEYS_PER_CRYPT) {
 #ifdef SIMD_COEF_32
 		if (new_keys) {
 			SIMDSHA1body(&ipad[index * SHA_BUF_SIZ * 4],
@@ -383,6 +402,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 #endif
 	}
 	new_keys = 0;
+
 	return count;
 }
 
@@ -390,7 +410,7 @@ static void *get_binary(char *ciphertext)
 {
 	static union {
 		unsigned char c[BINARY_SIZE];
-		ARCH_WORD_32 dummy;
+		uint32_t dummy;
 	} buf;
 	unsigned char *out = buf.c;
 	char *p;
@@ -404,7 +424,7 @@ static void *get_binary(char *ciphertext)
 		p += 2;
 	}
 
-#ifdef SIMD_COEF_32
+#if defined(SIMD_COEF_32) && ARCH_LITTLE_ENDIAN==1
 	alter_endianity(out, BINARY_SIZE);
 #endif
 	return (void*)out;
@@ -441,7 +461,7 @@ static void *get_salt(char *ciphertext)
 #endif
 }
 
-struct fmt_main fmt_hmacSHA1 = {
+struct fmt_main fmt__hmacSHA1 = {
 	{
 		FORMAT_LABEL,
 		FORMAT_NAME,
@@ -456,8 +476,7 @@ struct fmt_main fmt_hmacSHA1 = {
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_CASE | FMT_8_BIT | FMT_OMP | FMT_OMP_BAD |
-		FMT_SPLIT_UNIFIES_CASE,
+		FMT_CASE | FMT_8_BIT | FMT_OMP | FMT_OMP_BAD | FMT_SPLIT_UNIFIES_CASE | FMT_HUGE_INPUT,
 		{ NULL },
 		{ NULL },
 		tests
@@ -473,7 +492,7 @@ struct fmt_main fmt_hmacSHA1 = {
 		{ NULL },
 		fmt_default_source,
 		{
-			fmt_default_binary_hash /* Not usable with $SOURCE_HASH$ */
+			fmt_default_binary_hash
 		},
 		fmt_default_salt_hash,
 		NULL,
@@ -487,7 +506,7 @@ struct fmt_main fmt_hmacSHA1 = {
 #endif
 		crypt_all,
 		{
-			fmt_default_get_hash /* Not usable with $SOURCE_HASH$ */
+			fmt_default_get_hash
 		},
 		cmp_all,
 		cmp_one,

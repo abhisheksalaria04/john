@@ -2,11 +2,10 @@
  * April of 2011 by Dhiru Kholia <dhiru.kholia at gmail.com> for GSoC.
  * magnum added -p mode support, using code based on libclamav
  * and OMP, AES-NI and OpenCL support.
- * jimf added dyna_salt support, Oct 2014.
  *
  * This software is Copyright (c) 2011, Dhiru Kholia <dhiru.kholia at gmail.com>
- * and Copyright (c) 2012, magnum and it is hereby released to the general public
- * under the following terms:
+ * and Copyright (c) 2012-2020, magnum
+ * and it is hereby released to the general public under the following terms:
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted.
  *
@@ -41,6 +40,13 @@
  *
  */
 
+#if AC_BUILT
+#include "autoconfig.h"
+#endif
+#include "arch.h"
+
+#if ARCH_ALLOWS_UNALIGNED || __ARM_FEATURE_UNALIGNED
+
 #if FMT_EXTERNS_H
 extern struct fmt_main fmt_rar;
 #elif FMT_REGISTERS_H
@@ -48,28 +54,12 @@ john_register_one(&fmt_rar);
 #else
 
 #include <string.h>
-#include <errno.h>
-#if AC_BUILT
-#include "autoconfig.h"
-#endif
-#if _MSC_VER || __MINGW32__ || __MINGW64__ || __CYGWIN__ || HAVE_WINDOWS_H
-#include "win32_memmap.h"
-#if !defined(__CYGWIN__) && !defined(__MINGW64__)
-#include "mmap-windows.c"
-#elif defined HAVE_MMAP
-#include <sys/mman.h>
-#endif
-#elif defined(HAVE_MMAP)
-#include <sys/mman.h>
-#endif
 
-#include "arch.h"
 #include "sha.h"
 #include "crc32.h"
 #include "misc.h"
 #include "common.h"
 #include "formats.h"
-#include "dyna_salt.h"
 #include "memory.h"
 #include "params.h"
 #include "options.h"
@@ -82,23 +72,24 @@ john_register_one(&fmt_rar);
 #define FORMAT_LABEL		"rar"
 #define FORMAT_NAME		"RAR3"
 
-#ifdef DEBUG
-#define BENCHMARK_COMMENT	" (1-16 characters)"
-#else
-#define BENCHMARK_COMMENT	" (4 characters)"
-#endif
-#define BENCHMARK_LENGTH	-1
+/*
+ * This format's speed is *highly* dependant on pw length (longer = slower)
+ *
+ * cRARk use 4-char passwords for CPU benchmark, but we use 5.
+ */
+#define BENCHMARK_COMMENT	" (length 5)"
+#define BENCHMARK_LENGTH	0x105
 
 #define UNICODE_LENGTH		(2 * PLAINTEXT_LENGTH)
-#define BINARY_SIZE		0
-#define BINARY_ALIGN		MEM_ALIGN_NONE
-#define SALT_SIZE		sizeof(rarfile*)
-#define SALT_ALIGN		sizeof(rarfile*)
 
 #ifdef SIMD_COEF_32
 #include "simd-intrinsics.h"
 #define NBKEYS (SIMD_COEF_32*SIMD_PARA_SHA1)
+#if ARCH_LITTLE_ENDIAN==1
 #define GETPOS(i,idx) ( (idx&(SIMD_COEF_32-1))*4 + ((i)&(0xffffffff-3))*SIMD_COEF_32 + (3-((i)&3)) + (unsigned int)idx/SIMD_COEF_32*SHA_BUF_SIZ*4*SIMD_COEF_32 )
+#else
+#define GETPOS(i,idx) ( (idx&(SIMD_COEF_32-1))*4 + ((i)&(0xffffffff-3))*SIMD_COEF_32 + ((i)&3) + (unsigned int)idx/SIMD_COEF_32*SHA_BUF_SIZ*4*SIMD_COEF_32 )
+#endif
 #define HASH_IDX(idx) (((unsigned int)idx&(SIMD_COEF_32-1))+(unsigned int)idx/SIMD_COEF_32*5*SIMD_COEF_32)
 
 #define ALGORITHM_NAME		"SHA1 " SHA1_ALGORITHM_NAME " AES"
@@ -107,7 +98,8 @@ john_register_one(&fmt_rar);
 #define MAX_KEYS_PER_CRYPT  NBKEYS
 #else
 #define ALGORITHM_NAME		"SHA1 AES 32/" ARCH_BITS_STR
-#define PLAINTEXT_LENGTH	125
+/* NOTE for implementing support for lengths past 28 (56 bytes of UTF-16), see issue #4296 */
+#define PLAINTEXT_LENGTH	28 //125
 #define MIN_KEYS_PER_CRYPT	1
 #define MAX_KEYS_PER_CRYPT	1
 #endif
@@ -123,7 +115,6 @@ john_register_one(&fmt_rar);
 #endif
 
 #include "rar_common.c"
-#include "memdbg.h"
 
 // these are supposed to be stack arrays; however gcc cannot correctly align
 // stack arrays so we have to use global arrays; we may switch back to stack
@@ -138,9 +129,9 @@ static uint32_t (*tmp_out)[NBKEYS*5];
 static void init(struct fmt_main *self)
 {
 #if defined (_OPENMP)
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	self->params.max_keys_per_crypt *= omp_t;
+	threads = omp_get_max_threads();
+	self->params.min_keys_per_crypt *= threads;
+	self->params.max_keys_per_crypt *= threads;
 #endif /* _OPENMP */
 
 	// Length is a cost. We sort in buckets but we need them to be mostly full
@@ -149,7 +140,7 @@ static void init(struct fmt_main *self)
 	if (options.target_enc == UTF_8)
 		self->params.plaintext_length = MIN(125, 3 * PLAINTEXT_LENGTH);
 
-	unpack_data = mem_calloc(omp_t, sizeof(unpack_data_t));
+	unpack_data = mem_calloc(threads, sizeof(unpack_data_t));
 	cracked = mem_calloc(self->params.max_keys_per_crypt,
 	                     sizeof(*cracked));
 	// allocate 1 more slot to handle the tail of vector buffer
@@ -232,15 +223,14 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 		unsigned int i, j, k;
 		uint8_t (*RawPsw)[NBKEYS*64] = vec_in[index/NBKEYS];
 		uint32_t *digest = vec_out[index/NBKEYS];
-
 		// all passwords in one batch has the same length
 		int pw_len = saved_len[indices[index]];
 		int RawLength = pw_len + 8 + 3;
 		int cur_len = 0;
 		int fst_blk = 1;
 		int cur_buf = 0;
-
 		unsigned char tmp1 = 0, tmp2 = 0;
+
 		for (i = 0; i < ROUNDS; ++i) {
 			// copy passwords to vector buffer
 			for (j = 0; j < NBKEYS; ++j) {
@@ -277,7 +267,11 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 					for (k = RawLength; k < 64; ++k)
 						tempin[GETPOS(k, j)] = 0;
 					tempin[GETPOS(RawLength, j)] = 0x80;
+#if ARCH_LITTLE_ENDIAN==1
 					tail = (uint32_t*)&tempin[GETPOS(64 - 1, j)];
+#else
+					tail = (uint32_t*)&tempin[GETPOS(64 - 1 - 3, j)];
+#endif
 					*tail = cur_len*8;
 				}
 				if (i == 0)
@@ -307,7 +301,12 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 		for (j = 0; j < NBKEYS; ++j) {
 			uint32_t *tail;
 			RawPsw[0][GETPOS(0, j)] = 0x80;
-			tail = (uint32_t*)&RawPsw[0][GETPOS(64 - 1, j)];
+#if ARCH_LITTLE_ENDIAN==1
+			tail =  (uint32_t*)&RawPsw[0][GETPOS(64 - 1, j)];
+#else
+			tail =  (uint32_t*)&RawPsw[0][GETPOS(64 - 1 - 3, j)];
+#endif
+
 			*tail = cur_len*8;
 		}
 		SIMDSHA1body(RawPsw[0], digest, digest, SSEi_MIXED_IN | SSEi_RELOAD);
@@ -316,7 +315,11 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 			for (i = 0; i < 4; ++i) {
 				int idx = indices[index + j];
 				uint32_t *dst = (uint32_t*)&aes_key[idx*16];
+#if ARCH_LITTLE_ENDIAN==1
 				dst[i] = digest[HASH_IDX(j) + i*SIMD_COEF_32];
+#else
+				dst[i] = JOHNSWAP(digest[HASH_IDX(j) + i*SIMD_COEF_32]);
+#endif
 			}
 		}
 	}
@@ -363,8 +366,32 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 	}
 #endif
 
-	check_rar(count);
 	return count;
+}
+
+inline static void check_all_rar(rar_file *cur_file, int count)
+{
+	unsigned int index;
+
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+	for (index = 0; index < count; index++)
+		check_rar(cur_file, index, &aes_key[index * 16], &aes_iv[index * 16]);
+}
+
+static int cmp_all(void *binary, int count)
+{
+	fmt_data *blob = binary;
+	rar_file *cur_file = blob->blob;
+	int index;
+
+	check_all_rar(cur_file, count);
+
+	for (index = 0; index < count; index++)
+		if (cracked[index])
+			return 1;
+	return 0;
 }
 
 struct fmt_main fmt_rar = {
@@ -382,7 +409,7 @@ struct fmt_main fmt_rar = {
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_CASE | FMT_8_BIT | FMT_UNICODE | FMT_UTF8 | FMT_OMP | FMT_DYNA_SALT,
+		FMT_CASE | FMT_8_BIT | FMT_UNICODE | FMT_ENC | FMT_OMP | FMT_BLOB | FMT_HUGE_INPUT,
 		{ NULL },
 		{ FORMAT_TAG },
 		cpu_tests
@@ -393,14 +420,14 @@ struct fmt_main fmt_rar = {
 		fmt_default_prepare,
 		valid,
 		fmt_default_split,
-		fmt_default_binary,
+		get_binary,
 		get_salt,
 		{ NULL },
 		fmt_default_source,
 		{
 			fmt_default_binary_hash
 		},
-		fmt_default_dyna_salt_hash,
+		salt_hash,
 		NULL,
 		set_salt,
 		set_key,
@@ -415,5 +442,15 @@ struct fmt_main fmt_rar = {
 		cmp_exact
 	}
 };
-
 #endif /* plugin stanza */
+
+#else
+#if !defined(FMT_EXTERNS_H) && !defined(FMT_REGISTERS_H)
+#ifdef __GNUC__
+#warning ": target system requires aligned memory access, rar format disabled:"
+#elif _MSC_VER
+#pragma message(": target system requires aligned memory access, rar format disabled:")
+#endif
+#endif
+
+#endif	/* ARCH_ALLOWS_UNALIGNED || __ARM_FEATURE_UNALIGNED */

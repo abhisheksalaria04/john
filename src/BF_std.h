@@ -15,6 +15,8 @@
 #ifndef _JOHN_BF_STD_H
 #define _JOHN_BF_STD_H
 
+#include <stdint.h>
+
 #include "arch.h"
 #include "common.h"
 #include "formats.h"
@@ -30,7 +32,7 @@
 
 #if defined(_OPENMP) && !BF_ASM
 #define BF_cpt				3
-#define BF_mt				256
+#define BF_mt				1024
 #define BF_N				(BF_Nmin * BF_mt)
 #else
 #define BF_mt				1

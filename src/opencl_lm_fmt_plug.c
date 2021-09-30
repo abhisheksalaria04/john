@@ -20,15 +20,14 @@ john_register_one(&fmt_opencl_lm);
 #include "common.h"
 #include "formats.h"
 #include "config.h"
-#include "opencl_lm_hst_dev_shared.h"
-#include "memdbg.h"
+#include "../run/opencl/opencl_lm_hst_dev_shared.h"
 
 #define FORMAT_NAME			""
 #define FORMAT_TAG           "$LM$"
 #define FORMAT_TAG_LEN       (sizeof(FORMAT_TAG)-1)
 
 #define BENCHMARK_COMMENT		""
-#define BENCHMARK_LENGTH		-1
+#define BENCHMARK_LENGTH		0x107
 
 #define CIPHERTEXT_LENGTH		32
 
@@ -66,7 +65,7 @@ static void init(struct fmt_main *pFmt)
 
 static char *prepare(char *fields[10], struct fmt_main *self)
 {
-	if (fields[2] && strlen(fields[2]) == 32)
+	if (fields[1][0] != '$' && fields[2] && strlen(fields[2]) == 32)
 		return fields[2];
 	return fields[1];
 }
@@ -104,13 +103,11 @@ static char *split(char *ciphertext, int index, struct fmt_main *self)
 		ciphertext += FORMAT_TAG_LEN;
 
 	if (index)
-		memcpy(&out[FORMAT_TAG_LEN], &ciphertext[16], 16);
+		memcpylwr(&out[FORMAT_TAG_LEN], &ciphertext[16], 16);
 	else
-		memcpy(&out[FORMAT_TAG_LEN], ciphertext, 16);
+		memcpylwr(&out[FORMAT_TAG_LEN], ciphertext, 16);
 
 	out[20] = 0;
-
-	strlwr(&out[FORMAT_TAG_LEN]);
 
 	return out;
 }
@@ -188,7 +185,7 @@ struct fmt_main fmt_opencl_lm = {
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_8_BIT | FMT_BS | FMT_TRUNC | FMT_SPLIT_UNIFIES_CASE | FMT_REMOVE,
+		FMT_8_BIT | FMT_BS | FMT_TRUNC | FMT_SPLIT_UNIFIES_CASE | FMT_REMOVE | FMT_MASK,
 		{ NULL },
 		{ FORMAT_TAG },
 		tests

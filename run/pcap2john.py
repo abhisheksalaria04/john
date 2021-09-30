@@ -1,32 +1,41 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-# combine of all of Dhiru Kholia pcap convert utilities
+# Combine of all of Dhiru Kholia pcap convert utilities
 # into a single program.  The pcap2john.readme lists
 # all of the original license statements. This merge was
 # done by JimF, Nov 2014, somewhat as a learning experience
-# for python.
+# for Python.
+#
 # The code itself is still a fabrication of Dhiru.
 
-import dpkt
-import sys
-import dpkt.ethernet as ethernet
-import dpkt.stp as stp
-import struct
-import socket
 
+import base64
+from binascii import hexlify
 import os
+import socket
+import struct
+import sys
+import time
+
 import logging
 l = logging.getLogger("scapy.runtime")
 l.setLevel(49)
-from binascii import hexlify
-try:
-    from scapy.all import TCP, IP, UDP, rdpcap
-except ImportError:
-    sys.stderr.write("Please install scapy, http://www.secdev.org/projects/scapy/\n")
-    sys.exit(-1)
 
-# VTP_DOMAIN_SIZE = 32
+try:
+    from scapy.all import *
+except ImportError:
+    sys.stderr.write("Please install 'scapy' package for Python, running 'pip install --user scapy' should work\n")
+    sys.exit(1)
+
+try:
+    import dpkt
+    import dpkt.ethernet as ethernet
+    from dpkt import ip as dip
+    import dpkt.stp as stp
+except ImportError:
+    sys.stderr.write("Please install 'dpkt' package for Python, running 'pip install --user dpkt' should work\n")
+    sys.exit(1)
 
 
 def pcap_parser_bfd(fname):
@@ -61,12 +70,12 @@ def pcap_parser_bfd(fname):
                 h = data[-16:].encode("hex")  # MD5 hash
                 # password needs to be padded to length 16 (password + ''.join(['\x00' * (16 - len(password))])),
                 # "netmd5" format automagically handles this ;)
-                sys.stdout.write("$netmd5$%s$%s\n" % (salt, h))
+                print("$netmd5$%s$%s" % (salt, h))
             elif authentication_type == 4 or authentication_type == 5:  # Keyed SHA1, Meticulous Keyed SHA1
                 # http://tools.ietf.org/html/rfc5880
                 # password needs to be padded to length 20 (password + ''.join(['\x00' * (20 - len(password))])),
                 h = data[-20:].encode("hex")  # SHA1 hash
-                sys.stdout.write("$netsha1$%s$%s\n" % (salt, h))
+                print("$netsha1$%s$%s" % (salt, h))
             else:
                 assert 0
 
@@ -162,7 +171,7 @@ def pcap_parser_vtp(fname):
             vlans_data_length = len(vlans_data)
 
             if vlans_data_length != -1:
-                sys.stdout.write("%s:$vtp$%d$%s$%s$%s$%s$%s\n" % (index, ord(salt[0]), vlans_data_length,
+                print("%s:$vtp$%d$%s$%s$%s$%s$%s" % (index, ord(salt[0]), vlans_data_length,
                                                                   vlans_data.encode("hex"), len(salt),
                                                                   salt.encode("hex"), h))
 
@@ -171,42 +180,24 @@ def pcap_parser_vtp(fname):
 
 def pcap_parser_vrrp(fname):
 
-    f = open(fname, "rb")
-    pcap = dpkt.pcap.Reader(f)
-    index = 0
+    pcap = rdpcap(fname)
 
-    for _, buf in pcap:
-        index = index + 1
-        eth = dpkt.ethernet.Ethernet(buf)
-        if eth.type == dpkt.ethernet.ETH_TYPE_IP or eth.type == dpkt.ethernet.ETH_TYPE_IP6:
-            ip = eth.data
-
-            if eth.type == dpkt.ethernet.ETH_TYPE_IP and ip.p != dpkt.ip.IP_PROTO_VRRP:
+    for index, pkt in enumerate(pcap, start=1):
+        if pkt.haslayer(VRRP):
+            pkt = pkt['VRRP']
+            # check for Version 2, Packet type 1 (Advertisement)
+            if pkt.version != 2 or pkt.type != 1:
+                sys.stderr.write("Unsupported VRRP packet version %d or type %d, packet # %d\n" % (pkt.version, pkt.type, index))
                 continue
-            if eth.type == dpkt.ethernet.ETH_TYPE_IP6 and ip.nxt != dpkt.ip.IP_PROTO_VRRP:
-                continue
-
-            data = ip.data  # VRRP object
-            data = data.pack()  # raw data
-
-            if ord(data[0]) != 0x21:  # Version 2, Packet type 1 (Advertisement)
-                sys.stderr.write("Unsupported VRRP packet type %d, packet # %d\n" % (ord(data[0]), index))
-                continue
-
-            if len(data) < 40:  # rough estimate ;)
-                continue
-
-            # hash is at the end of the packet
-            h = data[len(data) - 16:].encode("hex")
-
-            # salt extends from offset 0 to 20
-            # zero-ize checksum (of length 2) at offset 6
-            salt = data[0:6] + "\x00\x00" + data[8:20]
-
-            # use the existing "hsrp" format to crack VRRP hashes ;)
-            sys.stdout.write("%s:$hsrp$%s$%s\n" % (index, salt.encode("hex"), h))
-
-    f.close()
+            # check for packets that are actually authenticated
+            if pkt.authtype != 0:
+                # hash is at the end of the packet
+                h = bytes(pkt['Raw'])[-16:]
+                # zero-ize checksum (of length 2)
+                pkt.chksum = 0
+                # salt extends from offset 0 to 20
+                salt = bytes(pkt)
+                print("%s:$hsrp$%s$%s" % (index, hexlify(salt).decode('ascii'), hexlify(h).decode('ascii')))
 
 
 def pcap_parser_tcpmd5(fname):
@@ -279,7 +270,7 @@ def pcap_parser_tcpmd5(fname):
                 salt = salt + raw_tcp_data[header_length:header_length + data_length]
                 # print len(salt)
 
-                sys.stdout.write("$tcpmd5$%s$%s\n" % (salt.encode("hex"),
+                print("$tcpmd5$%s$%s" % (salt.encode("hex"),
                                                       opt_data.encode("hex")))
 
     f.close()
@@ -321,7 +312,7 @@ def pcap_parser_s7(cfg_pcap_file):
     outcome = 0  # XXX we don't know this currently!
     for c, r in result.items():
         found_something = True  # overkill ;(
-        sys.stdout.write("%s:$siemens-s7$%s$%s$%s\n" % (os.path.basename(cfg_pcap_file),
+        print("%s:$siemens-s7$%s$%s$%s" % (os.path.basename(cfg_pcap_file),
                                                         outcome, c, r))
 
     # s7-1200_brute_offline.py stuff below
@@ -384,7 +375,7 @@ def pcap_parser_s7(cfg_pcap_file):
         return
     if raw_challenge[46:52] == '100214' and raw_challenge[92:94] == '00':
         challenge = raw_challenge[52:92]
-        # sys.stdout.write("found challenge: %s\n" % challenge)
+        # print("found challenge: %s" % challenge)
     else:
         sys.stderr.write("[-] cannot find challenge for %s. exiting...\n"
                          % os.path.basename(cfg_pcap_file))
@@ -393,7 +384,7 @@ def pcap_parser_s7(cfg_pcap_file):
     raw_response = hexlify(r[pckt_141].load)
     if raw_response[64:70] == '100214' and raw_response[110:112] == '00':
         response = raw_response[70:110]
-        # sys.stdout.write("found  response: %s\n" % response)
+        # print("found  response: %s" % response)
     else:
         sys.stderr.write("[-] cannot find response for %s. exiting...\n"
                          % os.path.basename(cfg_pcap_file))
@@ -403,7 +394,7 @@ def pcap_parser_s7(cfg_pcap_file):
         outcome = 1
     else:
         outcome = 0
-    sys.stdout.write("%s:$siemens-s7$%s$%s$%s\n" % (os.path.basename(cfg_pcap_file),
+    print("%s:$siemens-s7$%s$%s$%s" % (os.path.basename(cfg_pcap_file),
                                                     outcome, challenge, response))
 
 
@@ -448,7 +439,7 @@ def pcap_parser_rsvp(fname):
 
             # zero-out the hash during hash calculation
             salt = data.replace(h, "\x00" * len(h))
-            sys.stdout.write("%s:$rsvp$%d$%s$%s\n" % (index, algo_type, salt.encode("hex"), h.encode("hex")))
+            print("%s:$rsvp$%d$%s$%s" % (index, algo_type, salt.encode("hex"), h.encode("hex")))
 
     f.close()
 
@@ -491,19 +482,19 @@ def pcap_parser_ntp(fname):
             h = data
 
             if length == 16:  # md5($p.$s)
-                sys.stdout.write("%s:$dynamic_2001$%s$HEX$%s\n" % (index, h.encode("hex"), salt.encode("hex")))
+                print("%s:$dynamic_2001$%s$HEX$%s" % (index, h.encode("hex"), salt.encode("hex")))
             elif length == 20:  # sha1($p.$s)
-                sys.stdout.write("%s:$dynamic_24$%s$HEX$%s\n" % (index, h.encode("hex"), salt.encode("hex")))
+                print("%s:$dynamic_24$%s$HEX$%s" % (index, h.encode("hex"), salt.encode("hex")))
             elif length == 28:  # sha224($p.$s)
-                sys.stdout.write("%s:$dynamic_52$%s$HEX$%s\n" % (index, h.encode("hex"), salt.encode("hex")))
+                print("%s:$dynamic_52$%s$HEX$%s" % (index, h.encode("hex"), salt.encode("hex")))
             elif length == 32:  # sha256($p.$s)
-                sys.stdout.write("%s:$dynamic_62$%s$HEX$%s\n" % (index, h.encode("hex"), salt.encode("hex")))
+                print("%s:$dynamic_62$%s$HEX$%s" % (index, h.encode("hex"), salt.encode("hex")))
             elif length == 48:
-                sys.stdout.write("%s:$dynamic_72$%s$HEX$%s\n" % (index, h.encode("hex"), salt.encode("hex")))
+                print("%s:$dynamic_72$%s$HEX$%s" % (index, h.encode("hex"), salt.encode("hex")))
             elif length == 64:
-                sys.stdout.write("%s:$dynamic_82$%s$HEX$%s\n" % (index, h.encode("hex"), salt.encode("hex")))
+                print("%s:$dynamic_82$%s$HEX$%s" % (index, h.encode("hex"), salt.encode("hex")))
             else:
-                print "Unsupported hash of length %s found!" % len(data)
+                print("Unsupported hash of length %s found!" % len(data))
 
     f.close()
 
@@ -525,43 +516,69 @@ def pcap_parser_isis(fname):
         try:
             llc = LLC(data)
             data = llc.data
-            classification = llc.classification
             if isinstance(data, dpkt.cdp.CDP) or isinstance(data, dpkt.stp.STP):
                 continue
         except:
             continue
 
-        if not classification:
-            continue
-
+        data = data[3:]  # dirty hack to skip over LLC stuff
         discriminator = ord(data[0])
         if discriminator != 0x83:  # IS-IS
             continue
 
-        isis_data = data[8:]  # double check this!
-        offset = 19  # TLVs start after this
-        has_hash = False
+        # Check PDU type (HELLO, LSP, CSNP), LSP needs additional treatment
+        pdu_type = ord(data[4])
+        if pdu_type == 18 or pdu_type == 20:  # LSP PDU, L1 and L2
+            # zeroize the "lifetime" and "checksum" fields
+            data = data[:10] + "\x00\x00" + data[12:24] + "\x00\x00" + data[26:]
 
-        # process TLVs
-        while True:
+        isis_data = data[8:]  # double check this!
+
+        # find authentication TLV using brute-force
+        for offset in range(0, len(isis_data) - 3):
             tlv_type = ord(isis_data[offset])
             tlv_length = ord(isis_data[offset+1])
-            if tlv_length == 0:  # dirty
-                break
-            if tlv_type == 0x0a:  # authentication TLV
-                authentication_type = ord(isis_data[offset+2])
-                if tlv_length == 17 and authentication_type == 0x36:  # hmac-md5 is being used
-                    has_hash = True
-                    h = isis_data[offset+3:offset+3+16]
+            authentication_type = ord(isis_data[offset+2])
+
+            if tlv_type == 0x0a and tlv_length == 17 and authentication_type == 0x36:  # hmac-md5 is being used
+                    hash_length = 16
+                    h = isis_data[offset+3:offset+3+hash_length]
+                    # http://tools.ietf.org/html/rfc1195
+                    salt = data.replace(h, "\x00" * hash_length)  # zero out the hash
+                    print("%s:$rsvp$1$%s$%s" % (index, salt.encode("hex"), h.encode("hex")))
                     break
-            offset = offset + tlv_length
-
-        if not has_hash:
-            continue
-
-        # http://tools.ietf.org/html/rfc1195
-        salt = data.replace(h, "\x00" * 16)  # zero out the hash
-        sys.stdout.write("%s:$rsvp$1$%s$%s\n" % (index, salt.encode("hex"), h.encode("hex")))
+            # https://tools.ietf.org/html/rfc5310
+            if tlv_type == 0x0a and tlv_length == 23 and authentication_type == 0x3:  # hmac-sha1
+                    hash_length = 20
+                    h = isis_data[offset+3+2:offset+3+2+hash_length]  # +2 is required to skip over "Key ID"
+                    # ospf format supports such hashes!
+                    salt = data.replace(h, "")  # remove the hash
+                    print("%s:$ospf$1$%s$%s" % (index, salt.encode("hex"), h.encode("hex")))
+                    break
+            if tlv_type == 0x0a and tlv_length == 31 and authentication_type == 0x3:  # hmac-sha224
+                    hash_length = 28
+                    h = isis_data[offset+3+2:offset+3+2+hash_length]
+                    salt = data.replace(h, "")  # remove the hash
+                    print("%s:$ospf$5$%s$%s" % (index, salt.encode("hex"), h.encode("hex")))  # yes, 5 is out-of-order
+                    break
+            if tlv_type == 0x0a and tlv_length == 35 and authentication_type == 0x3:  # hmac-sha256
+                    hash_length = 32
+                    h = isis_data[offset+3+2:offset+3+2+hash_length]
+                    salt = data.replace(h, "")  # remove the hash
+                    print("%s:$ospf$2$%s$%s" % (index, salt.encode("hex"), h.encode("hex")))
+                    break
+            if tlv_type == 0x0a and tlv_length == 51 and authentication_type == 0x3:  # hmac-sha384
+                    hash_length = 48
+                    h = isis_data[offset+3+2:offset+3+2+hash_length]
+                    salt = data.replace(h, "")  # remove the hash
+                    print("%s:$ospf$3$%s$%s" % (index, salt.encode("hex"), h.encode("hex")))
+                    break
+            if tlv_type == 0x0a and tlv_length == 67 and authentication_type == 0x3:  # hmac-sha512
+                    hash_length = 64
+                    h = isis_data[offset+3+2:offset+3+2+hash_length]
+                    salt = data.replace(h, "")  # remove the hash
+                    print("%s:$ospf$4$%s$%s" % (index, salt.encode("hex"), h.encode("hex")))
+                    break
 
     f.close()
 
@@ -642,7 +659,7 @@ def pcap_parser_hsrp(fname):
             h = hsrp[-16:].encode("hex")  # MD5 hash
             # 20 bytes (HSRP) + 14 (till "keyid") + zero padding (double-check this) to make 50 bytes!
             salt = hsrp.encode("hex")[:68] + ("\x00" * (50 - 20 - 14)).encode("hex")
-            sys.stdout.write("$hsrp$%s$%s\n" % (salt, h))
+            print("$hsrp$%s$%s" % (salt, h))
 
     f.close()
 
@@ -690,7 +707,7 @@ def pcap_parser_hsrp_v2(fname):
                     break
 
             if uses_authentication:
-                sys.stdout.write("%d:$hsrp$%s$%s\n" % (index, salt.encode("hex"), h.encode("hex")))
+                print("%d:$hsrp$%s$%s" % (index, salt.encode("hex"), h.encode("hex")))
 
     f.close()
 
@@ -774,7 +791,167 @@ def pcap_parser_glbp(fname):
                 except:
                     break
 
-            sys.stdout.write("%s:$hsrp$%s$%s\n" % (index, salt.encode("hex"), h))
+            print("%s:$hsrp$%s$%s" % (index, salt.encode("hex"), h))
+
+    f.close()
+
+
+# Parts are borrowed from "module_tacacs_plus.py" from the loki project which is
+# Copyright 2015 Daniel Mende <dmende@ernw.de>. See the licensing blurb before
+# "pcap_parser_wlccp" function.
+#
+#  1 2 3 4 5 6 7 8  1 2 3 4 5 6 7 8  1 2 3 4 5 6 7 8  1 2 3 4 5 6 7 8
+#
+# +----------------+----------------+----------------+----------------+
+# |major  | minor  |                |                |                |
+# |version| version|      type      |     seq_no     |   flags        |
+# +----------------+----------------+----------------+----------------+
+# |                                                                   |
+# |                            session_id                             |
+# +----------------+----------------+----------------+----------------+
+# |                                                                   |
+# |                              length                               |
+# +----------------+----------------+----------------+----------------+
+
+def pcap_parser_tacacs_plus(fname):
+    TACACS_PLUS_PORT = 49
+    TACACS_PLUS_VERSION_MAJOR = 0xc
+    TYPE_AUTHEN = 0x01
+    FLAGS_UNENCRYPTED = 0x01
+
+    f = open(fname, "rb")
+    pcap = dpkt.pcap.Reader(f)
+    index = 0
+
+    for _, buf in pcap:
+        index = index + 1
+        eth = dpkt.ethernet.Ethernet(buf)
+        if eth.type == dpkt.ethernet.ETH_TYPE_IP or eth.type == dpkt.ethernet.ETH_TYPE_IP6:
+            ip = eth.data
+
+            if eth.type == dpkt.ethernet.ETH_TYPE_IP and ip.p != dpkt.ip.IP_PROTO_TCP:
+                continue
+            if eth.type == dpkt.ethernet.ETH_TYPE_IP6 and ip.nxt != dpkt.ip.IP_PROTO_TCP:
+                continue
+
+            tcp = ip.data
+            data = tcp.data
+
+            if tcp.dport != TACACS_PLUS_PORT and tcp.sport != TACACS_PLUS_PORT:
+                continue
+            if len(tcp.data) <= 12:
+                continue
+
+            server = tcp.sport == TACACS_PLUS_PORT
+            ver, kind, seq_no, flags, session_id, length = struct.unpack("!BBBBII", data[:12])
+            if flags & FLAGS_UNENCRYPTED:
+                continue
+            version_minor = ver & 0x0F
+            if not server or kind != TYPE_AUTHEN:
+                continue
+            ciphertext = data[12:]
+            predata = struct.pack("!I", session_id)
+            postdata = struct.pack("!BB", TACACS_PLUS_VERSION_MAJOR << 4 + version_minor, seq_no)
+            print("%s:$tacacs-plus$0$%s$%s$%s" % (index,
+                                                               predata.encode("hex"),
+                                                               ciphertext.encode("hex"),
+                                                               postdata.encode("hex")))
+    f.close()
+
+# This code is borrowed from "module_wlccp.py" from the loki project which is
+# Copyright 2015 Daniel Mende <dmende@ernw.de>.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted.
+
+
+def pcap_parser_wlccp(fname):
+    f = open(fname, "rb")
+    pcap = dpkt.pcap.Reader(f)
+    index = 0
+
+    comms = {}  # "state machine", bugs introduced by me!
+
+    for _, buf in pcap:
+        index = index + 1
+        eth = dpkt.ethernet.Ethernet(buf)
+        if eth.type == dpkt.ethernet.ETH_TYPE_IP or eth.type == dpkt.ethernet.ETH_TYPE_IP6:
+            ip = eth.data
+            if eth.type == dpkt.ethernet.ETH_TYPE_IP and ip.p != dpkt.ip.IP_PROTO_UDP:
+                continue
+            if eth.type == dpkt.ethernet.ETH_TYPE_IP6 and ip.nxt != dpkt.ip.IP_PROTO_UDP:
+                continue
+
+            udp = ip.data
+            data = udp.data
+
+            if udp.dport != 2887 and udp.sport != 2887:
+                continue
+            if len(udp.data) <= 28 + 12 + 6 + 4 + 16:  # rough check
+                continue
+
+            # WLCCP header parse
+            (version, sap, dst_type, length, msg_type, hopcount, iden, flags, orig_node_type) = struct.unpack("!BBHHBBHHH", data[:14])
+            orig_node_mac = data[14:20]
+            dst_node_type = struct.unpack("!H", data[20:22])
+            dst_node_mac = data[22:28]
+            data = data[28:]
+
+            if msg_type & 0x3f == 0x0b:  # EAP AUTH
+                # EAP header parse
+                requestor_type = struct.unpack("!H", data[:2])
+                requestor_mac = data[2:8]
+                (aaa_msg_type, aaa_auth_type, aaa_key_mgmt_type, status_code) = struct.unpack("!BBBB", data[8:12])
+                data = data[12:]
+                host = requestor_mac.encode("hex")
+                if host in comms:
+                    leap = comms[host]
+                elif not host == "000000000000":
+                    comms[host] = (None, None, None, None)
+
+                (eapol_version, eapol_type, eapol_len) = struct.unpack("!BBH", data[2:6])
+                data = data[6:]
+                # check EAP-TYPE
+                if eapol_type == 0x00:
+                    (eap_code, eap_id, eap_len) = struct.unpack("!BBH", data[:4])
+                    data = data[4:]
+                    # check EAP-CODE
+                    if eap_code == 0x01:
+                        (leap_type, leap_version, leap_reserved, leap_count) = struct.unpack("!BBBB", data[:4])
+                        data = data[4:]
+                        # EAP-REQUEST, check the leap hdr
+                        if leap_type == 0x11 and leap_version == 0x01 and leap_reserved == 0x00 and leap_count == 0x08:
+                            (leap_auth_chall, leap_auth_resp, leap_supp_chall, leap_supp_resp) = leap
+                            if not leap_auth_chall and not leap_auth_resp and not leap_supp_chall and not leap_supp_resp:
+                                iden = eap_id
+                                chall = data[:8]
+                                user = data[8:16]
+                                print("[DEBUG] WLCCP: EAP-AUTH challenge from authenticator seen for %s" % host)
+                                comms[host] = ((iden, chall, user), leap_auth_resp, leap_supp_chall, leap_supp_resp)
+                            elif leap_auth_chall and leap_auth_resp and not leap_supp_chall and not leap_supp_resp:
+                                chall = data[:8]
+                                print("[DEBUG] WLCCP: EAP-AUTH challenge from supplicant seen for %s" % host)
+                                comms[host] = (leap_auth_chall, leap_auth_resp, chall, leap_supp_resp)
+                    elif eap_code == 0x02:
+                            (leap_type, leap_version, leap_reserved, leap_count) = struct.unpack("!BBBB", data[:4])
+                            data = data[4:]
+                            # EAP-RESPONSE, check the leap hdr
+                            if leap_type == 0x11 and leap_version == 0x01 and leap_reserved == 0x00 and leap_count == 0x18:
+                                (leap_auth_chall, leap_auth_resp, leap_supp_chall, leap_supp_resp) = leap
+                                if leap_auth_chall and not leap_auth_resp and not leap_supp_chall and not leap_supp_resp:
+                                    resp = data[:24]
+                                    print("[DEBUG] WLCCP: EAP-AUTH response from authenticator seen for %s" % host)
+                                    comms[host] = (leap_auth_chall, resp, leap_supp_chall, leap_supp_resp)
+                                elif leap_auth_chall and leap_auth_resp and leap_supp_chall and not leap_supp_resp:
+                                    resp = data[:24]
+                                    print("[DEBUG] WLCCP: EAP-AUTH response from supplicant seen for %s" % host)
+                                    comms[host] = (leap_auth_chall, leap_auth_resp, leap_supp_chall, resp)
+
+    for entry in comms:
+        (leap_auth_chall, leap_auth_resp, leap_supp_chall, leap_supp_resp) = comms[entry]
+        if leap_auth_chall:
+            _, challenge, user = leap_auth_chall
+            print("%s:$NETNTLM$%s$%s" % (user, challenge.encode("hex"), leap_auth_resp.encode("hex")))
 
     f.close()
 
@@ -790,7 +967,19 @@ def process_hash(uid, nonce, sha1):
     if len(nonce) == 0:
         return
     uid = int(endian(uid[::-1]), 16)
-    print "%s:$dynamic_24$%s$HEX$%s" % (uid, sha1, nonce)
+    print("%s:$dynamic_24$%s$HEX$%s" % (uid, sha1, nonce))
+
+
+def handle_gg_login105(payload, nonce):
+    """
+    GG_LOGIN105 stores uid as hex encoded ASCII. 16th byte is the number of digits in uid.
+    uid begins at 17th byte. sha1 hash is separated from last digit of uid by two bytes.
+    """
+    digits = int(payload[30:32], 16)
+    uid = payload[32:32 + 2*digits].decode("hex")
+    offset = 32 + 2*digits + 4
+    sha1 = payload[offset:offset + 40]
+    print("%s:$dynamic_24$%s$HEX$%s" % (uid, sha1, nonce))
 
 
 def pcap_parser_gadu(pcapfile):
@@ -807,12 +996,14 @@ def pcap_parser_gadu(pcapfile):
             payload = str(pkt[TCP].payload).encode('hex')
             if payload[:8] == '01000000':  # GG_WELCOME
                 nonce = payload[16:]
-            if payload[:8] == '31000000':  # GG_LOGIN
+            if payload[:8] == '31000000':  # GG_LOGIN80
                 hashtype = payload[28:30]
                 if hashtype == "02":
                     uid = payload[16:24]
                     sha1 = payload[30:70]
                     process_hash(uid, nonce, sha1)
+            if payload[:8] == '83000000':  # GG_LOGIN105
+                handle_gg_login105(payload, nonce)
 
 
 def pcap_parser_eigrp(fname):
@@ -929,7 +1120,7 @@ def pcap_parser_eigrp(fname):
                 salt = data[0:2] + "\x00\x00\x00\x00" + data[6:]  # zero-ize checksum
                 salt = salt.replace(h.decode("hex"), "\x00" * hash_length)  # zero-ize the digest
 
-            sys.stdout.write("%s:$eigrp$%d$%s$%d$%s$1$%s$%s\n" % (index, algo_type, salt.encode("hex"), have_extra_salt,
+            print("%s:$eigrp$%d$%s$%d$%s$1$%s$%s" % (index, algo_type, salt.encode("hex"), have_extra_salt,
                                                                   extra_salt, destination, h))
 
     f.close()
@@ -974,10 +1165,211 @@ def pcap_parser_tgsrep(fname):
                     unfinished[(p[IP].src, p[IP].dst, p[TCP].dport)] = (ticketdata, size)
                 else:
                     # OH NO! Oversized!
-                    print 'Too much data received! Source: %s Dest: %s DPort %i' % (p[IP].src, p[IP].dst, p[TCP].dport)
+                    print('Too much data received! Source: %s Dest: %s DPort %i' % (p[IP].src, p[IP].dst, p[TCP].dport))
 
     for p in kploads:
-        sys.stdout.write("%s:$tgsrep$%s\n" % (index, p.encode("hex")))
+        print("%s:$tgsrep$%s" % (index, p.encode("hex")))
+
+
+def pcap_parser_ah(fname):
+    """
+    Extract Authentication Header (AH) hashes from packets.
+
+    VRRP v2 only supports IPv4 addresses. VRRP v3 protocol does not support
+    authentication. Use "Keepalived for Linux" for debugging this function.
+
+    https://fossies.org/linux/scapy/scapy/layers/ipsec.py mentions various HMAC
+    schemes which are possible in the Authentication Header (AH).
+    """
+
+    pcap = rdpcap(fname)
+
+    for pkt in pcap:
+        if pkt.haslayer(AH) and pkt.haslayer(IP):
+            pkt = pkt['IP']
+            # zero mutable fields
+            pkt.tos = 0
+            pkt.flags = 0
+            pkt.chksum = 0
+            # store icv; zero icv in original packet
+            icv = pkt['AH'].icv
+            pkt['AH'].icv = bytearray(len(icv))
+            # print net-ah hash
+            print("$net-ah$0$%s$%s" % (hexlify(bytes(pkt)).decode('ascii'), hexlify(icv).decode('ascii')))
+
+
+def pcap_parser_rndc(fname):
+    """
+    Extract BIND RNDC hashes from .pcap files.
+
+    Based on rndc.py.in from bind-9.11.2.tar.gz tarball.
+    """
+
+    f = open(fname, "rb")
+    pcap = dpkt.pcap.Reader(f)
+    index = 0
+
+    for _, buf in pcap:
+        index = index + 1
+        eth = dpkt.ethernet.Ethernet(buf)
+        if eth.type == dpkt.ethernet.ETH_TYPE_IP or eth.type == dpkt.ethernet.ETH_TYPE_IP6:
+            ip = eth.data
+
+            if eth.type == dpkt.ethernet.ETH_TYPE_IP and ip.p != dpkt.ip.IP_PROTO_TCP:
+                continue
+            if eth.type == dpkt.ethernet.ETH_TYPE_IP6 and ip.nxt != dpkt.ip.IP_PROTO_TCP:
+                continue
+
+            tcp = ip.data
+            data = tcp.data
+
+            if tcp.dport != 953 and tcp.sport != 953:  # is this RNDC traffic?
+                continue
+
+            if len(data) < 48:
+                continue
+
+            # sanity check the payload
+            offset = data.find("hmd5")
+            kind = 1
+            if offset == -1:
+                offset = data.find("hsha")
+                kind = 2
+            if offset == -1:
+                continue
+
+            if kind == 1:
+                hash_offset = offset + len("hmd5") + 5
+                h = data[hash_offset:hash_offset + 22]
+                if len(h) % 4:
+                    h += '=' * (4 - len(h) % 4)
+                h = base64.decodestring(h)
+                data_offset = hash_offset + 22
+                salt = data[data_offset:]
+            elif kind == 2:
+                hash_type_offset = offset + len("hmd5") + 5
+                hash_type = ord(data[hash_type_offset:hash_type_offset + 1])
+                hash_offset = offset + len("hsha") + 6
+                h = data[hash_offset:hash_offset + 88]
+                if len(h) % 4:
+                    h += '=' * (4 - len(h) % 4)
+                h = base64.decodestring(h)
+                data_offset = hash_offset + 88
+                salt = data[data_offset:]
+                if hash_type == 161:  # SHA-1
+                    kind = 2
+                elif hash_type == 162:  # SHA-224
+                    kind = 3
+                elif hash_type == 163:  # SHA-256
+                    kind = 4
+                elif hash_type == 164:  # SHA-384
+                    kind = 5
+                elif hash_type == 165:  # SHA-512
+                    kind = 6
+
+            print("%s:$rsvp$%s$%s$%s" % (index, kind, salt.encode("hex"), h.encode("hex")))
+
+
+    f.close()
+
+
+def pcap_parser_tsig(fname):
+    """
+    Extract BIND TSIG hashes from .pcap files.
+    """
+    import dns
+    import dns.message
+    import dns.tsigkeyring
+
+    mapping = {}
+
+    keyring = dns.tsigkeyring.from_text({
+        'update-key' : 'MTIzNDU2Nzg='
+    })
+
+    f = open(fname, "rb")
+    pcap = dpkt.pcap.Reader(f)
+    index = 0
+
+    for _, buf in pcap:
+        index = index + 1
+        eth = dpkt.ethernet.Ethernet(buf)
+        if eth.type == dpkt.ethernet.ETH_TYPE_IP or eth.type == dpkt.ethernet.ETH_TYPE_IP6:
+            ip = eth.data
+            if eth.type == dpkt.ethernet.ETH_TYPE_IP and ip.p != dpkt.ip.IP_PROTO_UDP:
+                continue
+            if eth.type == dpkt.ethernet.ETH_TYPE_IP6 and ip.nxt != dpkt.ip.IP_PROTO_UDP:
+                continue
+
+            udp = ip.data
+            data = udp.data
+
+            if udp.dport != 53 and udp.sport != 53:  # is this DNS traffic?
+                continue
+
+            is_response = True
+            if udp.dport == 53:
+                is_response = False
+
+            if len(data) < 48:
+                continue
+
+            p = dns.message.from_wire(data, keyring=keyring, pout=False)
+            if not is_response and hasattr(p, "mac"):
+                mapping[p.id] = p.mac
+            if is_response and hasattr(p, "mac"):
+                request_mac = mapping.get(p.id, None)
+                if request_mac:
+                    p = dns.message.from_wire(data, keyring=keyring, request_mac=request_mac, pout=True)
+            else:
+                p = dns.message.from_wire(data, keyring=keyring, pout=True)
+
+    f.close()
+
+
+# http://dpkt.readthedocs.io/en/latest/print_http_requests.html
+def pcap_parser_htdigest(fname):
+    f = open(fname, "rb")
+    pcap = dpkt.pcap.Reader(f)
+
+    # For each packet in the pcap process the contents
+    for timestamp, buf in pcap:
+        # Unpack the Ethernet frame (mac src/dst, ethertype)
+        try:
+           eth = dpkt.ethernet.Ethernet(buf)
+        except:
+            continue
+
+        # Make sure the Ethernet data contains an IP packet
+        if eth.type == dpkt.ethernet.ETH_TYPE_IP or eth.type == dpkt.ethernet.ETH_TYPE_IP6:
+            # Now grab the data within the Ethernet frame (the IP packet)
+            ip = eth.data
+
+            # Check for TCP in the transport layer
+            if isinstance(ip.data, dpkt.tcp.TCP):
+
+                # Set the TCP data
+                tcp = ip.data
+
+                # Now see if we can parse the contents as a HTTP request
+                try:
+                    request = dpkt.http.Request(tcp.data)
+                except (dpkt.dpkt.NeedData, dpkt.dpkt.UnpackError):
+                    continue
+
+                if "authorization" in request.headers:
+                    value = request.headers["authorization"]
+                    if "qop" in value and "response" in value:
+                        import urllib2
+                        items = urllib2.parse_http_list(value)
+                        opts = urllib2.parse_keqv_list(items)
+                        user = opts['Digest username']
+                        print("%s:$response$%s$%s$%s$%s$%s$%s$%s$%s$%s" %
+                                (user, opts["response"], user, opts["realm"],
+                                    request.method, opts["uri"], opts["nonce"],
+                                    opts["nc"], opts["cnonce"], opts["qop"]))
+
+    f.close()
 
 
 ############################################################
@@ -987,28 +1379,83 @@ def pcap_parser_tgsrep(fname):
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         sys.stderr.write("Usage: %s [.pcap files]\n" % sys.argv[0])
-        sys.exit(-1)
+        sys.exit(1)
+
+    # advertise what is not handled
+    sys.stderr.write("Note: This program does not have the functionality of wpapcap2john, SIPdump, eapmd5tojohn, and vncpcap2john programs which are included with JtR Jumbo.\n\n")
+    time.sleep(1)
 
     for i in range(1, len(sys.argv)):
-        pcap_parser_bfd(sys.argv[i])
+        try:
+            pcap_parser_ah(sys.argv[i])
+        except:
+            pass
+        try:
+            pcap_parser_bfd(sys.argv[i])
+        except:
+            pass
         try:
             pcap_parser_vtp(sys.argv[i])
         except:
             # sys.stderr.write("vtp could not handle input\n")
             pass
-        pcap_parser_vrrp(sys.argv[i])
-        pcap_parser_tcpmd5(sys.argv[i])
+        try:
+            pcap_parser_vrrp(sys.argv[i])
+        except:
+            pass
+        try:
+            pcap_parser_tcpmd5(sys.argv[i])
+        except:
+            pass
+        try:
+            pcap_parser_rsvp(sys.argv[i])
+        except:
+            pass
+        try:
+            pcap_parser_ntp(sys.argv[i])
+        except:
+            pass
+        try:
+            pcap_parser_isis(sys.argv[i])
+        except:
+            pass
+        try:
+            pcap_parser_hsrp(sys.argv[i])
+        except:
+            pass
+        try:
+            pcap_parser_hsrp_v2(sys.argv[i])
+        except:
+            pass
+        try:
+            pcap_parser_glbp(sys.argv[i])
+        except:
+            pass
+        pcap_parser_gadu(sys.argv[i])
+        try:
+            pcap_parser_eigrp(sys.argv[i])
+        except:
+            pass
+        pcap_parser_tgsrep(sys.argv[i])
+        try:
+            pcap_parser_tacacs_plus(sys.argv[i])
+        except:
+            pass
+        try:
+            pcap_parser_wlccp(sys.argv[i])
+        except:
+            pass
+        try:
+            pcap_parser_rndc(sys.argv[i])
+        except:
+            pass
+        try:
+            pcap_parser_tsig(sys.argv[i])
+        except:
+            pass
+        pcap_parser_htdigest(sys.argv[i])
         try:
             pcap_parser_s7(sys.argv[i])
         except:
-            # sys.stderr.write("s7 could not handle input\n")
+            # sys.stderr.write("DEBUG: s7 parser could not handle input\n")
             pass
-        pcap_parser_rsvp(sys.argv[i])
-        pcap_parser_ntp(sys.argv[i])
-        pcap_parser_isis(sys.argv[i])
-        pcap_parser_hsrp(sys.argv[i])
-        pcap_parser_hsrp_v2(sys.argv[i])
-        pcap_parser_glbp(sys.argv[i])
-        pcap_parser_gadu(sys.argv[i])
-        pcap_parser_eigrp(sys.argv[i])
-        pcap_parser_tgsrep(sys.argv[i])

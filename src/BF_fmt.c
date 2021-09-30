@@ -19,13 +19,12 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
-#include "memdbg.h"
 
 #define FORMAT_LABEL			"bcrypt"
 #define FORMAT_NAME			""
 
 #define BENCHMARK_COMMENT		" (\"$2a$05\", 32 iterations)"
-#define BENCHMARK_LENGTH		-1
+#define BENCHMARK_LENGTH		0x107
 
 #define PLAINTEXT_LENGTH		72
 //#define CIPHERTEXT_LENGTH		60 // in BF_commmon.h
@@ -117,7 +116,7 @@ static void set_key(char *key, int index)
 {
 	BF_std_set_key(key, index, sign_extension_bug);
 
-	strnzcpy(saved_key[index], key, PLAINTEXT_LENGTH + 1);
+	strnzcpy(saved_key[index], key, sizeof(*saved_key));
 }
 
 static char *get_key(int index)
@@ -210,7 +209,7 @@ struct fmt_main fmt_BF = {
 		fmt_default_reset,
 		fmt_default_prepare,
 		BF_common_valid,
-		fmt_default_split,
+		BF_common_split,
 		BF_common_get_binary,
 		BF_common_get_salt,
 		{

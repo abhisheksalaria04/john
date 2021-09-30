@@ -1,4 +1,5 @@
-/* HAVAL cracker patch for JtR. Hacked together during April of 2013 by Dhiru
+/*
+ * HAVAL cracker patch for JtR. Hacked together during April of 2013 by Dhiru
  * Kholia <dhiru at openwall.com>.
  *
  * This software is Copyright (c) 2013 Dhiru Kholia <dhiru at openwall.com> and
@@ -17,6 +18,16 @@ john_register_one(&fmt_haval_128_4);
 #else
 
 #include <string.h>
+
+#include "arch.h"
+#if !FAST_FORMATS_OMP
+#undef _OPENMP
+#endif
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif // _OPENMP
+
 #include "arch.h"
 #include "sph_haval.h"
 #include "misc.h"
@@ -25,38 +36,11 @@ john_register_one(&fmt_haval_128_4);
 #include "params.h"
 #include "options.h"
 
-#if !FAST_FORMATS_OMP
-#undef _OPENMP
-#endif
-
-#ifdef _OPENMP
-static int omp_t = 1;
-#include <omp.h>
-// Tuned on core i7 quad HT
-//       256-3  128-4
-//   1   227k   228k
-//  64  6359k  5489k
-// 128  7953k  6654k
-// 256  8923k  7618k
-// 512  9804k  8223k
-// 1k  10307k  8569k  ** set to this value
-// 2k  10081k  8427k
-// 4k  10551k  8893k
-#ifndef OMP_SCALE
-#ifdef __MIC__
-#define OMP_SCALE  64
-#else
-#define OMP_SCALE  1024
-#endif // __MIC__
-#endif // OMP_SCALE
-#endif // _OPENMP
-#include "memdbg.h"
-
 #define FORMAT_TAG		"$haval$"
 #define TAG_LENGTH		(sizeof(FORMAT_TAG)-1)
 #define ALGORITHM_NAME		"32/" ARCH_BITS_STR
 #define BENCHMARK_COMMENT	""
-#define BENCHMARK_LENGTH	-1
+#define BENCHMARK_LENGTH	0x107
 #define PLAINTEXT_LENGTH	125
 #define BINARY_SIZE256		32
 #define BINARY_SIZE128		16
@@ -64,7 +48,15 @@ static int omp_t = 1;
 #define BINARY_ALIGN		4
 #define SALT_ALIGN		1
 #define MIN_KEYS_PER_CRYPT	1
-#define MAX_KEYS_PER_CRYPT	1
+#define MAX_KEYS_PER_CRYPT	64
+
+#ifndef OMP_SCALE
+#ifdef __MIC__
+#define OMP_SCALE  4
+#else
+#define OMP_SCALE  16
+#endif // __MIC__
+#endif // OMP_SCALE
 
 static struct fmt_tests haval_256_3_tests[] = {
 	{"91850C6487C9829E791FC5B58E98E372F3063256BB7D313A93F1F83B426AEDCC", "HAVAL"},
@@ -93,16 +85,12 @@ static struct fmt_tests haval_128_4_tests[] = {
 };
 
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
-static ARCH_WORD_32 (*crypt_out)[BINARY_SIZE256 / sizeof(ARCH_WORD_32)];
+static uint32_t (*crypt_out)[BINARY_SIZE256 / sizeof(uint32_t)];
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
+	omp_autotune(self, OMP_SCALE);
+
 	if (!saved_key) {
 		saved_key = mem_calloc(self->params.max_keys_per_crypt,
 		                       sizeof(*saved_key));
@@ -125,25 +113,29 @@ static int valid(char *ciphertext, struct fmt_main *self, int len)
 
 	if (!strncmp(p, FORMAT_TAG, TAG_LENGTH))
 		p += TAG_LENGTH;
-	if (strlen(p) != len)
+
+	if (strnlen(p, len + 1) != len)
 		return 0;
 
 	while(*p)
-		if(atoi16[ARCH_INDEX(*p++)]==0x7f)
+		if (atoi16[ARCH_INDEX(*p++)] == 0x7f)
 			return 0;
 	return 1;
 }
 
-/* we need independent valids, since the $haval$ signature is the same */
-/* otherwise, if we have input with a mix of both types, then ALL of them */
-/* will validate, even though  only the ones of the proper type will actually */
-/* be tested.  If we had a singleton crypt function (which both 128-4 and */
-/* 256-3 used, then a single valid would also work. But since each have */
-/* their own crypt, and they are NOT compatible, then we need separate valids */
+/*
+ * We need independent valids, since the $haval$ signature is the same.
+ * Otherwise, if we have input with a mix of both types, then ALL of them
+ * will validate, even though only the ones of the proper type will actually be
+ * tested. If we had a singleton crypt function (which both 128-4 and
+ * 256-3 used, then a single valid would also work. But since each have
+ * their own crypt, and they are NOT compatible, then we need separate valids.
+ */
 static int valid3(char *ciphertext, struct fmt_main *self)
 {
 	return valid(ciphertext, self, 64);
 }
+
 static int valid4(char *ciphertext, struct fmt_main *self)
 {
 	return valid(ciphertext, self, 32);
@@ -197,58 +189,52 @@ static void *get_binary_128(char *ciphertext)
 	return out;
 }
 
-static int get_hash_0(int index) { return crypt_out[index][0] & PH_MASK_0; }
-static int get_hash_1(int index) { return crypt_out[index][0] & PH_MASK_1; }
-static int get_hash_2(int index) { return crypt_out[index][0] & PH_MASK_2; }
-static int get_hash_3(int index) { return crypt_out[index][0] & PH_MASK_3; }
-static int get_hash_4(int index) { return crypt_out[index][0] & PH_MASK_4; }
-static int get_hash_5(int index) { return crypt_out[index][0] & PH_MASK_5; }
-static int get_hash_6(int index) { return crypt_out[index][0] & PH_MASK_6; }
+#define COMMON_GET_HASH_VAR crypt_out
+#include "common-get-hash.h"
 
 static int crypt_256_3(int *pcount, struct db_salt *salt)
 {
 	int count = *pcount;
-	int index = 0;
+	int index;
 
 #ifdef _OPENMP
 #pragma omp parallel for
-	for (index = 0; index < count; index++)
 #endif
-	{
+	for (index = 0; index < count; index++) {
 		sph_haval256_3_context ctx;
 
 		sph_haval256_3_init(&ctx);
 		sph_haval256_3(&ctx, saved_key[index], strlen(saved_key[index]));
 		sph_haval256_3_close(&ctx, (unsigned char*)crypt_out[index]);
 	}
+
 	return count;
 }
 
 static int crypt_128_4(int *pcount, struct db_salt *salt)
 {
 	int count = *pcount;
-	int index = 0;
+	int index;
 
 #ifdef _OPENMP
 #pragma omp parallel for
-	for (index = 0; index < count; index++)
 #endif
-	{
+	for (index = 0; index < count; index++) {
 		sph_haval128_4_context ctx;
 
 		sph_haval128_4_init(&ctx);
 		sph_haval128_4(&ctx, saved_key[index], strlen(saved_key[index]));
 		sph_haval128_4_close(&ctx, (unsigned char*)crypt_out[index]);
 	}
+
 	return count;
 }
 
 static int cmp_all(void *binary, int count)
 {
-	int index = 0;
-#ifdef _OPENMP
-	for (; index < count; index++)
-#endif
+	int index;
+
+	for (index = 0; index < count; index++)
 		if (!memcmp(binary, crypt_out[index], ARCH_SIZE))
 			return 1;
 	return 0;
@@ -271,11 +257,7 @@ static int cmp_exact(char *source, int index)
 
 static void haval_set_key(char *key, int index)
 {
-	int saved_len = strlen(key);
-	if (saved_len > PLAINTEXT_LENGTH)
-		saved_len = PLAINTEXT_LENGTH;
-	memcpy(saved_key[index], key, saved_len);
-	saved_key[index][saved_len] = 0;
+	strnzcpy(saved_key[index], key, sizeof(*saved_key));
 }
 
 static char *get_key(int index)
@@ -347,13 +329,8 @@ struct fmt_main fmt_haval_256_3 = {
 		fmt_default_clear_keys,
 		crypt_256_3,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one256,
@@ -412,13 +389,8 @@ struct fmt_main fmt_haval_128_4 = {
 		fmt_default_clear_keys,
 		crypt_128_4,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one128,

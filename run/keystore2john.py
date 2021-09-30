@@ -171,17 +171,17 @@ def process_file(filename):
     assert(len(md) == 20)
 
     sys.stdout.write("%s:$keystore$0$%d$%s" % (os.path.basename(filename), pos,
-                                               hexlify(data[0:pos])))
+                                               hexlify(data[0:pos]).decode('utf-8')))
 
-    sys.stdout.write("$%s" % hexlify(md))
-    sys.stdout.write("$%d$%d$%s" % (count, keysize, hexlify(protectedPrivKey)))
+    sys.stdout.write("$%s" % hexlify(md).decode('utf-8'))
+    sys.stdout.write("$%d$%d$%s" % (count, keysize, hexlify(protectedPrivKey).decode('utf-8')))
     sys.stdout.write(":::::%s\n" % filename)
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         sys.stderr.write("Usage: %s <.keystore / .jks file(s)>\n" % sys.argv[0])
-        sys.exit(-1)
+        sys.exit(1)
 
     for i in range(1, len(sys.argv)):
         process_file(sys.argv[i])

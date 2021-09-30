@@ -13,6 +13,7 @@ import struct
 from binascii import hexlify
 import base64
 
+PY3 = sys.version_info[0] == 3
 
 """
 LUKS header, derived from LUKS on disk format specification
@@ -49,7 +50,7 @@ slot_size = 48
 
 def af_sectors(blocksize, blocknumbers):
     af_size = blocksize * blocknumbers
-    af_size = (af_size + 511) / 512
+    af_size = (af_size + 511) // 512
     af_size *= 512
 
     return af_size
@@ -69,29 +70,33 @@ def process_file(filename):
 
     myphdr = data = f.read(luks_header_size)
     if len(data) != luks_header_size:
-        sys.stdout.write("%s : parsing failed\n" % filename)
+        sys.stderr.write("%s : parsing failed\n" % filename)
         return -1
 
     data = struct.unpack(luks_header_fmt, data)
     (magic, version, cipherName, cipherMode, hashSpec, payloadOffset, keyBytes,
         mkDigest, mkDigestSalt, mkDigestIterations, uuid, slots) = data
 
-    if magic != "LUKS\xba\xbe":
-        sys.stderr.write("%s : not a LUKS file / disk\n", filename)
+    if magic != b"LUKS\xba\xbe":
+        sys.stderr.write("%s : not a LUKS file / disk\n" % filename)
         return -2
 
-    cipherName = str(cipherName)
-    if not cipherName.startswith("aes\x00"):
+    if version != 1:
+        sys.stderr.write("%s : Only LUKS1 is supported. Used version: %d\n" %
+                         (filename, version))
+        return -2
+
+    if not cipherName.startswith(b"aes\x00"):
         sys.stderr.write("%s : Only AES cipher supported. Used cipher: %s\n" %
                          (filename, cipherName))
         return -3
 
-    if not cipherMode.startswith("cbc-essiv:sha256\x00"):
+    if not cipherMode.startswith(b"cbc-essiv:sha256\x00"):
         sys.stderr.write("%s : Only cbc-essiv:sha256 mode is supported. Used mode: %s\n" %
                          (filename, cipherMode))
         return -4
 
-    if not hashSpec.startswith("sha1\x00"):
+    if not hashSpec.startswith(b"sha1\x00"):
         sys.stderr.write("%s : Only sha1 hash is supported. Used hash: %s\n" %
                          (filename, hashSpec))
         return -5
@@ -124,10 +129,15 @@ def process_file(filename):
     f.seek(keyMaterialOffset * 512, 0)
     cipherbuf = f.read(afsize)
 
-    sys.stdout.write("$luks$1$%d$%s" % (luks_header_size, hexlify(myphdr)))
-    sys.stdout.write("$%d$%s$%s\n" % (
-        afsize,
-        base64.b64encode(cipherbuf), hexlify(mkDigest)))
+    myphdr = hexlify(myphdr)
+    cipherbuf = base64.b64encode(cipherbuf)
+    mkDigest = hexlify(mkDigest)
+    if PY3:
+        myphdr = str(myphdr, 'ascii')
+        cipherbuf = str(cipherbuf, 'ascii')
+        mkDigest = str(mkDigest, 'ascii')
+    sys.stdout.write("$luks$1$%d$%s" % (luks_header_size, myphdr))
+    sys.stdout.write("$%d$%s$%s\n" % (afsize, cipherbuf, mkDigest))
 
     f.close()
 

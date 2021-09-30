@@ -8,38 +8,39 @@
 #ifdef HAVE_OPENCL
 
 #include <string.h>
-#include <assert.h>
+#include <fcntl.h>
 
 #include "arch.h"
 #include "common.h"
 #include "opencl_DES_bs.h"
-#include "opencl_DES_hst_dev_shared.h"
+#include "../run/opencl/opencl_DES_hst_dev_shared.h"
 #include "unicode.h"
 #include "bt_interface.h"
 #include "mask_ext.h"
-#include "memdbg.h"
+#include "logger.h"
 
 typedef struct {
 	unsigned char *pxkeys[DES_BS_DEPTH]; /* Pointers into xkeys.c */
 } des_combined;
 
-static cl_kernel **cmp_kernel = NULL;
-static cl_kernel kernel_high = 0, kernel_low = 0;
-static cl_mem buffer_hash_ids, buffer_bitmap_dupe, *buffer_uncracked_hashes = NULL, *buffer_hash_tables = NULL, *buffer_offset_tables = NULL, *buffer_bitmaps = NULL;
-static unsigned int *zero_buffer = NULL, **hash_tables = NULL;
-static unsigned int *hash_ids = NULL;
-static unsigned int max_uncracked_hashes = 0, max_hash_table_size = 0;
-DES_hash_check_params *hash_chk_params = NULL;
-static WORD current_salt = 0;
+static cl_kernel **cmp_kernel;
+static cl_kernel kernel_high, kernel_low;
+static cl_mem buffer_hash_ids, buffer_bitmap_dupe, *buffer_uncracked_hashes, *buffer_hash_tables, *buffer_offset_tables, *buffer_bitmaps;
+static unsigned int *zero_buffer, **hash_tables;
+static unsigned int *hash_ids;
+static unsigned int max_uncracked_hashes, max_hash_table_size;
+DES_hash_check_params *hash_chk_params;
+static WORD current_salt;
 
-static cl_kernel keys_kernel = 0;
-static cl_mem buffer_raw_keys = 0, buffer_int_des_keys = 0, buffer_int_key_loc = 0;
+static cl_kernel keys_kernel;
+static cl_mem buffer_raw_keys, buffer_int_des_keys, buffer_int_key_loc;
 static int keys_changed = 1;
 static des_combined *des_all;
 static opencl_DES_bs_transfer *des_raw_keys;
-static unsigned int *des_int_key_loc = NULL;
+static unsigned int *des_int_key_loc;
 static unsigned int static_gpu_locations[MASK_FMT_INT_PLHDR];
-static size_t process_key_gws = 0;
+static size_t process_key_gws;
+unsigned int CC_CACHE_ALIGN opencl_DES_bs_index768[0x300];
 
 unsigned char opencl_DES_E[48] = {
 	31, 0, 1, 2, 3, 4,
@@ -166,21 +167,17 @@ static void select_bitmap(unsigned int num_ld_hashes, WORD *uncracked_hashes_t, 
 		}
 		if (buf_sz >= 536870912)
 			buf_sz = 536870912;
-		assert(!(buf_sz & (buf_sz - 1)));
 		if (((*bitmap_size_bits) >> 3) > buf_sz)
 			*bitmap_size_bits = buf_sz << 3;
-		assert(!((*bitmap_size_bits) & ((*bitmap_size_bits) - 1)));
 	}
 
 	prepare_bitmap_1(*bitmap_size_bits, bitmaps_ptr, (unsigned WORD *)uncracked_hashes_t, num_ld_hashes);
 
-	assert(!((*bitmap_size_bits) & ((*bitmap_size_bits) - 1)));
-	assert(*bitmap_size_bits <= 0xffffffff);
 	get_num_bits(bits_req, (*bitmap_size_bits));
 
-	hash_chk_params -> bitmap_size_bits = (unsigned int)(*bitmap_size_bits);
-	hash_chk_params -> cmp_steps = cmp_steps;
-	hash_chk_params -> cmp_bits = bits_req;
+	hash_chk_params->bitmap_size_bits = (unsigned int)(*bitmap_size_bits);
+	hash_chk_params->cmp_steps = cmp_steps;
+	hash_chk_params->cmp_bits = bits_req;
 
 	*bitmap_size_bits *= cmp_steps;
 }
@@ -195,8 +192,8 @@ static void fill_buffer(struct db_salt *salt, unsigned int *max_uncracked_hashes
 	OFFSET_TABLE_WORD *offset_table;
 	unsigned int hash_table_size, offset_table_size;
 
-	salt_val = *(WORD *)salt -> salt;
-	num_uncracked_hashes(salt_val) = salt -> count;
+	salt_val = *(WORD *)salt->salt;
+	num_uncracked_hashes(salt_val) = salt->count;
 
 	uncracked_hashes = (WORD *) mem_calloc(2 * num_uncracked_hashes(salt_val), sizeof(WORD));
 	uncracked_hashes_t = (WORD *) mem_calloc(2 * num_uncracked_hashes(salt_val), sizeof(WORD));
@@ -218,8 +215,8 @@ static void fill_buffer(struct db_salt *salt, unsigned int *max_uncracked_hashes
 		}
 	} while ((pw = pw->next));
 
-	if (salt -> count > *max_uncracked_hashes)
-		*max_uncracked_hashes = salt -> count;
+	if (salt->count > *max_uncracked_hashes)
+		*max_uncracked_hashes = salt->count;
 
 	num_uncracked_hashes(salt_val) = create_perfect_hash_table(64, (void *)uncracked_hashes_t,
 				num_uncracked_hashes(salt_val),
@@ -418,10 +415,10 @@ void build_tables(struct db_main *db)
 	memset(hash_chk_params, 0, 4096 * sizeof(DES_hash_check_params));
 
 	if (db) {
-	struct db_salt *salt = db -> salts;
+	struct db_salt *salt = db->salts;
 	do {
 		fill_buffer(salt, &max_uncracked_hashes, &max_hash_table_size);
-	} while((salt = salt -> next));
+	} while((salt = salt->next));
 	}
 	else {
 		fill_buffer_self_test(&max_uncracked_hashes, &max_hash_table_size);
@@ -460,7 +457,7 @@ size_t create_checking_kernel_set_args()
 	int i;
 	size_t min_lws;
 
-	opencl_build_kernel("$JOHN/kernels/DES_bs_hash_checking_kernel.cl",
+	opencl_build_kernel("$JOHN/opencl/DES_bs_hash_checking_kernel.cl",
 	                    gpu_id, NULL, 0);
 
 	if (kernel_high == 0) {
@@ -475,7 +472,7 @@ size_t create_checking_kernel_set_args()
 	memset(cmp_kernel[gpu_id], 0, 4096 * sizeof(cl_kernel));
 
 	for (i = 0; i < 4096; i++) {
-		if(num_uncracked_hashes(i) <= LOW_THRESHOLD)
+		if (num_uncracked_hashes(i) <= LOW_THRESHOLD)
 			cmp_kernel[gpu_id][i] = kernel_low;
 		else
 			cmp_kernel[gpu_id][i] = kernel_high;
@@ -485,7 +482,7 @@ size_t create_checking_kernel_set_args()
 
 	min_lws = get_kernel_max_lws(gpu_id, kernel_high);
 
-	if(min_lws > get_kernel_max_lws(gpu_id, kernel_low))
+	if (min_lws > get_kernel_max_lws(gpu_id, kernel_low))
 		return get_kernel_max_lws(gpu_id, kernel_low);
 
 	return min_lws;
@@ -504,11 +501,11 @@ void set_common_kernel_args_kpc(cl_mem buffer_unchecked_hashes, cl_mem buffer_bs
 void update_buffer(struct db_salt *salt)
 {
 	unsigned int _max_uncracked_hashes = 0, _max_hash_table_size = 0;
-	WORD salt_val = *(WORD *)salt -> salt;
+	WORD salt_val = *(WORD *)salt->salt;
 	release_fill_buffer(salt_val);
 
-	if (salt -> count > LOW_THRESHOLD &&
-		(num_uncracked_hashes(salt_val) - num_uncracked_hashes(salt_val) / 10) < salt -> count)
+	if (salt->count > LOW_THRESHOLD &&
+		(num_uncracked_hashes(salt_val) - num_uncracked_hashes(salt_val) / 10) < salt->count)
 		return;
 
 	fill_buffer(salt, &_max_uncracked_hashes, &_max_hash_table_size);
@@ -591,37 +588,37 @@ void finish_checking()
 
 int opencl_DES_bs_get_hash_0(int index)
 {
-	return hash_tables[current_salt][hash_ids[2 + 2 * index]] & 0xf;
+	return hash_tables[current_salt][hash_ids[2 + 2 * index]] & PH_MASK_0;
 }
 
 int opencl_DES_bs_get_hash_1(int index)
 {
-	return hash_tables[current_salt][hash_ids[2 + 2 * index]] & 0xff;
+	return hash_tables[current_salt][hash_ids[2 + 2 * index]] & PH_MASK_1;
 }
 
 int opencl_DES_bs_get_hash_2(int index)
 {
-	return hash_tables[current_salt][hash_ids[2 + 2 * index]] & 0xfff;
+	return hash_tables[current_salt][hash_ids[2 + 2 * index]] & PH_MASK_2;
 }
 
 int opencl_DES_bs_get_hash_3(int index)
 {
-	return hash_tables[current_salt][hash_ids[2 + 2 * index]] & 0xffff;
+	return hash_tables[current_salt][hash_ids[2 + 2 * index]] & PH_MASK_3;
 }
 
 int opencl_DES_bs_get_hash_4(int index)
 {
-	return hash_tables[current_salt][hash_ids[2 + 2 * index]] & 0xfffff;
+	return hash_tables[current_salt][hash_ids[2 + 2 * index]] & PH_MASK_4;
 }
 
 int opencl_DES_bs_get_hash_5(int index)
 {
-	return hash_tables[current_salt][hash_ids[2 + 2 * index]] & 0xffffff;
+	return hash_tables[current_salt][hash_ids[2 + 2 * index]] & PH_MASK_5;
 }
 
 int opencl_DES_bs_get_hash_6(int index)
 {
-	return hash_tables[current_salt][hash_ids[2 + 2 * index]] & 0x7ffffff;
+	return hash_tables[current_salt][hash_ids[2 + 2 * index]] & PH_MASK_6;
 }
 
 int opencl_DES_bs_cmp_one(void *binary, int index)
@@ -817,8 +814,6 @@ typedef union {
 	kp += 1;					\
 }
 
-#include "memdbg.h"
-
 static void des_finalize_int_keys()
 {
 	key_page *int_key_page[MASK_FMT_INT_PLHDR];
@@ -927,14 +922,12 @@ void create_int_keys_buffer()
 {
 	unsigned int active_placeholders, i;
 
-	active_placeholders = 0;
+	active_placeholders = 1;
 	if (mask_skip_ranges)
 	for (i = 0; i < MASK_FMT_INT_PLHDR; i++) {
 		if (mask_skip_ranges[i] != -1)
 			active_placeholders++;
 	}
-	else
-		active_placeholders = 1;
 
 	buffer_int_des_keys = clCreateBuffer(context[gpu_id], CL_MEM_READ_ONLY, active_placeholders * 7 * ((mask_int_cand.num_int_cand + DES_BS_DEPTH - 1) >> DES_LOG_DEPTH) * sizeof(unsigned int), NULL, &ret_code);
 	HANDLE_CLERROR(ret_code, "Create buffer_int_des_keys failed.\n");
@@ -1160,7 +1153,7 @@ size_t create_keys_kernel_set_args(int mask_mode)
 	des_finalize_int_keys();
 
 	for (i = 0; i < MASK_FMT_INT_PLHDR; i++)
-		if (mask_skip_ranges!= NULL && mask_skip_ranges[i] != -1)
+		if (mask_skip_ranges && mask_skip_ranges[i] != -1)
 			static_gpu_locations[i] = mask_int_cand.int_cpu_mask_ctx->
 				ranges[mask_skip_ranges[i]].pos;
 		else
@@ -1191,7 +1184,7 @@ size_t create_keys_kernel_set_args(int mask_mode)
 #endif
 		, mask_gpu_is_static, (unsigned long long)const_cache_size);
 
-	opencl_build_kernel("$JOHN/kernels/DES_bs_finalize_keys_kernel.cl",
+	opencl_build_kernel("$JOHN/opencl/DES_bs_finalize_keys_kernel.cl",
 	                    gpu_id, build_opts, 0);
 	keys_kernel = clCreateKernel(program[gpu_id], "DES_bs_finalize_keys", &ret_code);
 	HANDLE_CLERROR(ret_code, "Failed creating kernel DES_bs_finalize_keys.\n");
@@ -1230,38 +1223,24 @@ char *get_device_name(int id)
 void save_lws_config(const char* config_file, int id_gpu, size_t lws, unsigned int forced_global_key)
 {
 	FILE *file;
-	char config_file_name[500];
+	char config_file_name[PATH_BUFFER_SIZE];
 	char *d_name;
 
 	sprintf(config_file_name, config_file, d_name = get_device_name(id_gpu));
 	MEM_FREE(d_name);
+	strnzcpy(config_file_name, path_expand(config_file_name),
+	         sizeof(config_file_name));
 
-	file = fopen(path_expand(config_file_name), "r");
+	file = fopen(config_file_name, "r");
 	if (file != NULL) {
 		fclose(file);
 		return;
 	}
-	file = fopen(path_expand(config_file_name), "w");
+	if (!(file = fopen(config_file_name, "w")))
+		pexit("%s", config_file_name);
 
-#if OS_FLOCK || FCNTL_LOCKS
-	{
-#if FCNTL_LOCKS
-		struct flock lock;
+	jtr_lock(fileno(file), F_SETLKW, F_WRLCK, config_file_name);
 
-		memset(&lock, 0, sizeof(lock));
-		lock.l_type = F_WRLCK;
-		while (fcntl(fileno(file), F_SETLKW, &lock)) {
-			if (errno != EINTR)
-				pexit("fcntl(F_WRLCK)");
-		}
-#else
-		while (flock(fileno(file), LOCK_EX)) {
-			if (errno != EINTR)
-				pexit("flock(LOCK_EX)");
-		}
-#endif
-	}
-#endif
 	fprintf(file, ""Zu" %u", lws, forced_global_key);
 	fclose(file);
 }
@@ -1269,37 +1248,21 @@ void save_lws_config(const char* config_file, int id_gpu, size_t lws, unsigned i
 int restore_lws_config(const char *config_file, int id_gpu, size_t *lws, size_t extern_lws_limit, unsigned int *forced_global_key)
 {
 	FILE *file;
-	char config_file_name[500];
+	char config_file_name[PATH_BUFFER_SIZE];
 	char *d_name;
 	unsigned int param;
 
 	sprintf(config_file_name, config_file, d_name = get_device_name(id_gpu));
 	MEM_FREE(d_name);
+	strnzcpy(config_file_name, path_expand(config_file_name),
+	         sizeof(config_file_name));
 
-	file = fopen(path_expand(config_file_name), "r");
+	file = fopen(config_file_name, "r");
 	if (file == NULL)
 		return 0;
 
+	jtr_lock(fileno(file), F_SETLKW, F_RDLCK, config_file_name);
 
-#if OS_FLOCK || FCNTL_LOCKS
-	{
-#if FCNTL_LOCKS
-		struct flock lock;
-
-		memset(&lock, 0, sizeof(lock));
-		lock.l_type = F_RDLCK;
-		while (fcntl(fileno(fp), F_SETLKW, &lock)) {
-			if (errno != EINTR)
-				pexit("fcntl(F_RDLCK)");
-		}
-#else
-		while (flock(fileno(fp), LOCK_SH)) {
-			if (errno != EINTR)
-				pexit("flock(LOCK_SH)");
-		}
-#endif
-	}
-#endif
 	if (fscanf(file, ""Zu" %u", lws, &param) != 2 || *lws > extern_lws_limit) {
 		if (forced_global_key)
 			*forced_global_key = param;

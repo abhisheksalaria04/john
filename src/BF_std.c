@@ -11,7 +11,7 @@
  * interfaces added, but optimizations specific to password cracking
  * removed, is available at:
  *
- *	http://www.openwall.com/crypt/
+ *	https://www.openwall.com/crypt/
  *
  * This implementation is compatible with OpenBSD bcrypt.c (version 2a)
  * by Niels Provos <provos at citi.umich.edu>, and uses some of his
@@ -20,7 +20,7 @@
  *
  * There's a paper on the algorithm that explains its design decisions:
  *
- *	http://www.usenix.org/events/usenix99/provos.html
+ *	https://www.usenix.org/events/usenix99/provos.html
  *
  * Some of the tricks in BF_ROUND might be inspired by Eric Young's
  * Blowfish library (I can't be sure if I would think of something if I
@@ -33,7 +33,6 @@
 #include "arch.h"
 #include "common.h"
 #include "BF_std.h"
-#include "memdbg.h"
 
 BF_binary BF_out[BF_N];
 
@@ -388,7 +387,11 @@ void BF_std_crypt(BF_salt *salt, int n)
 #endif
 
 #if BF_mt > 1 && defined(_OPENMP)
+#if defined(WITH_UBSAN)
+#pragma omp parallel for
+#else
 #pragma omp parallel for default(none) private(t) shared(n, BF_init_state, BF_init_key, BF_exp_key, salt, BF_magic_w, BF_out)
+#endif
 #endif
 	for_each_t() {
 #if BF_mt > 1

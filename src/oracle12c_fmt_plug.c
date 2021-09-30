@@ -14,15 +14,13 @@ extern struct fmt_main fmt_oracle12c;
 john_register_one(&fmt_oracle12c);
 #else
 
-#include <openssl/sha.h>
 #include <string.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "arch.h"
-
-//#undef SIMD_COEF_64
-//#undef SIMD_PARA_SHA512
-//#undef _OPENMP
-
 #include "misc.h"
 #include "memory.h"
 #include "common.h"
@@ -30,13 +28,6 @@ john_register_one(&fmt_oracle12c);
 #include "johnswap.h"
 #include "sha2.h"
 #include "pbkdf2_hmac_sha512.h"
-#ifdef _OPENMP
-#include <omp.h>
-#ifndef OMP_SCALE
-#define OMP_SCALE               1
-#endif
-#endif
-#include "memdbg.h"
 
 #define FORMAT_LABEL		"Oracle12C"
 #define FORMAT_NAME		""
@@ -48,11 +39,13 @@ john_register_one(&fmt_oracle12c);
 #define PLAINTEXT_LENGTH	125 // XXX
 #define CIPHERTEXT_LENGTH	160
 #define SALT_SIZE		sizeof(struct custom_salt)
-#define SALT_ALIGN		sizeof(ARCH_WORD_32)
+#define SALT_ALIGN		sizeof(uint32_t)
 #define BINARY_SIZE		64
-#define BINARY_ALIGN		sizeof(ARCH_WORD_32)
+#define BINARY_ALIGN		sizeof(uint32_t)
 #define BENCHMARK_COMMENT       ""
-#define BENCHMARK_LENGTH        -1
+#define BENCHMARK_LENGTH        0x107
+#define FORMAT_TAG		"$oracle12c$"
+#define FORMAT_TAG_LENGTH	(sizeof(FORMAT_TAG) - 1)
 #ifdef SIMD_COEF_64
 #define MIN_KEYS_PER_CRYPT	(SIMD_COEF_64 * SIMD_PARA_SHA512)
 #define MAX_KEYS_PER_CRYPT	(SIMD_COEF_64 * SIMD_PARA_SHA512)
@@ -60,11 +53,14 @@ john_register_one(&fmt_oracle12c);
 #define MIN_KEYS_PER_CRYPT	1
 #define MAX_KEYS_PER_CRYPT	1
 #endif
-#define FORMAT_TAG		"$oracle12c$"
-#define FORMAT_TAG_LENGTH	(sizeof(FORMAT_TAG) - 1)
+
+#ifndef OMP_SCALE
+#define OMP_SCALE           4 // Tuned w/ MKPC for OMP
+#endif
 
 static struct fmt_tests tests[] = {
-{"$oracle12c$e3243b98974159cc24fd2c9a8b30ba62e0e83b6ca2fc7c55177c3a7f82602e3bdd17ceb9b9091cf9dad672b8be961a9eac4d344bdba878edc5dcb5899f689ebd8dd1be3f67bff9813a464382381ab36b", "epsilon"},
+	{"$oracle12c$e3243b98974159cc24fd2c9a8b30ba62e0e83b6ca2fc7c55177c3a7f82602e3bdd17ceb9b9091cf9dad672b8be961a9eac4d344bdba878edc5dcb5899f689ebd8dd1be3f67bff9813a464382381ab36b", "epsilon"},
+	{"$oracle12c$eda9535a516d5c7c75ef250f8b1b5fadc023ebfdad9b8d46f023b283cabc06f822e6db556a131d8f87fb427e6a7d592ca69b0e4eef22648aa7ba00afee786a8745057545117145650771143408825746", "18445407"},
 	{NULL}
 };
 
@@ -74,21 +70,16 @@ static struct custom_salt {
 } *cur_salt;
 
 #ifdef SIMD_COEF_64
-static char (*saved_key)[SHA_BUF_SIZ*sizeof(ARCH_WORD_64)];
+static char (*saved_key)[SHA_BUF_SIZ*sizeof(uint64_t)];
 #else
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
 #endif
-static ARCH_WORD_32 (*crypt_out)[BINARY_SIZE / sizeof(ARCH_WORD_32)];
+static uint32_t (*crypt_out)[BINARY_SIZE / sizeof(uint32_t)];
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	static int omp_t = 1;
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
+	omp_autotune(self, OMP_SCALE);
+
 	saved_key = mem_calloc(self->params.max_keys_per_crypt,
 			sizeof(*saved_key));
 	crypt_out = mem_calloc(self->params.max_keys_per_crypt,
@@ -138,10 +129,10 @@ static void *get_salt(char *ciphertext)
 
 	p = ciphertext + FORMAT_TAG_LENGTH + 2 * BINARY_SIZE;
 	// AUTH_VFR_DATA is variable, and 16 bytes in length
-	for(i = 0; i < 16; i++)
+	for (i = 0; i < 16; i++)
 		cs.salt[i] = (atoi16[ARCH_INDEX(p[2*i])] << 4) | atoi16[ARCH_INDEX(p[2*i+1])];
 
-	strncpy((char*)cs.salt + 16, "AUTH_PBKDF2_SPEEDY_KEY", 22);  // add constant string to the salt
+	strncpy((char*)cs.salt + 16, "AUTH_PBKDF2_SPEEDY_KEY", 22+1);  // add constant string (including NUL) to the salt
 	cs.saltlen = 16 + 22;
 
 	return (void *)&cs;
@@ -173,13 +164,8 @@ static void set_salt(void *salt)
 	cur_salt = (struct custom_salt *)salt;
 }
 
-static int get_hash_0(int index) { return crypt_out[index][0] & PH_MASK_0; }
-static int get_hash_1(int index) { return crypt_out[index][0] & PH_MASK_1; }
-static int get_hash_2(int index) { return crypt_out[index][0] & PH_MASK_2; }
-static int get_hash_3(int index) { return crypt_out[index][0] & PH_MASK_3; }
-static int get_hash_4(int index) { return crypt_out[index][0] & PH_MASK_4; }
-static int get_hash_5(int index) { return crypt_out[index][0] & PH_MASK_5; }
-static int get_hash_6(int index) { return crypt_out[index][0] & PH_MASK_6; }
+#define COMMON_GET_HASH_VAR crypt_out
+#include "common-get-hash.h"
 
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
@@ -189,23 +175,20 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-#if defined(_OPENMP) || MAX_KEYS_PER_CRYPT > 1
-#endif
-	for (index = 0; index < count; index += MAX_KEYS_PER_CRYPT)
-	{
+	for (index = 0; index < count; index += MIN_KEYS_PER_CRYPT) {
 		SHA512_CTX ctx;
 		int i = 0;
 #if SIMD_COEF_64
 		int lens[SSE_GROUP_SZ_SHA512];
 		unsigned char *pin[SSE_GROUP_SZ_SHA512];
 		union {
-			ARCH_WORD_32 *pout[SSE_GROUP_SZ_SHA512];
+			uint32_t *pout[SSE_GROUP_SZ_SHA512];
 			unsigned char *poutc;
 		} x;
 		for (i = 0; i < SSE_GROUP_SZ_SHA512; ++i) {
 			lens[i] = strlen(saved_key[index+i]);
 			pin[i] = (unsigned char*)saved_key[index+i];
-			x.pout[i] = (ARCH_WORD_32*)(crypt_out[index+i]);
+			x.pout[i] = (uint32_t*)(crypt_out[index+i]);
 		}
 		pbkdf2_sha512_sse((const unsigned char **)pin, lens, cur_salt->salt,
 		                  cur_salt->saltlen, 4096, &(x.poutc), BINARY_SIZE, 0);
@@ -215,10 +198,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 		              cur_salt->saltlen, 4096,
 		              (unsigned char*)crypt_out[index], BINARY_SIZE, 0);
 #endif
-#if defined(_OPENMP) || MAX_KEYS_PER_CRYPT > 1
-		for (i = 0; i < MAX_KEYS_PER_CRYPT; i++)
-#endif
-		{
+		for (i = 0; i < MIN_KEYS_PER_CRYPT; i++) {
 			SHA512_Init(&ctx);
 			SHA512_Update(&ctx, (unsigned char*)crypt_out[index + i], BINARY_SIZE);
 			SHA512_Update(&ctx, cur_salt->salt, 16); // AUTH_VFR_DATA first 16 bytes
@@ -230,10 +210,9 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 static int cmp_all(void *binary, int count)
 {
-	int index = 0;
-#if defined(_OPENMP) || MAX_KEYS_PER_CRYPT > 1
-	for (; index < count; index++)
-#endif
+	int index;
+
+	for (index = 0; index < count; index++)
 		if (!memcmp(binary, crypt_out[index], ARCH_SIZE))
 			return 1;
 	return 0;
@@ -251,11 +230,7 @@ static int cmp_exact(char *source, int index)
 
 static void set_key(char *key, int index)
 {
-	int saved_len = strlen(key);
-	if (saved_len > PLAINTEXT_LENGTH)
-		saved_len = PLAINTEXT_LENGTH;
-	memcpy(saved_key[index], key, saved_len);
-	saved_key[index][saved_len] = 0;
+	strnzcpy(saved_key[index], key, sizeof(*saved_key));
 }
 
 static char *get_key(int index)
@@ -310,13 +285,8 @@ struct fmt_main fmt_oracle12c = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,

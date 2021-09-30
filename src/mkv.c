@@ -29,13 +29,12 @@
 #include "mkv.h"
 #include "mask.h"
 #include "regex.h"
-#include "memdbg.h"
 
 #define SUBSECTION_DEFAULT  "Default"
 
 extern struct fmt_main fmt_LM;
 
-static long long tidx, hybrid_tidx;
+static int64_t tidx, hybrid_tidx;
 #if HAVE_REXGEN
 static char *regex_alpha;
 static int regex_case;
@@ -44,12 +43,12 @@ static char *regex;
 
 static void save_state(FILE *file)
 {
-	fprintf(file, LLd "\n", tidx);
+	fprintf(file, "%"PRId64 "\n", tidx);
 }
 
 static int restore_state(FILE *file)
 {
-	if (fscanf(file, LLd "\n", &gidx) != 1)
+	if (fscanf(file, "%"PRId64 "\n", &gidx) != 1)
 		return 1;
 
 	return 0;
@@ -71,7 +70,7 @@ void mkv_hybrid_fix_state(void)
 
 static int show_pwd_rnbs(struct db_main *db, struct s_pwd *pwd)
 {
-	unsigned long long i;
+	uint64_t i;
 	unsigned int k;
 	unsigned long lvl;
 	char pass_filtered[PLAINTEXT_BUFFER_SIZE];
@@ -110,7 +109,7 @@ static int show_pwd_rnbs(struct db_main *db, struct s_pwd *pwd)
 					return 1;
 				mkv_hybrid_fix_state();
 			} else
-			if (options.mask) {
+			if (options.flags & FLG_MASK_CHK) {
 				if (do_mask_crack(pass))
 					return 1;
 			} else
@@ -132,7 +131,7 @@ static int show_pwd_rnbs(struct db_main *db, struct s_pwd *pwd)
 
 static int show_pwd_r(struct db_main *db, struct s_pwd *pwd, unsigned int bs)
 {
-	unsigned long long i;
+	uint64_t i;
 	unsigned int k;
 	unsigned long lvl;
 	unsigned char curchar;
@@ -176,7 +175,7 @@ static int show_pwd_r(struct db_main *db, struct s_pwd *pwd, unsigned int bs)
 					return 1;
 				mkv_hybrid_fix_state();
 			} else
-			if (options.mask) {
+			if (options.flags & FLG_MASK_CHK) {
 				if (do_mask_crack(pass))
 					return 1;
 			} else
@@ -216,7 +215,7 @@ static int show_pwd_r(struct db_main *db, struct s_pwd *pwd, unsigned int bs)
 					return 1;
 				mkv_hybrid_fix_state();
 			} else
-			if (options.mask) {
+			if (options.flags & FLG_MASK_CHK) {
 				if (do_mask_crack(pass))
 					return 1;
 			} else
@@ -236,7 +235,7 @@ static int show_pwd_r(struct db_main *db, struct s_pwd *pwd, unsigned int bs)
 	return 0;
 }
 
-static int show_pwd(struct db_main *db, unsigned long long start)
+static int show_pwd(struct db_main *db, uint64_t start)
 {
 	struct s_pwd pwd;
 	unsigned int i;
@@ -272,7 +271,7 @@ static int show_pwd(struct db_main *db, unsigned long long start)
 						return 1;
 					mkv_hybrid_fix_state();
 				} else
-				if (options.mask) {
+				if (options.flags & FLG_MASK_CHK) {
 					if (do_mask_crack(pass))
 						return 1;
 				} else
@@ -309,7 +308,7 @@ static int show_pwd(struct db_main *db, unsigned long long start)
 					return 1;
 				mkv_hybrid_fix_state();
 			} else
-			if (options.mask) {
+			if (options.flags & FLG_MASK_CHK) {
 				if (do_mask_crack(pass))
 					return 1;
 			} else
@@ -326,17 +325,22 @@ static int show_pwd(struct db_main *db, unsigned long long start)
 
 static double get_progress(void)
 {
-	unsigned long long mask_mult = mask_tot_cand ? mask_tot_cand : 1;
-	double try;
+	uint64_t mask_mult = mask_tot_cand ? mask_tot_cand : 1;
+	uint64_t factors = crk_stacked_rule_count * mask_mult;
+	uint64_t keyspace = (gend - gstart) * factors;
+	uint64_t pos = status.cands;
 
 	emms();
 
-	if (gend == 0)
+	if (keyspace == 0)
 		return 0;
 
-	try = ((unsigned long long)status.cands.hi << 32) + status.cands.lo;
+	/* Less accurate because we don't know all details needed */
+	if (f_filter || f_new || options.eff_minlength || gmin_level)
+		pos = ((rules_stacked_number - 1) * keyspace) +
+			(gidx - gstart) * factors;
 
-	return 100.0 * try / ((gend - gstart) * mask_mult);
+	return 100.0 * pos / keyspace;
 }
 
 void get_markov_options(struct db_main *db,
@@ -351,7 +355,7 @@ void get_markov_options(struct db_main *db,
 	char *dummy_token = NULL;
 
 	int minlevel, level, minlen, maxlen;
-	int our_fmt_len = db->format->params.plaintext_length;
+	int our_fmt_len = options.eff_maxlength;
 
 	*start_token = NULL;
 	*end_token = NULL;
@@ -406,7 +410,7 @@ void get_markov_options(struct db_main *db,
 	}
 
 	if (options.mkv_stats == NULL)
-		*statfile = cfg_get_param(SECTION_MARKOV, mode, "Statsfile");
+		*statfile = (char*)cfg_get_param(SECTION_MARKOV, mode, "Statsfile");
 	else
 		*statfile = options.mkv_stats;
 
@@ -475,13 +479,15 @@ void get_markov_options(struct db_main *db,
 		minlevel = level;
 	}
 
-	/* Command-line --min-length and --max-length can over-ride lengths
-	   from config file. This may clash with the len_token stuff, or rather
-	   it will over-ride that too. */
-	if (options.req_minlength >= 0)
-		minlen = options.req_minlength;
+	/*
+	 * Command-line --min-length and --max-length, or a format's min length,
+	 * can over-ride lengths from config file. This may clash with the
+	 * len_token stuff, or rather it will over-ride that too.
+	 */
+	if (options.eff_minlength > minlen)
+		minlen = options.eff_minlength;
 	if (options.req_maxlength)
-		maxlen = options.req_maxlength;
+		maxlen = options.eff_maxlength;
 
 	if (maxlen <= 0) {
 		if ((maxlen = cfg_get_int(SECTION_MARKOV, mode, "MkvMaxLen")) == -1) {
@@ -497,9 +503,6 @@ void get_markov_options(struct db_main *db,
 				maxlen /= mask_num_qw;
 		}
 	}
-
-	if (mask_num_qw > 1)
-		our_fmt_len /= mask_num_qw;
 
 	if (our_fmt_len <= MAX_MKV_LEN && maxlen > our_fmt_len) {
 		log_event("! MaxLen = %d is too large for this hash type", maxlen);
@@ -554,14 +557,14 @@ void get_markov_options(struct db_main *db,
 }
 
 void get_markov_start_end(char *start_token, char *end_token,
-                          unsigned long long mkv_max,
-                          unsigned long long *mkv_start, unsigned long long *mkv_end)
+                          uint64_t mkv_max,
+                          uint64_t *mkv_start, uint64_t *mkv_end)
 {
 	*mkv_start = 0;
 	*mkv_end = 0;
 
-	if ((start_token != NULL) && (sscanf(start_token, LLd, mkv_start) == 1)) {
-		if ((end_token != NULL) && (sscanf(end_token, LLd, mkv_end) == 1)) {
+	if ((start_token != NULL) && (sscanf(start_token, "%"PRIu64, mkv_start) == 1)) {
+		if ((end_token != NULL) && (sscanf(end_token, "%"PRIu64, mkv_end) == 1)) {
 		}
 		/* NOTE, end_token can be an empty string. Treat "" and mkv_max as equal */
 		else if (end_token != NULL && *end_token) {
@@ -576,7 +579,7 @@ void get_markov_start_end(char *start_token, char *end_token,
 	 * If that changes, I'll need
 	 * start_token = cfg_get_param(SECTION_MARKOV, mode, "MkvStart")
 	 * and
-	 * sscanf(start_token, LLd, start)
+	 * sscanf(start_token, "%"PRId64, start)
 	 * because the values could be too large for integers
 	 */
 	/* NOTE, start_token can be an empty string. Treat "" and "0" equal */
@@ -596,10 +599,10 @@ void get_markov_start_end(char *start_token, char *end_token,
 			exit(1);
 		} else if (*mkv_start > 0) {
 			*mkv_start *= mkv_max / 100;
-			log_event("- Start: %s converted to " LLd, start_token,
+			log_event("- Start: %s converted to %" PRId64, start_token,
 			          *mkv_start);
 			if (john_main_process)
-				fprintf(stderr, "Start: %s converted to " LLd
+				fprintf(stderr, "Start: %s converted to %" PRId64
 				        "\n", start_token, *mkv_start);
 		}
 	}
@@ -614,9 +617,9 @@ void get_markov_start_end(char *start_token, char *end_token,
 			*mkv_end = 0;
 		} else if (*mkv_end > 0) {
 			*mkv_end *= mkv_max / 100;
-			log_event("- End: %s converted to " LLd "", end_token, *mkv_end);
+			log_event("- End: %s converted to %" PRId64 "", end_token, *mkv_end);
 			if (john_main_process)
-				fprintf(stderr, "End: %s converted to " LLd
+				fprintf(stderr, "End: %s converted to %" PRId64
 				        "\n", end_token, *mkv_end);
 		}
 	}
@@ -624,19 +627,19 @@ void get_markov_start_end(char *start_token, char *end_token,
 		*mkv_end = mkv_max;
 
 	if (*mkv_end > mkv_max) {
-		log_event("! End = " LLd " is too large (max=" LLd ")", *mkv_end,
+		log_event("! End = %" PRId64 " is too large (max=%" PRId64 ")", *mkv_end,
 		          mkv_max);
 		if (john_main_process)
-			fprintf(stderr, "Warning: End = " LLd " is too large "
-			        "(max = " LLd ")\n", *mkv_end, mkv_max);
+			fprintf(stderr, "Warning: End = %" PRId64 " is too large "
+			        "(max = %" PRId64 ")\n", *mkv_end, mkv_max);
 		*mkv_end = mkv_max;
 	}
 
 	if (*mkv_start > *mkv_end) {
-		log_event("! MKV start > end (" LLd " > " LLd ")", *mkv_start,
+		log_event("! MKV start > end (%" PRId64 " > %" PRId64 ")", *mkv_start,
 		          *mkv_end);
 		if (john_main_process)
-			fprintf(stderr, "Error: MKV start > end (" LLd " > " LLd
+			fprintf(stderr, "Error: MKV start > end (%" PRId64 " > %" PRId64
 			        ")\n", *mkv_start, *mkv_end);
 		error();
 	}
@@ -649,7 +652,7 @@ void do_markov_crack(struct db_main *db, char *mkv_param)
 	char *end_token = NULL;
 	char *param = NULL;
 	unsigned int mkv_minlevel, mkv_level, mkv_maxlen, mkv_minlen;
-	unsigned long long mkv_start, mkv_end;
+	uint64_t mkv_start, mkv_end;
 
 	if (mkv_param != NULL) {
 		param = str_alloc_copy(mkv_param);
@@ -686,10 +689,10 @@ void do_markov_crack(struct db_main *db, char *mkv_param)
 	gmin_len = mkv_minlen;
 
 	nbparts =
-	    mem_alloc(256 * (mkv_level + 1) * sizeof(long long) * (mkv_maxlen +
+	    mem_alloc(256 * (mkv_level + 1) * sizeof(int64_t) * (mkv_maxlen +
 	              1));
 	memset(nbparts, 0,
-	       256 * (mkv_level + 1) * (mkv_maxlen + 1) * sizeof(long long));
+	       256 * (mkv_level + 1) * (mkv_maxlen + 1) * sizeof(int64_t));
 
 	nb_parts(0, 0, 0, mkv_level, mkv_maxlen);
 
@@ -703,12 +706,12 @@ void do_markov_crack(struct db_main *db, char *mkv_param)
 		fprintf(stderr, "%d len=", mkv_level);
 		if (mkv_minlen > 0)
 			fprintf(stderr, "%d-", mkv_minlen);
-		fprintf(stderr, "%d pwd=" LLd "%s)\n", mkv_maxlen, mkv_end - mkv_start,
+		fprintf(stderr, "%d pwd=%" PRIu64 "%s)\n", mkv_maxlen, mkv_end - mkv_start,
 		        options.node_count > 1 ? " split over nodes" : "");
 	}
 
 	if (options.node_count > 1) {
-		unsigned long long mkv_size;
+		uint64_t mkv_size;
 
 		mkv_size = mkv_end - mkv_start + 1;
 		if (options.node_max != options.node_count)
@@ -721,15 +724,27 @@ void do_markov_crack(struct db_main *db, char *mkv_param)
 	gstart = mkv_start;
 	gend = mkv_end + 10;        /* omg !! */
 
-	if (param)
-		log_event("Proceeding with Markov mode %s", param);
-	else
-		log_event("Proceeding with Markov mode");
-
+	log_event("Proceeding with Markov mode%s%s",
+	          param ? " " : "", param ? param : "");
 	log_event("- Statsfile: %s", statfile);
 	log_event("- Markov level: %d - %d", mkv_minlevel, mkv_level);
 	log_event("- Length: %d - %d", mkv_minlen, mkv_maxlen);
-	log_event("- Start-End: " LLd " - " LLd, mkv_start, mkv_end);
+	log_event("- Start-End: %" PRIu64 " - %" PRIu64, mkv_start, mkv_end);
+
+	if (rec_restored && john_main_process) {
+		fprintf(stderr, "Proceeding with Markov%s%s",
+		        param ? " " : "", param ? param : "");
+		if (options.flags & FLG_MASK_CHK)
+			fprintf(stderr, ", hybrid mask:%s", options.mask ?
+			        options.mask : options.eff_mask);
+		if (options.rule_stack)
+			fprintf(stderr, ", rules-stack:%s", options.rule_stack);
+		if (options.req_minlength >= 0 || options.req_maxlength)
+			fprintf(stderr, ", lengths: %d-%d",
+			        options.eff_minlength + mask_add_len,
+			        options.eff_maxlength + mask_add_len);
+		fprintf(stderr, "\n");
+	}
 
 	show_pwd(db, mkv_start);
 

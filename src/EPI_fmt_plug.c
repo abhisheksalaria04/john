@@ -11,7 +11,7 @@
  * See doc/README.format-epi for information on the input file format.
  *
  * Updated Dec, 2014, JimF.  Added OMP, and allowed more than one hash to be
- * processed at once (OMP_SCALE stuff).
+ * processed at once.
  */
 
 #if FMT_EXTERNS_H
@@ -22,37 +22,38 @@ john_register_one(&fmt_EPI);
 
 #include <string.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "arch.h"
 #include "misc.h"
 #include "common.h"
 #include "formats.h"
-
 #include "sha.h"
-#ifdef _OPENMP
-#include <omp.h>
-#ifdef __MIC__
-#ifndef OMP_SCALE
-#define OMP_SCALE              8192
-#endif
-#else
-#ifndef OMP_SCALE
-#define OMP_SCALE              32768   // Tuned, K8-dual HT
-#endif
-#endif // __MIC__
-#endif
-#include "memdbg.h"
 
+#define CIPHERTEXT_LENGTH  105
 #define PLAINTEXT_LENGTH   125
 #define BINARY_LENGTH      20
-#define BINARY_ALIGN       sizeof(ARCH_WORD_32)
+#define BINARY_ALIGN       sizeof(uint32_t)
 #define SALT_LENGTH        30
 #define SALT_ALIGN         4
 #define MIN_KEYS_PER_CRYPT		1
-#define MAX_KEYS_PER_CRYPT		1
+#define MAX_KEYS_PER_CRYPT		1024
+
+#ifdef __MIC__
+#ifndef OMP_SCALE
+#define OMP_SCALE              8
+#endif
+#else
+#ifndef OMP_SCALE
+#define OMP_SCALE              4   // Tuned w/ MKPC for core i7
+#endif
+#endif // __MIC__
 
 static int (*key_len);
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
-static ARCH_WORD_32 (*crypt_out)[BINARY_LENGTH / 4];
+static uint32_t (*crypt_out)[BINARY_LENGTH / 4];
 static char global_salt[SALT_LENGTH+1];
 
 static struct fmt_tests global_tests[] =
@@ -67,12 +68,8 @@ static struct fmt_tests global_tests[] =
 
 static void init(struct fmt_main *self)
 {
-#if defined (_OPENMP)
-	int omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
+	omp_autotune(self, OMP_SCALE);
+
 	key_len   = mem_calloc(self->params.max_keys_per_crypt,
 	                       sizeof(*key_len));
 	saved_key = mem_calloc(self->params.max_keys_per_crypt,
@@ -95,22 +92,25 @@ static int valid(char *ciphertext, struct fmt_main *self)
 {
   unsigned int len, n;
 
-  if(!ciphertext) return 0;
-  len = strlen(ciphertext);
+  if (!ciphertext)
+	  return 0;
 
-  if(len != 105)
+  len = strnlen(ciphertext, CIPHERTEXT_LENGTH + 1);
+
+  if (len != CIPHERTEXT_LENGTH)
     return 0;
 
   // check fixed positions
-  if(ciphertext[0]  != '0' || ciphertext[1]  != 'x' ||
+  if (ciphertext[0]  != '0' || ciphertext[1]  != 'x' ||
      ciphertext[62] != ' ' ||
      ciphertext[63] != '0' || ciphertext[64] != 'x')
     return 0;
 
-  for(n = 2; n < 62 && atoi16u[ARCH_INDEX(ciphertext[n])] != 0x7F; ++n);
+  for (n = 2; n < 62 && atoi16u[ARCH_INDEX(ciphertext[n])] != 0x7F; ++n);
   if (n < 62)
 	  return 0;
-  for(n = 65; n < 105 && atoi16u[ARCH_INDEX(ciphertext[n])] != 0x7F; ++n);
+  for (n = 65; n < CIPHERTEXT_LENGTH &&
+	       atoi16u[ARCH_INDEX(ciphertext[n])] != 0x7F; ++n);
 
   return n == len;
 }
@@ -119,10 +119,10 @@ static void _tobin(char* dst, char *src, unsigned int len)
 {
   unsigned int n;
 
-  if(src[0] == '0' && src[1] == 'x')
+  if (src[0] == '0' && src[1] == 'x')
     src += sizeof(char)*2;
 
-  for(n = 0; n < len; ++n)
+  for (n = 0; n < len; ++n)
     dst[n] = atoi16[ARCH_INDEX(src[n*2])]<<4 |
              atoi16[ARCH_INDEX(src[n*2+1])];
 }
@@ -152,9 +152,7 @@ static void set_salt(void *salt)
 
 static void set_key(char *key, int index)
 {
-  if(!key) return;
-  key_len[index] = strlen(key) + 1;
-  strcpy(saved_key[index], key);
+  key_len[index] = strnzcpyn(saved_key[index], key, sizeof(*saved_key)) + 1;
 }
 
 static char* get_key(int index)
@@ -169,10 +167,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 #ifdef _OPENMP
 #pragma omp parallel for private(i) shared(global_salt, saved_key, key_len, crypt_out)
 #endif
-#if defined (_OPENMP) || MAX_KEYS_PER_CRYPT>1
-	for (i = 0; i < count; ++i)
-#endif
-	{
+	for (i = 0; i < count; ++i) {
 		SHA_CTX ctx;
 		SHA1_Init(&ctx);
 		SHA1_Update(&ctx, (unsigned char*)global_salt, SALT_LENGTH-1);
@@ -187,7 +182,7 @@ static int cmp_all(void *binary, int count)
 {
 	int index;
 	for (index = 0; index < count; index++)
-		if ( ((ARCH_WORD_32*)binary)[0] == crypt_out[index][0] )
+		if ( ((uint32_t*)binary)[0] == crypt_out[index][0] )
 			return 1;
 	return 0;
 }
@@ -202,17 +197,12 @@ static int cmp_exact(char *source, int index)
   return 1;
 }
 
-static int get_hash_0(int index) { return crypt_out[index][0] & PH_MASK_0; }
-static int get_hash_1(int index) { return crypt_out[index][0] & PH_MASK_1; }
-static int get_hash_2(int index) { return crypt_out[index][0] & PH_MASK_2; }
-static int get_hash_3(int index) { return crypt_out[index][0] & PH_MASK_3; }
-static int get_hash_4(int index) { return crypt_out[index][0] & PH_MASK_4; }
-static int get_hash_5(int index) { return crypt_out[index][0] & PH_MASK_5; }
-static int get_hash_6(int index) { return crypt_out[index][0] & PH_MASK_6; }
+#define COMMON_GET_HASH_VAR crypt_out
+#include "common-get-hash.h"
 
 static int salt_hash(void *salt)
 {
-	return *(ARCH_WORD_32*)salt & (SALT_HASH_SIZE - 1);
+	return *(uint32_t*)salt & (SALT_HASH_SIZE - 1);
 }
 
 // Define john integration
@@ -223,7 +213,7 @@ struct fmt_main fmt_EPI =
 		"EPiServer SID",
 		"SHA1 32/" ARCH_BITS_STR,
 		"", // benchmark comment
-		0, // benchmark length
+		7, // benchmark length
 		0,
 		PLAINTEXT_LENGTH,
 		BINARY_LENGTH,
@@ -265,13 +255,8 @@ struct fmt_main fmt_EPI =
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,

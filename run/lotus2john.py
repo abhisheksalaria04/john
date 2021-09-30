@@ -17,6 +17,7 @@ import os
 import struct
 from binascii import hexlify
 
+
 def process_file(filename):
     dataSize = os.path.getsize(filename)
     if dataSize < 0xD8:
@@ -43,13 +44,14 @@ def process_file(filename):
         assert 0
 
     # read blob of size wUserBlobSize
-    sys.stdout.write("%s:%s\n" % (os.path. basename(filename),
+    sys.stdout.write("%s:%s\n" % (os.path.basename(filename),
         hexlify(f.read(wUserBlobSize)).decode("ascii").upper()))
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         sys.stderr.write("Usage: %s [Lotus Notes ID file(s)]\n" % sys.argv[0])
-        sys.exit(-1)
+        sys.exit(1)
 
     for i in range(1, len(sys.argv)):
         process_file(sys.argv[i])

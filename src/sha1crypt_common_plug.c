@@ -11,10 +11,11 @@
 #include "base64_convert.h"
 #include "johnswap.h"
 #include "sha1crypt_common.h"
-#include "memdbg.h"
 
 
 struct fmt_tests sha1crypt_common_tests[] = {
+	/* retroactively added hashcat's test vector for benchmark compatibility */
+	{"$sha1$20000$75552156$HhYMDdaEHiK3eMIzTldOFPnw.s2Q", "hashcat"},
 	{"$sha1$64000$wnUR8T1U$vt1TFQ50tBMFgkflAFAOer2CwdYZ", "password"},
 	{"$sha1$40000$jtNX3nZ2$hBNaIXkt4wBI2o5rsi8KejSjNqIq", "password"},
 	{"$sha1$64000$wnUR8T1U$wmwnhQ4lpo/5isi5iewkrHN7DjrT", "123456"},
@@ -63,10 +64,10 @@ err:;
 }
 
 #define TO_BINARY(b1, b2, b3) \
-	value = (ARCH_WORD_32)atoi64[ARCH_INDEX(pos[0])] | \
-		((ARCH_WORD_32)atoi64[ARCH_INDEX(pos[1])] << 6) | \
-		((ARCH_WORD_32)atoi64[ARCH_INDEX(pos[2])] << 12) | \
-		((ARCH_WORD_32)atoi64[ARCH_INDEX(pos[3])] << 18); \
+	value = (uint32_t)atoi64[ARCH_INDEX(pos[0])] | \
+		((uint32_t)atoi64[ARCH_INDEX(pos[1])] << 6) | \
+		((uint32_t)atoi64[ARCH_INDEX(pos[2])] << 12) | \
+		((uint32_t)atoi64[ARCH_INDEX(pos[3])] << 18); \
 	pos += 4; \
 	out[b1] = value >> 16; \
 	out[b2] = value >> 8; \
@@ -76,10 +77,10 @@ void * sha1crypt_common_get_binary(char * ciphertext) {
 	static union {
                 unsigned char c[BINARY_SIZE + 16];
                 ARCH_WORD dummy;
-				ARCH_WORD_32 swap[1];
+				uint32_t swap[1];
         } buf;
         unsigned char *out = buf.c;
-	ARCH_WORD_32 value;
+	uint32_t value;
 
 	char *pos = strrchr(ciphertext, '$') + 1;
 	int i = 0;

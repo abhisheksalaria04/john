@@ -52,7 +52,6 @@ john_register_one(&fmt_rawSHA1_axcrypt);
 #include <omp.h>
 #endif
 #include "simd-intrinsics.h"
-#include "memdbg.h"
 
 #define AX_FORMAT			1
 #define RAW_FORMAT			2
@@ -67,7 +66,7 @@ john_register_one(&fmt_rawSHA1_axcrypt);
 #endif
 
 #define BENCHMARK_COMMENT		""
-#define BENCHMARK_LENGTH		-1
+#define BENCHMARK_LENGTH		0x107
 
 #define BINARY_SIZE				DIGEST_SIZE
 #define BINARY_ALIGN			4
@@ -76,7 +75,8 @@ john_register_one(&fmt_rawSHA1_axcrypt);
 #define PLAINTEXT_LENGTH		55
 #define MIN_KEYS_PER_CRYPT		NBKEYS
 #define MAX_KEYS_PER_CRYPT		NBKEYS
-#define GETPOS(i, index)		( (index&(SIMD_COEF_32-1))*4 + ((i)&(0xffffffff-3))*SIMD_COEF_32 + (3-((i)&3)) + (unsigned int)index/SIMD_COEF_32*SHA_BUF_SIZ*4*SIMD_COEF_32 ) //for endianity conversion
+#define FMT_IS_BE
+#include "common-simd-getpos.h"
 #else
 #define PLAINTEXT_LENGTH		125
 #define MIN_KEYS_PER_CRYPT		1
@@ -84,11 +84,11 @@ john_register_one(&fmt_rawSHA1_axcrypt);
 #endif
 
 #ifdef SIMD_COEF_32
-static ARCH_WORD_32 (*saved_key)[SHA_BUF_SIZ*NBKEYS];
-static ARCH_WORD_32 (*crypt_key)[DIGEST_SIZE/4*NBKEYS];
+static uint32_t (*saved_key)[SHA_BUF_SIZ*NBKEYS];
+static uint32_t (*crypt_key)[DIGEST_SIZE/4*NBKEYS];
 #else
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
-static ARCH_WORD_32 (*crypt_key)[DIGEST_SIZE / 4];
+static uint32_t (*crypt_key)[DIGEST_SIZE / 4];
 #endif
 
 static unsigned algo;
@@ -99,12 +99,7 @@ static unsigned SSEi_flags;
 static void init(struct fmt_main *self)
 {
 #ifdef _OPENMP
-	int omp_t;
-
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
+	omp_autotune(self, OMP_SCALE);
 #endif
 #ifdef SIMD_COEF_32
 	saved_key = mem_calloc_align(self->params.max_keys_per_crypt/NBKEYS,
@@ -173,91 +168,19 @@ static int get_hash_5(int index) { return crypt_key[index][pos] & PH_MASK_5; }
 static int get_hash_6(int index) { return crypt_key[index][pos] & PH_MASK_6; }
 #endif
 
-static int binary_hash_0(void *binary) { return ((ARCH_WORD_32*)binary)[pos] & PH_MASK_0; }
-static int binary_hash_1(void *binary) { return ((ARCH_WORD_32*)binary)[pos] & PH_MASK_1; }
-static int binary_hash_2(void *binary) { return ((ARCH_WORD_32*)binary)[pos] & PH_MASK_2; }
-static int binary_hash_3(void *binary) { return ((ARCH_WORD_32*)binary)[pos] & PH_MASK_3; }
-static int binary_hash_4(void *binary) { return ((ARCH_WORD_32*)binary)[pos] & PH_MASK_4; }
-static int binary_hash_5(void *binary) { return ((ARCH_WORD_32*)binary)[pos] & PH_MASK_5; }
-static int binary_hash_6(void *binary) { return ((ARCH_WORD_32*)binary)[pos] & PH_MASK_6; }
+static int binary_hash_0(void *binary) { return ((uint32_t*)binary)[pos] & PH_MASK_0; }
+static int binary_hash_1(void *binary) { return ((uint32_t*)binary)[pos] & PH_MASK_1; }
+static int binary_hash_2(void *binary) { return ((uint32_t*)binary)[pos] & PH_MASK_2; }
+static int binary_hash_3(void *binary) { return ((uint32_t*)binary)[pos] & PH_MASK_3; }
+static int binary_hash_4(void *binary) { return ((uint32_t*)binary)[pos] & PH_MASK_4; }
+static int binary_hash_5(void *binary) { return ((uint32_t*)binary)[pos] & PH_MASK_5; }
+static int binary_hash_6(void *binary) { return ((uint32_t*)binary)[pos] & PH_MASK_6; }
 
-#ifdef SIMD_COEF_32
-static void set_key(char *key, int index)
-{
-#if ARCH_ALLOWS_UNALIGNED
-	const ARCH_WORD_32 *wkey = (ARCH_WORD_32*)key;
-#else
-	char buf_aligned[PLAINTEXT_LENGTH + 1] JTR_ALIGN(sizeof(uint32_t));
-	const ARCH_WORD_32 *wkey = (uint32_t*)(is_aligned(key, sizeof(uint32_t)) ?
-	                                       key : strcpy(buf_aligned, key));
-#endif
-	ARCH_WORD_32 *keybuffer = &((ARCH_WORD_32*)saved_key)[(index&(SIMD_COEF_32-1)) + (unsigned int)index/SIMD_COEF_32*SHA_BUF_SIZ*SIMD_COEF_32];
-	ARCH_WORD_32 *keybuf_word = keybuffer;
-	unsigned int len;
-	ARCH_WORD_32 temp;
-
-	len = 0;
-	while((unsigned char)(temp = *wkey++)) {
-		if (!(temp & 0xff00))
-		{
-			*keybuf_word = JOHNSWAP((temp & 0xff) | (0x80 << 8));
-			len++;
-			goto key_cleaning;
-		}
-		if (!(temp & 0xff0000))
-		{
-			*keybuf_word = JOHNSWAP((temp & 0xffff) | (0x80 << 16));
-			len+=2;
-			goto key_cleaning;
-		}
-		if (!(temp & 0xff000000))
-		{
-			*keybuf_word = JOHNSWAP(temp | (0x80U << 24));
-			len+=3;
-			goto key_cleaning;
-		}
-		*keybuf_word = JOHNSWAP(temp);
-		len += 4;
-		keybuf_word += SIMD_COEF_32;
-	}
-	*keybuf_word = 0x80000000;
-
-key_cleaning:
-	keybuf_word += SIMD_COEF_32;
-	while(*keybuf_word) {
-		*keybuf_word = 0;
-		keybuf_word += SIMD_COEF_32;
-	}
-	keybuffer[15*SIMD_COEF_32] = len << 3;
-}
-#else
-static void set_key(char *key, int index)
-{
-	strnzcpy(saved_key[index], key, PLAINTEXT_LENGTH+1);
-}
-#endif
-
-#ifdef SIMD_COEF_32
-static char *get_key(int index)
-{
-	static char out[PLAINTEXT_LENGTH + 1];
-	unsigned int i;
-	ARCH_WORD_32 len = ((ARCH_WORD_32*)saved_key)[15*SIMD_COEF_32 + (index&(SIMD_COEF_32-1)) + (unsigned int)index/SIMD_COEF_32*SHA_BUF_SIZ*SIMD_COEF_32] >> 3;
-
-	for(i=0;i<len;i++)
-		out[i] = ((char*)saved_key)[GETPOS(i, index)];
-	out[i] = 0;
-	return (char*)out;
-}
-#else
-static char *get_key(int index) {
-	return saved_key[index];
-}
-#endif
+#include "common-simd-setkey32.h"
 
 static void *get_binary(char *ciphertext)
 {
-	static ARCH_WORD_32 full[DIGEST_SIZE / 4];
+	static uint32_t full[DIGEST_SIZE / 4];
 	unsigned char *realcipher = (unsigned char*)full;
 
 	memset(full, 0, sizeof(full)); // since ax-crypt 'may' be short.
@@ -267,7 +190,9 @@ static void *get_binary(char *ciphertext)
 	               flg_Base64_MIME_TRAIL_EQ, 0);
 
 #ifdef SIMD_COEF_32
+#if ARCH_LITTLE_ENDIAN
 	alter_endianity(realcipher, DIGEST_SIZE);
+#endif
 #ifdef REVERSE_STEPS
 	if (algo == RAW_FORMAT)
 		sha1_reverse(full);
@@ -282,7 +207,7 @@ static void *get_binary(char *ciphertext)
 static char *source(char *source, void *binary)
 {
 	static char hex[CIPHERTEXT_LENGTH + 1] = FORMAT_TAG;
-	ARCH_WORD_32 hash[DIGEST_SIZE / 4];
+	uint32_t hash[DIGEST_SIZE / 4];
 	char *p;
 	int i, j;
 
@@ -298,13 +223,15 @@ static char *source(char *source, void *binary)
 		sha1_unreverse3(hash);
 	}
 #endif
+#if ARCH_LITTLE_ENDIAN
 	alter_endianity(hash, DIGEST_SIZE);
+#endif
 #else
 	if (algo == AX_FORMAT)
 		hash[4] = 0;
 #endif
 
-#if ARCH_LITTLE_ENDIAN==0
+#if !ARCH_LITTLE_ENDIAN
 	alter_endianity(hash, DIGEST_SIZE);
 #endif
 
@@ -348,9 +275,9 @@ static int cmp_all(void *binary, int count) {
 
 	for (index = 0; index < count; index++)
 #ifdef SIMD_COEF_32
-		if (((ARCH_WORD_32*)binary)[pos] == ((ARCH_WORD_32*)crypt_key)[(index&(SIMD_COEF_32-1)) + (unsigned int)index/SIMD_COEF_32*5*SIMD_COEF_32 + pos*SIMD_COEF_32])
+		if (((uint32_t*)binary)[pos] == ((uint32_t*)crypt_key)[(index&(SIMD_COEF_32-1)) + (unsigned int)index/SIMD_COEF_32*5*SIMD_COEF_32 + pos*SIMD_COEF_32])
 #else
-		if ( ((ARCH_WORD_32*)binary)[0] == crypt_key[index][0] )
+		if ( ((uint32_t*)binary)[0] == crypt_key[index][0] )
 #endif
 			return 1;
 	return 0;
@@ -359,7 +286,7 @@ static int cmp_all(void *binary, int count) {
 static int cmp_one(void *binary, int index)
 {
 #ifdef SIMD_COEF_32
-	return (((ARCH_WORD_32 *) binary)[pos] == ((ARCH_WORD_32*)crypt_key)[(index&(SIMD_COEF_32-1)) + (unsigned int)index/SIMD_COEF_32*5*SIMD_COEF_32 + pos*SIMD_COEF_32]);
+	return (((uint32_t *) binary)[pos] == ((uint32_t*)crypt_key)[(index&(SIMD_COEF_32-1)) + (unsigned int)index/SIMD_COEF_32*5*SIMD_COEF_32 + pos*SIMD_COEF_32]);
 #else
 	return !memcmp(binary, crypt_key[index], digest_size);
 #endif
@@ -368,7 +295,7 @@ static int cmp_one(void *binary, int index)
 static int cmp_exact(char *source, int index)
 {
 #ifdef SIMD_COEF_32
-	ARCH_WORD_32 crypt_key[DIGEST_SIZE / 4];
+	uint32_t crypt_key[DIGEST_SIZE / 4];
 	SHA_CTX ctx;
 	char *key = get_key(index);
 
@@ -376,7 +303,9 @@ static int cmp_exact(char *source, int index)
 	SHA1_Update(&ctx, key, strlen(key));
 	SHA1_Final((void*)crypt_key, &ctx);
 
+#if ARCH_LITTLE_ENDIAN
 	alter_endianity(crypt_key, DIGEST_SIZE);
+#endif
 #ifdef REVERSE_STEPS
 	if (algo == RAW_FORMAT)
 		sha1_reverse(crypt_key);
@@ -479,8 +408,8 @@ struct fmt_main fmt_rawSHA1_axcrypt = {
 		init_ax,
 		done,
 		fmt_default_reset,
-		rawsha1_axcrypt_prepare,
-		rawsha1_common_valid,
+		rawsha1_common_prepare,
+		rawsha1_axcrypt_valid,
 		rawsha1_axcrypt_split,
 		get_binary,
 		fmt_default_salt,

@@ -47,14 +47,13 @@ john_register_one(&fmt_PHPS);
 #include "formats.h"
 #include "dynamic.h"
 #include "options.h"
-#include "memdbg.h"
 
 #define FORMAT_LABEL		"PHPS"
 #define FORMAT_NAME		"" /* md5(md5($pass).$salt) */
 
 #define ALGORITHM_NAME		"?" /* filled in by md5-gen */
 #define BENCHMARK_COMMENT	""
-#define BENCHMARK_LENGTH	0
+#define BENCHMARK_LENGTH	7
 
 #define MD5_BINARY_SIZE		16
 #define MD5_HEX_SIZE		(MD5_BINARY_SIZE * 2)
@@ -149,22 +148,24 @@ static char *our_split(char *ciphertext, int index, struct fmt_main *self)
 static int phps_valid(char *ciphertext, struct fmt_main *self)
 {
 	int i;
-	if (!ciphertext ) // || strlen(ciphertext) < CIPHERTEXT_LENGTH)
+
+	if (!ciphertext )
 		return 0;
 
 	get_ptr();
-	i = strlen(ciphertext);
+	i = strnlen(ciphertext, CIPHERTEXT_LENGTH + 1);
 
 	if (i != CIPHERTEXT_LENGTH) {
 		int val = pDynamic_6->methods.valid(ciphertext, pDynamic_6);
 		char *cp;
 		int wanted_len = 3+1; // salt length + length of the '$' char.
 
-		if (!val) return 0;
+		if (!val)
+			return 0;
 		cp = strrchr(ciphertext, '$');
 		if (strstr(ciphertext, "$HEX$"))
 			wanted_len += 3; // salt is in hex.
-		return cp && strlen(cp)==wanted_len;
+		return cp && strlen(cp) == wanted_len;
 	}
 
 	if (strncmp(ciphertext, "$PHPS$", 6) != 0)
@@ -241,15 +242,6 @@ static void get_ptr() {
 		link_funcs();
 	}
 }
-
-/**
- * GNU Emacs settings: K&R with 1 tab indent.
- * Local Variables:
- * c-file-style: "k&r"
- * c-basic-offset: 8
- * indent-tabs-mode: t
- * End:
- */
 
 #endif /* plugin stanza */
 

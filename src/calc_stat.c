@@ -14,7 +14,6 @@
 #include <math.h>
 #include <string.h>
 #include "memory.h"
-#include "memdbg.h"
 
 #define C2I(c) ((unsigned int)(unsigned char)(c))
 
@@ -22,7 +21,18 @@ unsigned int *proba1;
 unsigned int *proba2;
 unsigned int *first;
 
+#ifdef HAVE_LIBFUZZER
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+	return 0;
+}
+#endif
+
+#ifdef HAVE_LIBFUZZER
+int main_dummy(int argc, char **argv)
+#else
 int main(int argc, char **argv)
+#endif
 {
 	FILE *fichier;
 	char *ligne;
@@ -185,8 +195,6 @@ int main(int argc, char **argv)
 
 	MEM_FREE(ligne);
 	fclose(fichier);
-
-	MEMDBG_PROGRAM_EXIT_CHECKS(stderr);
 
 	return 0;
 }

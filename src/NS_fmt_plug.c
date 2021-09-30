@@ -51,7 +51,6 @@ john_register_one(&fmt_NS);
 #include "dynamic.h"
 #include "base64_convert.h"
 #include "johnswap.h"
-#include "memdbg.h"
 
 #define FORMAT_LABEL			"md5ns"
 #define FORMAT_NAME			"Netscreen"
@@ -62,7 +61,7 @@ john_register_one(&fmt_NS);
 #endif
 
 #define BENCHMARK_COMMENT		""
-#define BENCHMARK_LENGTH		0
+#define BENCHMARK_LENGTH		7
 
 // set PLAINTEXT_LENGTH to 0, so dyna will set this
 #define PLAINTEXT_LENGTH		0
@@ -70,7 +69,7 @@ john_register_one(&fmt_NS);
 #define BINARY_SIZE			16
 #define SALT_SIZE			32
 #define DYNA_SALT_SIZE		(sizeof(char*))
-#define BINARY_ALIGN		sizeof(ARCH_WORD_32)
+#define BINARY_ALIGN		sizeof(uint32_t)
 #define SALT_ALIGN			4
 
 static struct fmt_tests tests[] = {
@@ -91,7 +90,7 @@ static struct fmt_main *pDynamic;
 static void our_init(struct fmt_main *self);
 static void get_ptr();
 
-static ARCH_WORD_32 *get_binary(char *ciphertext);
+static uint32_t *get_binary(char *ciphertext);
 static int NS_valid(char *ciphertext, struct fmt_main *self);
 
 /* this function converts a 'native' phps signature string into a $dynamic_6$ syntax string */
@@ -201,24 +200,26 @@ static int NS_valid(char *ciphertext, struct fmt_main *self)
 {
 	char *password;
 	static char *netscreen = "nrcstn" ;
-        static int  p[] = { 0, 6, 12, 17, 23, 29 };
+	static int  p[] = { 0, 6, 12, 17, 23, 29 };
 	int i;
 
-	password = ciphertext;
+	password = strchr(ciphertext, '$');
 
-	while ((*password != '$') && (*password != '\0' ))
-		password++;
-	if (*password == '\0') return 0;
+	if (!password)
+		return 0;
 
 	if ((int)(password - ciphertext) > SALT_SIZE)
 		return 0;
 
 	password++;
 
-	if (strlen(password) != 30) return 0;
-        if (strspn(password, b64) != 30) return 0;
+	if (strnlen(password, 31) != 30)
+		return 0;
+	if (strspn(password, b64) != 30)
+		return 0;
 	for (i = 0; i < 6 ; i++)
-		if (netscreen[i] != password[p[i]]) return 0;
+		if (netscreen[i] != password[p[i]])
+			return 0;
 
 	for (i = 0; i < 30 ; i++) {
 		char c = password[i];
@@ -233,13 +234,13 @@ static int NS_valid(char *ciphertext, struct fmt_main *self)
 }
 
 /* original binary for the original hash. We use this also in convert() */
-static ARCH_WORD_32 *get_binary(char *ciphertext)
+static uint32_t *get_binary(char *ciphertext)
 {
 	static union {
 		unsigned long dummy;
-		ARCH_WORD_32 i[BINARY_SIZE/sizeof(ARCH_WORD_32)];
+		uint32_t i[BINARY_SIZE/sizeof(uint32_t)];
 	} _out;
-	ARCH_WORD_32 *out = _out.i;
+	uint32_t *out = _out.i;
 	char unscrambled[24];
 	int i;
 	MD5_u32plus a, b, c;

@@ -31,24 +31,23 @@ john_register_one(&fmt_nsec3);
 #include <ctype.h>
 #include <string.h>
 #include <stdint.h>
-#include "sha.h"
 
+#include "sha.h"
 #include "arch.h"
 #include "params.h"
 #include "common.h"
 #include "formats.h"
-#include "memdbg.h"
 
 #define FORMAT_LABEL                    "nsec3"
 #define FORMAT_NAME                     "DNSSEC NSEC3"
 #define ALGORITHM_NAME                  "32/" ARCH_BITS_STR
 #define BENCHMARK_COMMENT               ""
-#define BENCHMARK_LENGTH                0
+#define BENCHMARK_LENGTH                0x107
 #define PLAINTEXT_LENGTH                125
 #define MIN_KEYS_PER_CRYPT              1
 #define MAX_KEYS_PER_CRYPT              1
 #define BINARY_SIZE                     20
-#define BINARY_ALIGN                    sizeof(ARCH_WORD_32)
+#define BINARY_ALIGN                    sizeof(uint32_t)
 #define N3_MAX_SALT_SIZE                255
 #define N3_MAX_ZONE_SIZE                255
 #define HASH_LENGTH                     20
@@ -79,7 +78,7 @@ static unsigned char saved_key[PLAINTEXT_LENGTH + 1];
 static unsigned char saved_wf_label[PLAINTEXT_LENGTH + 2];
 
 static SHA_CTX sha_ctx;
-static ARCH_WORD_32 crypt_out[5];
+static uint32_t crypt_out[5];
 
 static void convert_label_wf(void)
 {
@@ -259,16 +258,17 @@ static int salt_hash(void *salt)
 {
 	unsigned int hash = 0;
 	int i;
+
 	for (i = 0; i < SALT_SIZE; ++i) {
 		hash <<= 1;
-		hash += (unsigned char)((unsigned char *)salt)[i];
-		if (hash >> 10) {
-			hash ^= hash >> 10;
-			hash &= 0x3FF;
+		hash += ((unsigned char *)salt)[i];
+		if (hash >> SALT_HASH_LOG) {
+			hash ^= hash >> SALT_HASH_LOG;
+			hash &= (SALT_HASH_SIZE - 1);
 		}
 	}
-	hash ^= hash >> 10;
-	hash &= 0x3FF;
+	hash ^= hash >> SALT_HASH_LOG;
+	hash &= (SALT_HASH_SIZE - 1);
 
 	return hash;
 }
@@ -280,10 +280,7 @@ static void set_salt(void *salt)
 
 static void set_key(char *key, int index)
 {
-	saved_key_length = strlen(key);
-	if (saved_key_length > PLAINTEXT_LENGTH)
-		saved_key_length = PLAINTEXT_LENGTH;
-	memcpy(saved_key, key, saved_key_length);
+	saved_key_length = strnzcpyn((char*)saved_key, key, sizeof(saved_key));
 	convert_label_wf();
 }
 
@@ -340,7 +337,7 @@ struct fmt_main fmt_nsec3 = {
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_8_BIT,
+		FMT_8_BIT | FMT_HUGE_INPUT,
 #if FMT_MAIN_VERSION > 11
 		{ NULL },
 #endif
@@ -360,7 +357,7 @@ struct fmt_main fmt_nsec3 = {
 #endif
 		fmt_default_source,
 		{
-			fmt_default_binary_hash /* Not usable with $SOURCE_HASH$ */
+			fmt_default_binary_hash
 		},
 		salt_hash,
 		NULL,
@@ -370,7 +367,7 @@ struct fmt_main fmt_nsec3 = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			fmt_default_get_hash /* Not usable with $SOURCE_HASH$ */
+			fmt_default_get_hash
 		},
 		cmp_all,
 		cmp_all,

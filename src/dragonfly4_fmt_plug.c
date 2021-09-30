@@ -19,20 +19,15 @@ john_register_one(&fmt_dragonfly4_32);
 john_register_one(&fmt_dragonfly4_64);
 #else
 
-#include "sha2.h"
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "arch.h"
 #include "params.h"
 #include "common.h"
 #include "formats.h"
-
-#ifdef _OPENMP
-#ifndef OMP_SCALE
-#define OMP_SCALE			2048  // tuned on K8-dual HT
-#endif
-#include <omp.h>
-#endif
-#include "memdbg.h"
+#include "sha2.h"
 
 #define FORMAT_LABEL_32			"dragonfly4-32"
 #define FORMAT_LABEL_64			"dragonfly4-64"
@@ -41,13 +36,13 @@ john_register_one(&fmt_dragonfly4_64);
 #define FORMAT_TAG				"$4$"
 #define FORMAT_TAG_LEN			(sizeof(FORMAT_TAG)-1)
 #if ARCH_BITS >= 64
-#define ALGORITHM_NAME			"SHA512 64/" ARCH_BITS_STR " " SHA2_LIB
+#define ALGORITHM_NAME			"SHA512 64/" ARCH_BITS_STR
 #else
-#define ALGORITHM_NAME			"SHA512 32/" ARCH_BITS_STR " " SHA2_LIB
+#define ALGORITHM_NAME			"SHA512 32/" ARCH_BITS_STR
 #endif
 
 #define BENCHMARK_COMMENT		""
-#define BENCHMARK_LENGTH		0
+#define BENCHMARK_LENGTH		7
 
 #define PLAINTEXT_LENGTH		125
 #define CIPHERTEXT_LENGTH		84
@@ -60,7 +55,11 @@ john_register_one(&fmt_dragonfly4_64);
 #define SALT_ALIGN			1
 
 #define MIN_KEYS_PER_CRYPT		1
-#define MAX_KEYS_PER_CRYPT		1
+#define MAX_KEYS_PER_CRYPT		128
+
+#ifndef OMP_SCALE
+#define OMP_SCALE			2  // Tuned w/ MKPC for core i7
+#endif
 
 static struct fmt_tests tests_32[] = {
 	{"$4$7E48ul$K4u43llx1P184KZBoILl2hnFLBHj6.486TtxWA.EA1pLZuQS7P5k0LQqyEULux47.5vttDbSo/Cbpsez.AUI", "magnum"},
@@ -82,21 +81,15 @@ static struct fmt_tests tests_64[] = {
 
 static int (*saved_len);
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
-static ARCH_WORD_32 (*crypt_out)
-    [(BINARY_SIZE + sizeof(ARCH_WORD_32) - 1) / sizeof(ARCH_WORD_32)];
+static uint32_t (*crypt_out)
+    [(BINARY_SIZE + sizeof(uint32_t) - 1) / sizeof(uint32_t)];
 static char *cur_salt;
 static int salt_len;
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	int omp_t;
+	omp_autotune(self, OMP_SCALE);
 
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
 	saved_len = mem_calloc(self->params.max_keys_per_crypt,
 	                       sizeof(*saved_len));
 	saved_key = mem_calloc(self->params.max_keys_per_crypt,
@@ -132,10 +125,10 @@ static int valid(char *ciphertext, struct fmt_main *self)
 }
 
 #define TO_BINARY(b1, b2, b3) \
-	value = (ARCH_WORD_32)atoi64[ARCH_INDEX(pos[0])] | \
-		((ARCH_WORD_32)atoi64[ARCH_INDEX(pos[1])] << 6) | \
-		((ARCH_WORD_32)atoi64[ARCH_INDEX(pos[2])] << 12) | \
-		((ARCH_WORD_32)atoi64[ARCH_INDEX(pos[3])] << 18); \
+	value = (uint32_t)atoi64[ARCH_INDEX(pos[0])] | \
+		((uint32_t)atoi64[ARCH_INDEX(pos[1])] << 6) | \
+		((uint32_t)atoi64[ARCH_INDEX(pos[2])] << 12) | \
+		((uint32_t)atoi64[ARCH_INDEX(pos[3])] << 18); \
 	pos += 4; \
 	out[b1] = value >> 16; \
 	out[b2] = value >> 8; \
@@ -145,8 +138,8 @@ static int valid(char *ciphertext, struct fmt_main *self)
 // We are actually missing the last 16 bits with this implementation.
 static void *get_binary(char *ciphertext)
 {
-	static ARCH_WORD_32 outbuf[BINARY_SIZE/4];
-	ARCH_WORD_32 value;
+	static uint32_t outbuf[BINARY_SIZE/4];
+	uint32_t value;
 	char *pos;
 	unsigned char *out = (unsigned char*)outbuf;
 	int i;
@@ -157,31 +150,22 @@ static void *get_binary(char *ciphertext)
 	for (i = 0; i < 20; i++) {
 		TO_BINARY(i, i + 21, i + 42);
 	}
-	value = (ARCH_WORD_32)atoi64[ARCH_INDEX(pos[0])] |
-		((ARCH_WORD_32)atoi64[ARCH_INDEX(pos[1])] << 6) |
-		((ARCH_WORD_32)atoi64[ARCH_INDEX(pos[2])] << 12) |
-		((ARCH_WORD_32)atoi64[ARCH_INDEX(pos[3])] << 18);
+	value = (uint32_t)atoi64[ARCH_INDEX(pos[0])] |
+		((uint32_t)atoi64[ARCH_INDEX(pos[1])] << 6) |
+		((uint32_t)atoi64[ARCH_INDEX(pos[2])] << 12) |
+		((uint32_t)atoi64[ARCH_INDEX(pos[3])] << 18);
 	out[20] = value >> 16;
 	out[41] = value >> 8;
 
 	return (void *)out;
 }
 
-static int get_hash_0(int index) { return crypt_out[index][0] & PH_MASK_0; }
-static int get_hash_1(int index) { return crypt_out[index][0] & PH_MASK_1; }
-static int get_hash_2(int index) { return crypt_out[index][0] & PH_MASK_2; }
-static int get_hash_3(int index) { return crypt_out[index][0] & PH_MASK_3; }
-static int get_hash_4(int index) { return crypt_out[index][0] & PH_MASK_4; }
-static int get_hash_5(int index) { return crypt_out[index][0] & PH_MASK_5; }
-static int get_hash_6(int index) { return crypt_out[index][0] & PH_MASK_6; }
+#define COMMON_GET_HASH_VAR crypt_out
+#include "common-get-hash.h"
 
 static void set_key(char *key, int index)
 {
-	int len = strlen(key);
-	saved_len[index] = len;
-	if (len > PLAINTEXT_LENGTH)
-		len = saved_len[index] = PLAINTEXT_LENGTH;
-	memcpy(saved_key[index], key, len);
+	saved_len[index] = strnzcpyn(saved_key[index], key, sizeof(*saved_key));
 }
 
 static char *get_key(int index)
@@ -193,12 +177,11 @@ static char *get_key(int index)
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
 	const int count = *pcount;
-	int index = 0;
+	int index;
 #ifdef _OPENMP
 #pragma omp parallel for
-	for (index = 0; index < count; index++)
 #endif
-	{
+	for (index = 0; index < count; index++) {
 		SHA512_CTX ctx;
 
 		SHA512_Init(&ctx);
@@ -211,6 +194,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 		SHA512_Final((unsigned char*)crypt_out[index], &ctx);
 	}
+
 	return count;
 }
 
@@ -260,10 +244,9 @@ static void *get_salt_64(char *ciphertext)
 
 static int cmp_all(void *binary, int count)
 {
-	int index = 0;
-#ifdef _OPENMP
-	for (; index < count; index++)
-#endif
+	int index;
+
+	for (index = 0; index < count; index++)
 		if (!memcmp(binary, crypt_out[index], USED_BINARY_SIZE))
 			return 1;
 	return 0;
@@ -339,13 +322,8 @@ struct fmt_main fmt_dragonfly4_32 = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,
@@ -400,13 +378,8 @@ struct fmt_main fmt_dragonfly4_64 = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,

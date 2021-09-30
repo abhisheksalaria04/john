@@ -1,7 +1,5 @@
 #if HAVE_OPENCL
 
-#include <assert.h>
-
 #include "options.h"
 #include "opencl_hash_check_128.h"
 #include "mask_ext.h"
@@ -18,7 +16,6 @@ static cl_uint *zero_buffer = NULL;
 static cl_mem buffer_offset_table, buffer_hash_table, buffer_return_hashes, buffer_hash_ids, buffer_bitmap_dupe, buffer_bitmaps;
 static struct fmt_main *self;
 
-#include "memdbg.h"
 
 void ocl_hc_128_init(struct fmt_main *_self)
 {
@@ -42,7 +39,7 @@ void ocl_hc_128_prepare_table(struct db_salt *salt) {
 		MEM_FREE(hash_table_128);
 
 	loaded_hashes = (cl_uint*) mem_alloc(4 * num_loaded_hashes * sizeof(cl_uint));
-	hash_ids = (cl_uint*) mem_alloc((3 * num_loaded_hashes + 1) * sizeof(cl_uint));
+	hash_ids = (cl_uint*) mem_calloc((3 * num_loaded_hashes + 1), sizeof(cl_uint));
 
 	last = pw = salt->list;
 	i = 0;
@@ -306,10 +303,8 @@ char* ocl_hc_128_select_bitmap(unsigned int num_ld_hashes)
 		}
 		if (buf_sz >= 536870912)
 			buf_sz = 536870912;
-		assert(!(buf_sz & (buf_sz - 1)));
 		if ((bitmap_size_bits >> 3) > buf_sz)
 			bitmap_size_bits = buf_sz << 3;
-		assert(!(bitmap_size_bits & (bitmap_size_bits - 1)));
 		cmp_steps = 1;
 	}
 
@@ -352,7 +347,6 @@ void ocl_hc_128_crobj(cl_kernel kernel)
 		max_alloc_size_bytes >>= 1;
 	}
 	if (max_alloc_size_bytes >= 536870912) max_alloc_size_bytes = 536870912;
-	assert(!(max_alloc_size_bytes & (max_alloc_size_bytes - 1)));
 
 	if (!cache_size_bytes) cache_size_bytes = 1024;
 
@@ -465,7 +459,7 @@ void ocl_hc_128_rlobj(void)
 		HANDLE_CLERROR(clReleaseMemObject(buffer_hash_ids), "Error Releasing buffer_hash_ids.");
 		HANDLE_CLERROR(clReleaseMemObject(buffer_bitmaps), "Error Releasing buffer_bitmap.");
 		MEM_FREE(zero_buffer);
-		buffer_bitmaps = 0;
+		buffer_bitmaps = NULL;
 	}
 
 	if (loaded_hashes)

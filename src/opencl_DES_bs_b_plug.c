@@ -7,25 +7,28 @@
 
 #ifdef HAVE_OPENCL
 
-#include <assert.h>
 #include <string.h>
 #include <sys/time.h>
 
 #include "options.h"
 #include "opencl_DES_bs.h"
-#include "opencl_DES_hst_dev_shared.h"
+#include "../run/opencl/opencl_DES_hst_dev_shared.h"
 #include "mask_ext.h"
 
-#define CONFIG_FILE 	"$JOHN/kernels/DES_bs_kernel_b_%s.config"
+#if JOHN_SYSTEMWIDE
+#define CONFIG_FILE	JOHN_PRIVATE_HOME "/opencl/DES_bs_kernel_b_%s.config"
+#else
+#define CONFIG_FILE	"$JOHN/opencl/DES_bs_kernel_b_%s.config"
+#endif
+
 #define PADDING 	2048
 
 static cl_kernel **kernels;
-static cl_mem buffer_map, buffer_bs_keys, *buffer_processed_salts = NULL, buffer_unchecked_hashes;
-static WORD current_salt = 0;
+static cl_mem buffer_map, buffer_bs_keys, *buffer_processed_salts, buffer_unchecked_hashes;
+static WORD current_salt;
 
-static int mask_mode = 0;
+static int mask_mode;
 
-#include "memdbg.h"
 
 static int des_crypt_25(int *pcount, struct db_salt *salt);
 
@@ -40,8 +43,6 @@ static void create_clobj_kpc(size_t gws)
 
 	buffer_unchecked_hashes = clCreateBuffer(context[gpu_id], CL_MEM_READ_WRITE, (gws * iter_count + PADDING) * sizeof(DES_bs_vector) * 64, NULL, &ret_code);
 	HANDLE_CLERROR(ret_code, "Create buffer_unchecked_hashes failed.\n");
-
-	assert(gws * iter_count <= ((0x1 << 27) - 1));
 }
 
 static void release_clobj_kpc()
@@ -97,7 +98,7 @@ static void clean_all_buffers()
 	release_clobj();
 	release_clobj_kpc();
 
-	for( i = 0; i < 1; i++) {
+	for ( i = 0; i < 1; i++) {
 		if (kernels[gpu_id][i]) {
 			HANDLE_CLERROR(clReleaseKernel(kernels[gpu_id][i]), "Error releasing kernel");
 			kernels[gpu_id][i] = NULL;
@@ -176,7 +177,7 @@ static void init_kernel(int id_gpu, size_t s_mem_lws, unsigned int use_local_mem
 	char build_opts[600];
 
 	sprintf(build_opts, "-D WORK_GROUP_SIZE="Zu" -D USE_LOCAL_MEM=%u", s_mem_lws, use_local_mem);;
-	opencl_build_kernel("$JOHN/kernels/DES_bs_kernel.cl",
+	opencl_build_kernel("$JOHN/opencl/DES_bs_kernel.cl",
 	                    id_gpu, build_opts, 0);
 	kernels[id_gpu][0] = clCreateKernel(program[id_gpu], "DES_bs_25_b", &ret_code);
 	HANDLE_CLERROR(ret_code, "Failed creating kernel DES_bs_25_b.\n");
@@ -248,7 +249,7 @@ static size_t find_smem_lws_limit(unsigned int use_local_mem, unsigned int force
 			(long double)(end.tv_usec - start.tv_usec) / 1000.000)
 
 /* Sets global_work_size and max_keys_per_crypt. */
-static void gws_tune(size_t gws_init, long double kernel_run_ms, int gws_tune_flag, void (*set_key)(char *, int), WORD test_salt, int mask_mode)
+static void gws_tune(size_t gws_init, long double kernel_run_ms, int gws_tune_flag, struct fmt_main *format, WORD test_salt, int mask_mode)
 {
 	unsigned int i;
 	char key[PLAINTEXT_LENGTH + 1] = "alterit";
@@ -274,9 +275,6 @@ static void gws_tune(size_t gws_init, long double kernel_run_ms, int gws_tune_fl
 		gws_limit >>= 1;
 #endif
 
-	assert(gws_limit > PADDING);
-	assert(!(gws_limit & (gws_limit - 1)));
-
 	if (gws_tune_flag)
 		global_work_size = gws_init;
 
@@ -288,10 +286,11 @@ static void gws_tune(size_t gws_init, long double kernel_run_ms, int gws_tune_fl
 		create_clobj_kpc(global_work_size);
 		set_kernel_args_kpc();
 
+		format->methods.clear_keys();
 		for (i = 0; i < (global_work_size << des_log_depth); i++) {
 			key[i & 3] = i & 255;
 			key[(i & 3) + 3] = i | 0x3F;
-			set_key(key, i);
+			format->methods.set_key(key, i);
 		}
 		set_salt(&test_salt);
 
@@ -317,9 +316,13 @@ static void gws_tune(size_t gws_init, long double kernel_run_ms, int gws_tune_fl
 	set_kernel_args_kpc();
 
 	/* for hash_ids[2*x + 1], 27 bits for storing gid and 5 bits for bs depth. */
-	assert(global_work_size <= ((1U << 28) - 1));
-	fmt_opencl_DES.params.max_keys_per_crypt = global_work_size << des_log_depth;
-	fmt_opencl_DES.params.min_keys_per_crypt = 1U << des_log_depth;
+	//assert(global_work_size <= ((1U << 28) - 1));
+	fmt_opencl_DES.params.max_keys_per_crypt =
+		global_work_size << des_log_depth;
+
+	fmt_opencl_DES.params.min_keys_per_crypt =
+		opencl_calc_min_kpc(local_work_size, global_work_size,
+		                    1 << des_log_depth);
 }
 
 static void release_kernel()
@@ -330,7 +333,7 @@ static void release_kernel()
 	}
 }
 
-static void auto_tune_all(long double kernel_run_ms, void (*set_key)(char *, int), WORD test_salt, int mask_mode, size_t extern_lws_limit)
+static void auto_tune_all(long double kernel_run_ms, struct fmt_main *format, WORD test_salt, int mask_mode, size_t extern_lws_limit)
 {
 	unsigned int force_global_keys = 1;
 	unsigned int use_local_mem = 1;
@@ -402,8 +405,8 @@ static void auto_tune_all(long double kernel_run_ms, void (*set_key)(char *, int
 		release_kernel();
 		init_kernel(gpu_id, 0, use_local_mem && s_mem_limited_lws);
 
-		gws_tune(1024, 2 * kernel_run_ms, gws_tune_flag, set_key, test_salt, mask_mode);
-		gws_tune(global_work_size, kernel_run_ms, gws_tune_flag, set_key, test_salt, mask_mode);
+		gws_tune(1024, 2 * kernel_run_ms, gws_tune_flag, format, test_salt, mask_mode);
+		gws_tune(global_work_size, kernel_run_ms, gws_tune_flag, format, test_salt, mask_mode);
 
 		lws_limit = get_kernel_max_lws(gpu_id, kernels[gpu_id][0]);
 
@@ -421,8 +424,6 @@ static void auto_tune_all(long double kernel_run_ms, void (*set_key)(char *, int
 		if (local_work_size > lws_limit)
 			local_work_size = lws_limit;
 
-		assert(local_work_size <= lws_limit);
-
 		if (lws_tune_flag) {
 			time_ms = 0;
 			best_time_ms = 999999.00;
@@ -430,10 +431,12 @@ static void auto_tune_all(long double kernel_run_ms, void (*set_key)(char *, int
 			while (local_work_size <= lws_limit &&
 				local_work_size <= PADDING) {
 				int pcount, i;
+
+				format->methods.clear_keys();
 				for (i = 0; i < (global_work_size << des_log_depth); i++) {
 					key[i & 3] = i & 255;
 					key[(i & 3) + 3] = i ^ 0x3F;
-					set_key(key, i);
+					format->methods.set_key(key, i);
 				}
 				set_salt(&test_salt);
 
@@ -451,14 +454,14 @@ static void auto_tune_all(long double kernel_run_ms, void (*set_key)(char *, int
 #if 0
 	fprintf(stdout, "GWS: "Zu", LWS: "Zu", Limit_smem:"Zu", Limit_kernel:"Zu","
 		"Current time:%Lf, Best time:%Lf\n",
- 		global_work_size, local_work_size, s_mem_limited_lws,
+		global_work_size, local_work_size, s_mem_limited_lws,
 		get_kernel_max_lws(gpu_id, kernels[gpu_id][0]), time_ms,
 		best_time_ms);
 #endif
 				local_work_size *= 2;
 			}
 			local_work_size = best_lws;
-			gws_tune(global_work_size, kernel_run_ms, gws_tune_flag, set_key, test_salt, mask_mode);
+			gws_tune(global_work_size, kernel_run_ms, gws_tune_flag, format, test_salt, mask_mode);
 		}
 	}
 
@@ -499,8 +502,8 @@ static void auto_tune_all(long double kernel_run_ms, void (*set_key)(char *, int
 			init_kernel(gpu_id, local_work_size, use_local_mem);
 		}
 
-		gws_tune(1024, 2 * kernel_run_ms, gws_tune_flag, set_key, test_salt, mask_mode);
-		gws_tune(global_work_size, kernel_run_ms, gws_tune_flag, set_key, test_salt, mask_mode);
+		gws_tune(1024, 2 * kernel_run_ms, gws_tune_flag, format, test_salt, mask_mode);
+		gws_tune(global_work_size, kernel_run_ms, gws_tune_flag, format, test_salt, mask_mode);
 
 		if (global_work_size < s_mem_limited_lws) {
 			s_mem_limited_lws = global_work_size;
@@ -514,14 +517,16 @@ static void auto_tune_all(long double kernel_run_ms, void (*set_key)(char *, int
 			while (local_work_size <= s_mem_limited_lws &&
 				local_work_size <= PADDING) {
 				int pcount, i;
+
 				release_kernel();
 				init_kernel(gpu_id, local_work_size, use_local_mem);
 				set_kernel_args_kpc();
 
+				format->methods.clear_keys();
 				for (i = 0; i < (global_work_size << des_log_depth); i++) {
 					key[i & 3] = i & 255;
 					key[(i & 3) + 3] = i ^ 0x3E;
-					set_key(key, i);
+					format->methods.set_key(key, i);
 				}
 				set_salt(&test_salt);
 
@@ -540,7 +545,7 @@ static void auto_tune_all(long double kernel_run_ms, void (*set_key)(char *, int
 #if 0
 	fprintf(stdout, "GWS: "Zu", LWS: "Zu", Limit_smem:"Zu", Limit_kernel:"Zu","
 		"Current time:%Lf, Best time:%Lf\n",
- 		global_work_size, local_work_size, s_mem_limited_lws,
+		global_work_size, local_work_size, s_mem_limited_lws,
 		get_kernel_max_lws(gpu_id, kernels[gpu_id][0]), time_ms,
 		best_time_ms);
 #endif
@@ -564,15 +569,16 @@ static void auto_tune_all(long double kernel_run_ms, void (*set_key)(char *, int
 			local_work_size = best_lws;
 			release_kernel();
 			init_kernel(gpu_id, local_work_size, use_local_mem);
-			gws_tune(global_work_size, kernel_run_ms, gws_tune_flag, set_key, test_salt, mask_mode);
+			gws_tune(global_work_size, kernel_run_ms, gws_tune_flag, format, test_salt, mask_mode);
 		}
 	}
 	if (lws_tune_flag)
 		save_lws_config(CONFIG_FILE, gpu_id, local_work_size, 0);
 
-	if (options.verbosity > VERB_LEGACY)
-	fprintf(stdout, "GWS: "Zu", LWS: "Zu"\n",
-		global_work_size, local_work_size);
+	if ((!self_test_running && options.verbosity >= VERB_DEFAULT) ||
+	    ocl_always_show_ws)
+		fprintf(stderr, "LWS="Zu" GWS="Zu"%s", local_work_size,
+		        global_work_size, benchmark_running ? " " : "\n");
 }
 
 static void reset(struct db_main *db)
@@ -601,15 +607,15 @@ static void reset(struct db_main *db)
 
 		build_salt(0);
 
-		salt = db -> salts;
+		salt = db->salts;
 		do {
-			salt_val = *(WORD *)(salt -> salt);
+			salt_val = *(WORD *)(salt->salt);
 			build_salt(salt_val);
-		} while((salt = salt -> next));
+		} while((salt = salt->next));
 
 		if (mask_mode) {
 			release_kernel();
-			auto_tune_all(300, fmt_opencl_DES.methods.set_key, salt_val, mask_mode, extern_lws_limit);
+			auto_tune_all(100, &fmt_opencl_DES, salt_val, mask_mode, extern_lws_limit);
 		}
 
 		set_kernel_args_kpc();
@@ -633,7 +639,7 @@ static void reset(struct db_main *db)
 			i++;
 		}
 
-		auto_tune_all(300, fmt_opencl_DES.methods.set_key, salt_val, 0, extern_lws_limit);
+		auto_tune_all(300, &fmt_opencl_DES, salt_val, 0, extern_lws_limit);
 
 		set_kernel_args_kpc();
 
@@ -664,10 +670,10 @@ static int des_crypt_25(int *pcount, struct db_salt *salt)
 
 	process_keys(current_gws, lws);
 
-	if (salt && num_uncracked_hashes(current_salt) != salt -> count &&
+	if (salt && num_uncracked_hashes(current_salt) != salt->count &&
 	/* In case there are duplicate hashes, num_uncracked_hashes is always less than salt->count, as
 	 * num_uncracked_hashes tracks only unique hashes. */
-		num_uncracked_hashes(current_salt) > salt -> count)
+		num_uncracked_hashes(current_salt) > salt->count)
 		update_buffer(salt);
 
 	HANDLE_CLERROR(clSetKernelArg(kernels[gpu_id][0], 1, sizeof(cl_mem), &buffer_processed_salts[current_salt]), "Failed setting kernel argument buffer_processed_salts, kernel DES_bs_25.\n");
@@ -683,10 +689,10 @@ static int des_crypt_25(int *pcount, struct db_salt *salt)
 
 void opencl_DES_bs_b_register_functions(struct fmt_main *fmt)
 {
-	fmt -> methods.done = &clean_all_buffers;
-	fmt -> methods.reset = &reset;
-	fmt -> methods.set_salt = &set_salt;
-	fmt -> methods.crypt_all = &des_crypt_25;
+	fmt->methods.done = &clean_all_buffers;
+	fmt->methods.reset = &reset;
+	fmt->methods.set_salt = &set_salt;
+	fmt->methods.crypt_all = &des_crypt_25;
 
 	opencl_DES_bs_init_global_variables = &init_global_variables;
 }

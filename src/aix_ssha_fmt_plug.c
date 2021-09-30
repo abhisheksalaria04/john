@@ -1,12 +1,14 @@
-/* AIX ssha cracker patch for JtR. Hacked together during April of 2013 by Dhiru
+/*
+ * AIX ssha cracker patch for JtR. Hacked together during April of 2013 by Dhiru
  * Kholia <dhiru at openwall.com> and magnum.
  *
  * Thanks to atom (of hashcat project) and philsmd for discovering and
  * publishing the details of various AIX hashing algorithms.
  *
  * This software is Copyright (c) 2013 Dhiru Kholia <dhiru at openwall.com> and
- * magnum, and
- * it is hereby released to the general public under the following terms:
+ * magnum, and it is hereby released to the general public under the following
+ * terms:
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted.
  */
@@ -22,67 +24,65 @@ john_register_one(&fmt_aixssha512);
 #else
 
 #include <string.h>
-#include <assert.h>
-#include <errno.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "arch.h"
 #include "misc.h"
 #include "common.h"
 #include "formats.h"
 #include "params.h"
 #include "options.h"
-#ifdef _OPENMP
-static int omp_t = 1;
-#include <omp.h>
-#ifndef OMP_SCALE
-#define OMP_SCALE               8 // Tuned on i7 w/HT for SHA-256
-#endif
-#endif
 #include "pbkdf2_hmac_sha1.h"
 #include "pbkdf2_hmac_sha256.h"
 #include "pbkdf2_hmac_sha512.h"
-#include "memdbg.h"
 
-#define FORMAT_LABEL_SHA1	"aix-ssha1"
-#define FORMAT_LABEL_SHA256	"aix-ssha256"
-#define FORMAT_LABEL_SHA512	"aix-ssha512"
-#define FORMAT_NAME_SHA1	"AIX LPA {ssha1}"
-#define FORMAT_NAME_SHA256	"AIX LPA {ssha256}"
-#define FORMAT_NAME_SHA512	"AIX LPA {ssha512}"
+#ifndef OMP_SCALE
+#define OMP_SCALE               4	// MKPC and OMP_SCALE tuned for core i7
+#endif
 
-#define FORMAT_TAG1			"{ssha1}"
-#define FORMAT_TAG256		"{ssha256}"
-#define FORMAT_TAG512		"{ssha512}"
-#define FORMAT_TAG1_LEN		(sizeof(FORMAT_TAG1)-1)
-#define FORMAT_TAG256_LEN	(sizeof(FORMAT_TAG256)-1)
-#define FORMAT_TAG512_LEN	(sizeof(FORMAT_TAG512)-1)
+#define FORMAT_LABEL_SHA1       "aix-ssha1"
+#define FORMAT_LABEL_SHA256     "aix-ssha256"
+#define FORMAT_LABEL_SHA512     "aix-ssha512"
+#define FORMAT_NAME_SHA1        "AIX LPA {ssha1}"
+#define FORMAT_NAME_SHA256      "AIX LPA {ssha256}"
+#define FORMAT_NAME_SHA512      "AIX LPA {ssha512}"
+
+#define FORMAT_TAG1             "{ssha1}"
+#define FORMAT_TAG256           "{ssha256}"
+#define FORMAT_TAG512           "{ssha512}"
+#define FORMAT_TAG1_LEN         (sizeof(FORMAT_TAG1)-1)
+#define FORMAT_TAG256_LEN       (sizeof(FORMAT_TAG256)-1)
+#define FORMAT_TAG512_LEN       (sizeof(FORMAT_TAG512)-1)
 
 #ifdef SIMD_COEF_32
-#define ALGORITHM_NAME_SHA1	"PBKDF2-SHA1 " SHA1_ALGORITHM_NAME
+#define ALGORITHM_NAME_SHA1     "PBKDF2-SHA1 " SHA1_ALGORITHM_NAME
 #else
-#define ALGORITHM_NAME_SHA1	"PBKDF2-SHA1 32/" ARCH_BITS_STR
+#define ALGORITHM_NAME_SHA1     "PBKDF2-SHA1 32/" ARCH_BITS_STR
 #endif
 #ifdef SIMD_COEF_32
-#define ALGORITHM_NAME_SHA256	"PBKDF2-SHA256 " SHA256_ALGORITHM_NAME
+#define ALGORITHM_NAME_SHA256   "PBKDF2-SHA256 " SHA256_ALGORITHM_NAME
 #else
-#define ALGORITHM_NAME_SHA256	"PBKDF2-SHA256 32/" ARCH_BITS_STR
+#define ALGORITHM_NAME_SHA256   "PBKDF2-SHA256 32/" ARCH_BITS_STR
 #endif
 #ifdef SIMD_COEF_64
-#define ALGORITHM_NAME_SHA512	"PBKDF2-SHA512 " SHA512_ALGORITHM_NAME
+#define ALGORITHM_NAME_SHA512   "PBKDF2-SHA512 " SHA512_ALGORITHM_NAME
 #else
-#define ALGORITHM_NAME_SHA512	"PBKDF2-SHA512 32/" ARCH_BITS_STR
+#define ALGORITHM_NAME_SHA512   "PBKDF2-SHA512 32/" ARCH_BITS_STR
 #endif
-#define BENCHMARK_COMMENT	""
-#define BENCHMARK_LENGTH	-1
-#define PLAINTEXT_LENGTH	125 /* actual max in AIX is 255 */
-#define BINARY_SIZE		20
-#define BINARY_ALIGN		4
-#define CMP_SIZE 		BINARY_SIZE - 2
-#define LARGEST_BINARY_SIZE	64
-#define MAX_SALT_SIZE		24
-#define SALT_SIZE		sizeof(struct custom_salt)
-#define SALT_ALIGN		4
-#define MIN_KEYS_PER_CRYPT	1
-#define MAX_KEYS_PER_CRYPT	1
+#define BENCHMARK_COMMENT       ""
+#define BENCHMARK_LENGTH        7
+#define PLAINTEXT_LENGTH        125 /* actual max in AIX is 255 */
+#define BINARY_SIZE             20
+#define BINARY_ALIGN            4
+#define CMP_SIZE                BINARY_SIZE - 2
+#define LARGEST_BINARY_SIZE     64
+#define MAX_SALT_SIZE           24
+#define SALT_SIZE               sizeof(struct custom_salt)
+#define SALT_ALIGN              4
+#define MIN_KEYS_PER_CRYPT      1
+#define MAX_KEYS_PER_CRYPT      1
 
 static struct fmt_tests aixssha_tests1[] = {
 	{"{ssha1}06$T6numGi8BRLzTYnF$AdXq1t6baevg9/cu5QBBk8Xg.se", "whatdoyouwantfornothing$$$$$$"},
@@ -113,22 +113,18 @@ static struct fmt_tests aixssha_tests512[] = {
 };
 
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
-static ARCH_WORD_32 (*crypt_out)[BINARY_SIZE / sizeof(ARCH_WORD_32)];
+static uint32_t (*crypt_out)[BINARY_SIZE / sizeof(uint32_t)];
 
 static struct custom_salt {
 	int iterations;
 	int type;
-	char unsigned salt[MAX_SALT_SIZE + 1];
+	unsigned char salt[MAX_SALT_SIZE + 1];
 } *cur_salt;
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
+	omp_autotune(self, OMP_SCALE);
+
 	saved_key = mem_calloc_align(sizeof(*saved_key),
 			self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
 	crypt_out = mem_calloc_align(sizeof(*crypt_out),
@@ -140,7 +136,7 @@ static void done(void)
 	MEM_FREE(crypt_out);
 	MEM_FREE(saved_key);
 }
-static int inline valid_common(char *ciphertext, struct fmt_main *self, int b64len, char *sig, int siglen)
+static inline int valid_common(char *ciphertext, struct fmt_main *self, int b64len, char *sig, int siglen)
 {
 	char *p = ciphertext;
 	int len;
@@ -212,10 +208,10 @@ static void *get_salt(char *ciphertext)
 }
 
 #define TO_BINARY(b1, b2, b3) {	  \
-	value = (ARCH_WORD_32)atoi64[ARCH_INDEX(pos[0])] | \
-		((ARCH_WORD_32)atoi64[ARCH_INDEX(pos[1])] << 6) | \
-		((ARCH_WORD_32)atoi64[ARCH_INDEX(pos[2])] << 12) | \
-		((ARCH_WORD_32)atoi64[ARCH_INDEX(pos[3])] << 18); \
+	value = (uint32_t)atoi64[ARCH_INDEX(pos[0])] | \
+		((uint32_t)atoi64[ARCH_INDEX(pos[1])] << 6) | \
+		((uint32_t)atoi64[ARCH_INDEX(pos[2])] << 12) | \
+		((uint32_t)atoi64[ARCH_INDEX(pos[3])] << 18); \
 	pos += 4; \
 	out.c[b1] = value >> 16; \
 	out.c[b2] = value >> 8; \
@@ -225,9 +221,9 @@ static void *get_binary(char *ciphertext)
 {
 	static union {
 		unsigned char c[LARGEST_BINARY_SIZE+3];
-		ARCH_WORD_64 dummy;
+		uint64_t dummy;
 	} out;
-	ARCH_WORD_32 value;
+	uint32_t value;
 	char *pos = strrchr(ciphertext, '$') + 1;
 	int len = strlen(pos);
 	int i;
@@ -237,26 +233,21 @@ static void *get_binary(char *ciphertext)
 		TO_BINARY(i, i + 1, i + 2);
 
 	if (len % 3 == 1) {
-		value = (ARCH_WORD_32)atoi64[ARCH_INDEX(pos[0])] |
-			((ARCH_WORD_32)atoi64[ARCH_INDEX(pos[1])] << 6);
+		value = (uint32_t)atoi64[ARCH_INDEX(pos[0])] |
+			((uint32_t)atoi64[ARCH_INDEX(pos[1])] << 6);
 		out.c[i] = value;
 	} else if (len % 3 == 2) { /* sha-1, sha-256 */
-		value = (ARCH_WORD_32)atoi64[ARCH_INDEX(pos[0])] |
-			((ARCH_WORD_32)atoi64[ARCH_INDEX(pos[1])] << 6) |
-			((ARCH_WORD_32)atoi64[ARCH_INDEX(pos[2])] << 12);
+		value = (uint32_t)atoi64[ARCH_INDEX(pos[0])] |
+			((uint32_t)atoi64[ARCH_INDEX(pos[1])] << 6) |
+			((uint32_t)atoi64[ARCH_INDEX(pos[2])] << 12);
 		out.c[i++] = value >> 8;
 		out.c[i++] = value;
 	}
 	return (void *)out.c;
 }
 
-static int get_hash_0(int index) { return crypt_out[index][0] & PH_MASK_0; }
-static int get_hash_1(int index) { return crypt_out[index][0] & PH_MASK_1; }
-static int get_hash_2(int index) { return crypt_out[index][0] & PH_MASK_2; }
-static int get_hash_3(int index) { return crypt_out[index][0] & PH_MASK_3; }
-static int get_hash_4(int index) { return crypt_out[index][0] & PH_MASK_4; }
-static int get_hash_5(int index) { return crypt_out[index][0] & PH_MASK_5; }
-static int get_hash_6(int index) { return crypt_out[index][0] & PH_MASK_6; }
+#define COMMON_GET_HASH_VAR crypt_out
+#include "common-get-hash.h"
 
 static void set_salt(void *salt)
 {
@@ -298,7 +289,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 				int lens[SSE_GROUP_SZ_SHA1], i;
 				unsigned char *pin[SSE_GROUP_SZ_SHA1];
 				union {
-					ARCH_WORD_32 *pout[SSE_GROUP_SZ_SHA1];
+					uint32_t *pout[SSE_GROUP_SZ_SHA1];
 					unsigned char *poutc;
 				} x;
 				for (i = 0; i < SSE_GROUP_SZ_SHA1; ++i) {
@@ -320,7 +311,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 				int lens[SSE_GROUP_SZ_SHA256], i;
 				unsigned char *pin[SSE_GROUP_SZ_SHA256];
 				union {
-					ARCH_WORD_32 *pout[SSE_GROUP_SZ_SHA256];
+					uint32_t *pout[SSE_GROUP_SZ_SHA256];
 					unsigned char *poutc;
 				} x;
 				for (i = 0; i < SSE_GROUP_SZ_SHA256; ++i) {
@@ -342,7 +333,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 				int lens[SSE_GROUP_SZ_SHA512], i;
 				unsigned char *pin[SSE_GROUP_SZ_SHA512];
 				union {
-					ARCH_WORD_32 *pout[SSE_GROUP_SZ_SHA512];
+					uint32_t *pout[SSE_GROUP_SZ_SHA512];
 					unsigned char *poutc;
 				} x;
 				for (i = 0; i < SSE_GROUP_SZ_SHA512; ++i) {
@@ -366,10 +357,11 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 static int cmp_all(void *binary, int count)
 {
-	int index = 0;
-	//dump_stuff_msg("\nbinary   ", binary, CMP_SIZE);
-	for (; index < count; index++) {
-		//dump_stuff_msg("crypt_out", crypt_out[index], CMP_SIZE);
+	int index;
+
+	// dump_stuff_msg("\nbinary   ", binary, CMP_SIZE);
+	for (index = 0; index < count; index++) {
+		// dump_stuff_msg("crypt_out", crypt_out[index], CMP_SIZE);
 		if (!memcmp(binary, crypt_out[index], CMP_SIZE-2))
 			return 1;
 	}
@@ -388,11 +380,7 @@ static int cmp_exact(char *source, int index)
 
 static void aixssha_set_key(char *key, int index)
 {
-	int saved_len = strlen(key);
-	if (saved_len > PLAINTEXT_LENGTH)
-		saved_len = PLAINTEXT_LENGTH;
-	memcpy(saved_key[index], key, saved_len);
-	saved_key[index][saved_len] = 0;
+	strnzcpy(saved_key[index], key, sizeof(*saved_key));
 }
 
 static char *get_key(int index)
@@ -465,13 +453,8 @@ struct fmt_main fmt_aixssha1 = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,
@@ -535,13 +518,8 @@ struct fmt_main fmt_aixssha256 = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,
@@ -605,13 +583,8 @@ struct fmt_main fmt_aixssha512 = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,

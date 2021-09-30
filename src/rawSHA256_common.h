@@ -26,10 +26,11 @@
 #define BINARY_ALIGN            MEM_ALIGN_WORD
 
 #define BENCHMARK_COMMENT       ""
-#define BENCHMARK_LENGTH        -1
+#define BENCHMARK_LENGTH        0x107
 
 int sha256_common_valid(char *ciphertext, struct fmt_main *self);
 void * sha256_common_binary(char *ciphertext);
+void * sha256_common_binary_BE(char *ciphertext);
 char * sha256_common_prepare(char *split_fields[10], struct fmt_main *self);
 char * sha256_common_split(char *ciphertext, int index, struct fmt_main *self);
 

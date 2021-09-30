@@ -33,7 +33,7 @@ struct fmt_main;
  * Maximum number of different tunable cost parameters
  * that can be reported for a single format
  */
-#define FMT_TUNABLE_COSTS	3
+#define FMT_TUNABLE_COSTS	4
 
 /*
  * Maximum number of different signatures
@@ -61,7 +61,7 @@ struct db_salt;
  * with formats not fully Unicode-aware is when a format like this is hard-coded
  * to convert from ISO-8859-1 (ie. by just inserting 0x00, effectively just
  * casting every char to a short). Such formats MUST set FMT_UNICODE and MUST
- * NOT set FMT_UTF8, or users will get false negatives when using UTF-8 or
+ * NOT set FMT_ENC, or users will get false negatives when using UTF-8 or
  * codepages.
  */
 #define FMT_UNICODE			0x00000004
@@ -69,13 +69,18 @@ struct db_salt;
  * Honors the --encoding=NAME option. This means it can handle codepages (like
  * cp1251) as well as UTF-8.
  */
-#define FMT_UTF8			0x00000008
+#define FMT_ENC				0x00000008
+/*
+ * This hash type is known to actually use UTF-8 encoding of password, so
+ * trying legacy target encodings should be pointless.
+ */
+#define FMT_UTF8			0x00000010
 /*
  * Mark password->binary = NULL immediately after a hash is cracked. Must be
- * set for formats that reads salt->list in crypt_all for the purpose of
+ * set for formats that read salt->list in crypt_all for the purpose of
  * identification of uncracked hashes for this salt.
  */
-#define FMT_REMOVE			0x00000010
+#define FMT_REMOVE			0x00000020
 /*
  * Format has false positive matches. Thus, do not remove hashes when
  * a likely PW is found.  This should only be set for formats where a
@@ -85,18 +90,26 @@ struct db_salt;
  */
 #define FMT_NOT_EXACT			0x00000100
 /*
- * this format uses a dynamic sized salt, and its salt structure
+ * This format uses a dynamic sized salt, and its salt structure
  * 'derives' from the dyna_salt type defined in dyna_salt.h
  */
 #define FMT_DYNA_SALT			0x00000200
+/*
+ * This format supports huge ciphertexts (longer than MAX_CIPHERTEXT_SIZE,
+ * currently 896 bytes) and will consequently truncate its pot lines with
+ * $SOURCE_HASH$ to end up fitting within LINE_BUFFER_SIZE.
+ */
+#define FMT_HUGE_INPUT			0x00000400
 /* Uses a bitslice implementation */
 #define FMT_BS				0x00010000
 /* The split() method unifies the case of characters in hash encodings */
 #define FMT_SPLIT_UNIFIES_CASE		0x00020000
-/* Is this format a dynamic_x format (or a 'thin' format using dynamic code)? */
+/* A dynamic_x format (or a 'thin' format using dynamic code) */
 #define FMT_DYNAMIC			0x00100000
-/* Is this a format which originally truncates at our max. length? */
+/* This format originally truncates at our max. length (eg. descrypt) */
 #define FMT_TRUNC			0x00200000
+/* Format can do "internal mask" (eg. GPU-side mask)? */
+#define FMT_MASK			0x00400000
 #ifdef _OPENMP
 /* Parallelized with OpenMP */
 #define FMT_OMP				0x01000000
@@ -106,8 +119,13 @@ struct db_salt;
 #define FMT_OMP				0
 #define FMT_OMP_BAD			0
 #endif
+/* Non-hash format. If used, binary_size must be sizeof(fmt_data) */
+#define FMT_BLOB			0x04000000
 /* We've already warned the user about hashes of this type being present */
 #define FMT_WARNED			0x80000000
+
+/* Format's length before calling init() */
+extern int fmt_raw_len;
 
 /*
  * A password to test the methods for correct operation.
@@ -117,24 +135,81 @@ struct fmt_tests {
 	char *fields[10];
 };
 
+#if BLOB_DEBUG
+
+/* Magic signature stuffed in flags for debugging */
+#include <assert.h>
+#define FMT_DATA_MAGIC	((sizeof(size_t) < 8) ? 0x0babe500 : \
+					0x00c007000babe500ULL)
+#define BLOB_ASSERT(b)	assert((((fmt_data*)(b))->flags & ~3) == FMT_DATA_MAGIC)
+
+#else
+
+#define BLOB_ASSERT(b)
+#define FMT_DATA_MAGIC	0
+
+#endif /* BLOB_DEBUG */
+
+/*
+ * Flags for fmt_data.
+ */
+/* Blob portion is tiny-alloc. */
+#define FMT_DATA_TINY			(FMT_DATA_MAGIC | 0x01)
+/* Blob portion is malloc, so needs to be freed when done with it. */
+#define FMT_DATA_ALLOC			(FMT_DATA_MAGIC | 0x02)
+
+/*
+ * Variable size data for non-hashes (formerly stored in "salt").
+ * "size" is the size of blob only. Size of data returned is always
+ * just sizeof(fmt_data). The blob is either mem_alloc_tiny and flag
+ * is FMT_DATA_TINY, or alloced and flag is FMT_DATA_ALLOC.
+ * The latter needs free when we're done with it. Regardless, the
+ * loader never copies it - just this struct. The cracker uses the
+ * pointer and size (and frees the pointer when appropriate).
+ */
+typedef struct {
+	size_t flags;
+	size_t size;
+	void *blob;
+} fmt_data;
+
+/* Helper macros */
+#define BLOB_BINARY(f, b) (((f)->params.flags & FMT_BLOB) ?	\
+                        (((fmt_data*)(b))->blob) : (b))
+
+#define BLOB_SIZE(f, b) (((f)->params.flags & FMT_BLOB) ?	  \
+                      (((fmt_data*)(b))->size) : ((f)->params.binary_size))
+
+#define BLOB_FREE(f, b) do {	  \
+		if ((f)->params.flags & FMT_BLOB) { \
+			BLOB_ASSERT(b); \
+			if ((b) && \
+			    (((fmt_data*)(b))->flags == FMT_DATA_ALLOC)) \
+				MEM_FREE(((fmt_data*)(b))->blob); \
+		} \
+	} while (0)
+
 /*
  * Parameters of a hash function and its cracking algorithm.
  */
 struct fmt_params {
 /* Label to refer to this format (any alphabetical characters in it must be
  * lowercase). */
-	char *label;
+	const char *label;
 
 /* Ciphertext format name */
-	char *format_name;
+	const char *format_name;
 
 /* Cracking algorithm name */
-	char *algorithm_name;
+	const char *algorithm_name;
 
 /* Comment about the benchmark (can be empty) */
-	char *benchmark_comment;
+	const char *benchmark_comment;
 
-/* Benchmark for short/long passwords instead of for one/many salts */
+/* Benchmark for this password length.  Can also add one of:
+ * + 0x100 Force "Raw" benchmark even for a salted format
+ * + 0x200 Benchmark for short/long passwords instead of for one/many salts
+ * + 0x500 Make "Raw" behave like "Only one salt", not "Many salts" */
 	int benchmark_length;
 
 /* Minimum length of a plaintext password */
@@ -228,6 +303,7 @@ struct fmt_methods {
 	char *(*split)(char *ciphertext, int index, struct fmt_main *self);
 
 /* Converts an ASCII ciphertext to binary, possibly using the salt */
+/* Or, converts an ASCII non-hash data blob to a fmt_data struct */
 	void *(*binary)(char *ciphertext);
 
 /* Converts an ASCII salt to its internal representation */
@@ -282,7 +358,8 @@ struct fmt_methods {
 
 /* Allow the previously set keys to be dropped if that would help improve
  * performance and/or reduce the impact of certain hardware faults. After
- * a call to clear_keys() the keys are undefined. */
+ * a call to clear_keys() the keys are undefined.  Jumbo guarantees this
+ * will be called before set_key(0). */
 	void (*clear_keys)(void);
 
 /* Computes the ciphertexts for given salt and plaintexts.
@@ -351,6 +428,20 @@ struct fmt_main {
 extern char fmt_null_key[PLAINTEXT_BUFFER_SIZE];
 
 /*
+ * List of valid format classes for this build
+ */
+extern char fmt_class_list[];
+
+/* Self-test is running */
+extern int self_test_running;
+
+/* Benchmark is running */
+extern int benchmark_running;
+
+/* Self-test or benchmark is running */
+#define bench_or_test_running	(self_test_running || benchmark_running)
+
+/*
  * Linked list of registered formats.
  */
 extern struct fmt_main *fmt_list;
@@ -359,6 +450,16 @@ extern struct fmt_main *fmt_list;
  * Format registration function.
  */
 extern void fmt_register(struct fmt_main *format);
+
+/*
+ * Match req_format to format, supporting wildcards/groups/classes etc.
+ */
+extern int fmt_match(const char *req_format, struct fmt_main *format, int override_disable);
+
+/*
+ * Check for --format=LIST and if so, re-populate fmt_list from it.
+ */
+extern int fmt_check_custom_list(void);
 
 /*
  * Initializes the format's internal structures unless already initialized.
@@ -380,6 +481,13 @@ extern void fmt_all_done(void);
  * success, method name on error.
  */
 extern char *fmt_self_test(struct fmt_main *format, struct db_main *db);
+
+/*
+ * Compare the real binary, whatever it is:
+ * If this is not FMT_BLOB we do a plain memcmp. If it is, we
+ * memcmp the pointed-to binaries, with correct sizes.
+ */
+extern int fmt_bincmp(void *b1, void *b2, struct fmt_main *format);
 
 /*
  * Default methods.
@@ -416,5 +524,10 @@ extern int fmt_default_binary_hash_6(void * binary);
  * Dummy hash function to use for salts with no hash table.
  */
 #define fmt_dummy_hash fmt_default_get_hash
+
+/*
+ * This is for all formats that want to use omp_autotune()
+ */
+#include "omp_autotune.h"
 
 #endif

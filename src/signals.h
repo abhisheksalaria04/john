@@ -35,7 +35,10 @@ extern volatile int event_abort;	/* Abort requested */
 extern volatile int event_reload;	/* Reload of pot file requested */
 extern volatile int event_save;		/* Save the crash recovery file */
 extern volatile int event_status;	/* Status display requested */
+extern volatile int event_delayed_status;	/* Status display requested after current batch */
 extern volatile int event_ticksafety;	/* System time in ticks may overflow */
+extern volatile int event_fix_state;	/* For cracker */
+extern volatile int event_refresh_salt;	/* For defensive salt refresh every nth seconds */
 #ifdef HAVE_MPI
 extern volatile int event_mpiprobe;	/* MPI probe for messages requested */
 #endif
@@ -71,6 +74,17 @@ void sig_preinit(void);
  * Installs the signal handlers.
  */
 extern void sig_init(void);
+
+/*
+ * Starts "the clock". Called after loading, auto-tuning, etc.
+ */
+extern void sig_init_late(void);
+
+/*
+ * Resets the save timer. This is called after *completing* an event_save
+ * with the rationale of keeping any separation we got by waiting for locks
+ */
+extern void sig_reset_timer(void);
 
 /*
  * Performs additional (re-)initialization after fork().  Assumes that

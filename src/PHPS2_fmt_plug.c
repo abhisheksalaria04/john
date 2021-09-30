@@ -23,14 +23,13 @@ john_register_one(&fmt_PHPS2);
 #include "common.h"
 #include "formats.h"
 #include "dynamic.h"
-#include "memdbg.h"
 
 #define FORMAT_LABEL		"PHPS2"
 #define FORMAT_NAME			"" /* md5(md5($pass).$salt) */
 
 #define ALGORITHM_NAME		"?" /* filled in by dynamic */
 #define BENCHMARK_COMMENT	""
-#define BENCHMARK_LENGTH	0
+#define BENCHMARK_LENGTH	7
 
 #define BINARY_SIZE			16
 #define BINARY_ALIGN		MEM_ALIGN_WORD
@@ -212,7 +211,7 @@ static void phps_init(struct fmt_main *self)
 static void get_ptr() {
 	if (!pDynamic) {
 		dynamic_LOCAL_FMT_FROM_PARSER_FUNCTIONS(dyna_script, &dyna_type, &fmt_PHPS2, Convert);
-		sprintf (dyna_hash_type, "$dynamic_%d$", dyna_type);
+		sprintf(dyna_hash_type, "$dynamic_%d$", dyna_type);
 		dyna_hash_type_len = strlen(dyna_hash_type);
 
 		pDynamic = dynamic_THIN_FORMAT_LINK(&fmt_PHPS2, Convert(Conv_Buf, phps_tests[0].ciphertext, 0), "phps", 0);

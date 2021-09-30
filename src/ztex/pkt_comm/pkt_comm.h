@@ -49,6 +49,7 @@
 // PKT_CHECKSUM_TYPE must be unsigned type
 #define PKT_CHECKSUM_TYPE	uint32_t
 
+#define PKT_MAX_DATA_LEN	(PKT_MAX_LEN - PKT_HEADER_LEN - 2 * PKT_CHECKSUM_LEN)
 
 struct pkt {
 	unsigned char version;
@@ -82,7 +83,7 @@ int get_pkt_count(void);
 
 
 // *****************************************************************
-// 
+//
 // packet queue
 //
 // *****************************************************************
@@ -134,7 +135,7 @@ struct pkt_comm_params {
 
 struct pkt_comm {
 	struct pkt_comm_params *params;
-	
+
 	struct pkt_queue *output_queue;
 	unsigned char *output_buf;
 	int output_buf_size;

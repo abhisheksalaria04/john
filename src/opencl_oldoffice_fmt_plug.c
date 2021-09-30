@@ -17,12 +17,11 @@ extern struct fmt_main FORMAT_STRUCT;
 john_register_one(&FORMAT_STRUCT);
 #else
 
+#include <stdint.h>
 #include <string.h>
-#include <errno.h>
 
-#include "common-opencl.h"
-#include "stdint.h"
 #include "arch.h"
+#include "opencl_common.h"
 #include "misc.h"
 #include "common.h"
 #include "formats.h"
@@ -36,8 +35,8 @@ john_register_one(&FORMAT_STRUCT);
 #define FORMAT_NAME		"MS Office <= 2003"
 #define ALGORITHM_NAME		"MD5/SHA1 RC4 OpenCL"
 #define BENCHMARK_COMMENT	""
-#define BENCHMARK_LENGTH	-1001 /* Use -1 for benchmarking w/ mitm */
-#define PLAINTEXT_LENGTH	19 //* 19 is leanest, 24, 28, 31, max. 51 */
+#define BENCHMARK_LENGTH	0x107
+#define PLAINTEXT_LENGTH	24 //* 19 is leanest, 24, 28, 31, max. 51 */
 #define BINARY_SIZE		0
 #define BINARY_ALIGN		MEM_ALIGN_NONE
 #define SALT_SIZE		sizeof(dyna_salt*)
@@ -46,7 +45,7 @@ john_register_one(&FORMAT_STRUCT);
 #define MIN_KEYS_PER_CRYPT	1
 #define MAX_KEYS_PER_CRYPT	1
 
-#define CIPHERTEXT_LENGTH	(TAG_LEN + 120)
+#define CIPHERTEXT_LENGTH	(TAG_LEN + 1 + 1 + 32 + 1 + 32 + 1 + 40 + 1 + 64)
 #define FORMAT_TAG		"$oldoffice$"
 #define TAG_LEN			(sizeof(FORMAT_TAG) - 1)
 
@@ -54,7 +53,7 @@ static struct fmt_tests oo_tests[] = {
 	{"$oldoffice$1*de17a7f3c3ff03a39937ba9666d6e952*2374d5b6ce7449f57c9f252f9f9b53d2*e60e1185f7aecedba262f869c0236f81", "test"},
 	{"$oldoffice$0*e40b4fdade5be6be329c4238e2099b8a*259590322b55f7a3c38cb96b5864e72d*2e6516bfaf981770fe6819a34998295d", "123456789012345"},
 	{"$oldoffice$4*163ae8c43577b94902f58d0106b29205*87deff24175c2414cb1b2abdd30855a3*4182446a527fe4648dffa792d55ae7a15edfc4fb", "Google123"},
-	/* Meet-in-the-middle candidate produced with oclHashcat -m9710 */
+	/* Meet-in-the-middle candidate produced with hashcat -m9710 */
 	/* Real pw is "hashcat", one collision is "zvDtu!" */
 	{"", "zvDtu!", {"", "$oldoffice$1*d6aabb63363188b9b73a88efb9c9152e*afbbb9254764273f8f4fad9a5d82981f*6f09fd2eafc4ade522b5f2bee0eaf66d","f2ab1219ae"} },
 #if PLAINTEXT_LENGTH >= 24
@@ -72,10 +71,13 @@ static struct fmt_tests oo_tests[] = {
 	/* the following hash was extracted from Proc2356.ppt (manually + by oldoffice2john.py */
 	{"$oldoffice$3*DB575DDA2E450AB3DFDF77A2E9B3D4C7*AB183C4C8B5E5DD7B9F3AF8AE5FFF31A*B63594447FAE7D4945D2DAFD113FD8C9F6191BF5", "crypto"},
 	{"$oldoffice$3*3fbf56a18b026e25815cbea85a16036c*216562ea03b4165b54cfaabe89d36596*91308b40297b7ce31af2e8c57c6407994b205590", "openwall"},
+	/*
+	 * Type 3 with extra field for avoiding FP.
+	 * One example of FP is benben878d932
+	 */
+	{"$oldoffice$3*f1e935587190564e67f979d138284b15*12a32bbf6d2377fa57c4a93d7d58d5f4*8c23386193b56cb26562848599fa58187b690d86*b71af4b34f0e06220df3f36984b230b6fad96099ffa387fa48bd9bde6176fa94", ":^99998888~!"},
 	{NULL}
 };
-
-extern volatile int bench_running;
 
 typedef struct {
 	dyna_salt dsalt;
@@ -83,8 +85,11 @@ typedef struct {
 	unsigned char salt[16];
 	unsigned char verifier[16]; /* or encryptedVerifier */
 	unsigned char verifierHash[20];  /* or encryptedVerifierHash */
-	unsigned int has_mitm;
 	unsigned int cracked;
+	unsigned int has_extra;
+	unsigned char extra[32];
+	unsigned int has_mitm;
+	unsigned int mitm_reported;
 	unsigned char mitm[8]; /* Meet-in-the-middle hint, if we have one */
 } custom_salt;
 
@@ -97,7 +102,6 @@ static custom_salt cs;
 static custom_salt *cur_salt = &cs;
 
 static char *saved_key;
-static int any_cracked;
 static int new_keys;
 
 static int max_len = PLAINTEXT_LENGTH;
@@ -116,8 +120,7 @@ static struct fmt_main *self;
 #define SEED			1024
 
 // This file contains auto-tuning routine(s). Has to be included after formats definitions.
-#include "opencl-autotune.h"
-#include "memdbg.h"
+#include "opencl_autotune.h"
 
 static const char *warn[] = {
 	"xP: ",  ", xI: ",  ", crypt: ",  ", xR: "
@@ -130,9 +133,13 @@ static size_t get_task_max_work_group_size()
 	           64);
 }
 
+static void release_clobj(void);
+
 static void create_clobj(size_t gws, struct fmt_main *self)
 {
 	unsigned int dummy = 0;
+
+	release_clobj();
 
 	pinned_key = clCreateBuffer(context[gpu_id], CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, max_len * gws, NULL, &ret_code);
 	HANDLE_CLERROR(ret_code, "Error creating page-locked buffer");
@@ -155,7 +162,7 @@ static void create_clobj(size_t gws, struct fmt_main *self)
 	cracked = clEnqueueMapBuffer(queue[gpu_id], pinned_result, CL_TRUE, CL_MAP_READ | CL_MAP_WRITE, 0, sizeof(unsigned int) * gws * mask_int_cand.num_int_cand, 0, NULL, NULL, &ret_code);
 	HANDLE_CLERROR(ret_code, "Error mapping cracked");
 
-	cl_benchmark = clCreateBuffer(context[gpu_id], CL_MEM_READ_ONLY, sizeof(bench_running), NULL, &ret_code);
+	cl_benchmark = clCreateBuffer(context[gpu_id], CL_MEM_READ_ONLY, sizeof(self_test_running), NULL, &ret_code);
 
 	cl_salt = clCreateBuffer(context[gpu_id], CL_MEM_READ_WRITE, sizeof(cs), NULL, &ret_code);
 	HANDLE_CLERROR(ret_code, "Error creating device buffer");
@@ -194,8 +201,10 @@ static void release_clobj(void)
 		HANDLE_CLERROR(clReleaseMemObject(pinned_idx), "Release pinned index buffer");
 		HANDLE_CLERROR(clReleaseMemObject(cl_salt), "Release salt buffer");
 		HANDLE_CLERROR(clReleaseMemObject(cl_result), "Release result buffer");
+		HANDLE_CLERROR(clReleaseMemObject(cl_benchmark), "Release benchmark flag buffer");
 		HANDLE_CLERROR(clReleaseMemObject(cl_saved_key), "Release key buffer");
 		HANDLE_CLERROR(clReleaseMemObject(cl_saved_idx), "Release index buffer");
+		HANDLE_CLERROR(clReleaseMemObject(buffer_int_keys), "Error Releasing buffer_int_keys.");
 		HANDLE_CLERROR(clReleaseMemObject(buffer_int_key_loc), "Error Releasing buffer_int_key_loc.");
 		HANDLE_CLERROR(clReleaseMemObject(pinned_int_key_loc), "Error Releasing pinned_int_key_loc.");
 
@@ -205,13 +214,14 @@ static void release_clobj(void)
 
 static void done(void)
 {
-	if (autotuned) {
+	if (program[gpu_id]) {
 		release_clobj();
 
 		HANDLE_CLERROR(clReleaseKernel(crypt_kernel), "Release kernel");
 		HANDLE_CLERROR(clReleaseProgram(program[gpu_id]), "Release Program");
 
-		autotuned--;
+		crypt_kernel = NULL;
+		program[gpu_id] = NULL;
 	}
 }
 
@@ -221,7 +231,7 @@ static void init(struct fmt_main *_self)
 
 	opencl_prepare_dev(gpu_id);
 
-	mask_int_cand_target = 95;
+	mask_int_cand_target = opencl_speed_index(gpu_id) / 3000;
 
 	if (options.target_enc == UTF_8)
 		max_len = self->params.plaintext_length =
@@ -230,26 +240,16 @@ static void init(struct fmt_main *_self)
 
 static void reset(struct db_main *db)
 {
-	static size_t o_lws, o_gws;
-	static int initialized;
 	size_t gws_limit = 4 << 20;
 	cl_ulong const_cache_size;
 	char build_opts[1024];
 	int i;
 
-	if (initialized) {
-		// Forget the previous auto-tune
-		local_work_size = o_lws;
-		global_work_size = o_gws;
-		release_clobj();
-	} else {
-		o_lws = local_work_size;
-		o_gws = global_work_size;
-		initialized = 1;
-	}
+	if (crypt_kernel)
+		done();
 
 	for (i = 0; i < MASK_FMT_INT_PLHDR; i++)
-		if (mask_skip_ranges != NULL && mask_skip_ranges[i] != -1)
+		if (mask_skip_ranges && mask_skip_ranges[i] != -1)
 			static_gpu_locations[i] = mask_int_cand.int_cpu_mask_ctx->
 				ranges[mask_skip_ranges[i]].pos;
 		else
@@ -276,7 +276,7 @@ static void reset(struct db_main *db)
 	         PLAINTEXT_LENGTH,
 	         (unsigned long long)const_cache_size,
 	         cp_id2macro(options.internal_cp),
-	         options.internal_cp == UTF_8 ? cp_id2macro(ASCII) :
+	         options.internal_cp == UTF_8 ? cp_id2macro(ENC_RAW) :
 	         cp_id2macro(options.internal_cp), static_gpu_locations[0],
 #if MASK_FMT_INT_PLHDR > 1
 	         static_gpu_locations[1],
@@ -290,16 +290,14 @@ static void reset(struct db_main *db)
 	         mask_int_cand.num_int_cand, mask_gpu_is_static
 		);
 
-	opencl_init("$JOHN/kernels/oldoffice_kernel.cl", gpu_id, build_opts);
+	if (!program[gpu_id])
+		opencl_init("$JOHN/opencl/oldoffice_kernel.cl", gpu_id, build_opts);
 
 	/* create kernels to execute */
-	crypt_kernel =
-		clCreateKernel(program[gpu_id], "oldoffice", &ret_code);
-	HANDLE_CLERROR(ret_code, "Error creating kernel. Double-check kernel name?");
-
-	// If real crack run, don't auto-tune for self-tests
-	if (db->real && db != db->real)
-		opencl_get_sane_lws_gws_values();
+	if (!crypt_kernel) {
+		crypt_kernel = clCreateKernel(program[gpu_id], "oldoffice", &ret_code);
+		HANDLE_CLERROR(ret_code, "Error creating kernel. Double-check kernel name?");
+	}
 
 	// Initialize openCL tuning (library) for this format.
 	opencl_init_auto_setup(SEED, 0, NULL, warn, 2,
@@ -307,7 +305,9 @@ static void reset(struct db_main *db)
 	                       2 * PLAINTEXT_LENGTH, gws_limit, db);
 
 	// Auto tune execution from shared/included code.
-	autotune_run(self, 1, gws_limit, 300);
+	autotune_run(self, 1, gws_limit, 100);
+
+	new_keys = 1;
 }
 
 /* Based on ldr_cracked_hash from loader.c */
@@ -363,7 +363,7 @@ static int valid(char *ciphertext, struct fmt_main *self)
 	if (!(ptr = strtokm(ctcopy, "*"))) /* type */
 		goto error;
 	type = atoi(ptr);
-	if (type < 0 || type > 4)
+	if (type < 0 || type > 5)
 		goto error;
 	if (!(ptr = strtokm(NULL, "*"))) /* salt */
 		goto error;
@@ -379,12 +379,9 @@ static int valid(char *ciphertext, struct fmt_main *self)
 		goto error;
 	else if ((type >= 3 && hexlen(ptr, &extra) != 40) || extra)
 		goto error;
-/*
- * Deprecated field: mitm hash (40-bit RC4). The new way to put it is in the
- * uid field, like hashcat's example hash.
- */
-	if (type <= 3 && (ptr = strtokm(NULL, "*"))) {
-		if (hexlen(ptr, &extra) != 10 || extra)
+	/* Optional extra data field for avoiding FP */
+	if (type == 3 && (ptr = strtokm(NULL, "*"))) {
+		if (hexlen(ptr, &extra) != 64 || extra)
 			goto error;
 	}
 	MEM_FREE(keeptr);
@@ -397,15 +394,14 @@ error:
 /* uid field may contain a meet-in-the-middle hash */
 static char *prepare(char *split_fields[10], struct fmt_main *self)
 {
-	int extra;
 	if (split_fields[0] && valid(split_fields[0], self) && split_fields[1] &&
-	    (hexlen(split_fields[1], &extra) == 10 || extra)) {
+	    hexlen(split_fields[1], 0) == 10) {
 		mitm_catcher.ct_hash = hex_hash(split_fields[0]);
 		memcpy(mitm_catcher.mitm, split_fields[1], 10);
 		return split_fields[0];
 	}
 	else if (valid(split_fields[1], self) && split_fields[2] &&
-	         (hexlen(split_fields[2], &extra) == 10 || extra)) {
+	         hexlen(split_fields[2], 0) == 10) {
 		mitm_catcher.ct_hash = hex_hash(split_fields[1]);
 		memcpy(mitm_catcher.mitm, split_fields[2], 10);
 	}
@@ -414,7 +410,7 @@ static char *prepare(char *split_fields[10], struct fmt_main *self)
 
 static char *split(char *ciphertext, int index, struct fmt_main *self)
 {
-	static char out[CIPHERTEXT_LENGTH];
+	static char out[CIPHERTEXT_LENGTH + 1];
 	char *p;
 	int extra;
 
@@ -448,7 +444,7 @@ static void *get_salt(char *ciphertext)
 		cs.verifier[i] = atoi16[ARCH_INDEX(p[i * 2])] * 16
 			+ atoi16[ARCH_INDEX(p[i * 2 + 1])];
 	p = strtokm(NULL, "*");
-	if(cs.type < 3) {
+	if (cs.type < 3) {
 		for (i = 0; i < 16; i++)
 			cs.verifierHash[i] = atoi16[ARCH_INDEX(p[i * 2])] * 16
 				+ atoi16[ARCH_INDEX(p[i * 2 + 1])];
@@ -458,19 +454,31 @@ static void *get_salt(char *ciphertext)
 			cs.verifierHash[i] = atoi16[ARCH_INDEX(p[i * 2])] * 16
 				+ atoi16[ARCH_INDEX(p[i * 2 + 1])];
 	}
-	if ((p = strtokm(NULL, "*"))) { /* Deprecated field */
-		cs.has_mitm = 1;
-		for (i = 0; i < 5; i++)
-			cs.mitm[i] = atoi16[ARCH_INDEX(p[i * 2])] * 16
+	if (cs.type == 3 && (p = strtokm(NULL, "*"))) { /* Type 3 extra data */
+		cs.has_extra = 1;
+		for (i = 0; i < 32; i++)
+			cs.extra[i] = atoi16[ARCH_INDEX(p[i * 2])] * 16
 				+ atoi16[ARCH_INDEX(p[i * 2 + 1])];
-	} else
-	if (hex_hash(ciphertext) == mitm_catcher.ct_hash) {
+	} else if (hex_hash(ciphertext) == mitm_catcher.ct_hash) {
 		cs.has_mitm = 1;
 		for (i = 0; i < 5; i++)
 			cs.mitm[i] = atoi16[ARCH_INDEX(mitm_catcher.mitm[i * 2])] * 16
 				+ atoi16[ARCH_INDEX(mitm_catcher.mitm[i * 2 + 1])];
-	} else
-		cs.has_mitm = 0;
+		if (!ldr_in_pot && !bench_or_test_running && john_main_process) {
+			log_event("- Using MITM key %02x%02x%02x%02x%02x for %s",
+			          cs.mitm[0], cs.mitm[1], cs.mitm[2], cs.mitm[3], cs.mitm[4], ciphertext);
+			cur_salt->mitm_reported = 1;
+		}
+	}
+
+	if (cs.type == 5 && !ldr_in_pot) {
+		static int warned;
+
+		if (john_main_process && !warned++) {
+			fprintf(stderr, "Note: The support for OldOffice type 5 is experimental and may be incorrect.\n");
+			fprintf(stderr, "      For latest news see https://github.com/openwall/john/issues/4705\n");
+		}
+	}
 
 	MEM_FREE(keeptr);
 
@@ -482,65 +490,24 @@ static void *get_salt(char *ciphertext)
 	return &ptr;
 }
 
-static char *source(char *source, void *binary)
-{
-	static char Buf[CIPHERTEXT_LENGTH];
-	unsigned char *cpi, *cp = (unsigned char*)Buf;
-	int i, len;
-
-	cp += sprintf(Buf, "%s%d*", FORMAT_TAG, cur_salt->type);
-
-	cpi = cur_salt->salt;
-	for (i = 0; i < 16; i++) {
-		*cp++ = itoa16[*cpi >> 4];
-		*cp++ = itoa16[*cpi & 0xf];
-		cpi++;
-	}
-	*cp++ = '*';
-
-	cpi = cur_salt->verifier;
-	for (i = 0; i < 16; i++) {
-		*cp++ = itoa16[*cpi >> 4];
-		*cp++ = itoa16[*cpi & 0xf];
-		cpi++;
-	}
-	*cp++ = '*';
-
-	len = (cur_salt->type < 3) ? 16 : 20;
-	cpi = cur_salt->verifierHash;
-	for (i = 0; i < len; i++) {
-		*cp++ = itoa16[*cpi >> 4];
-		*cp++ = itoa16[*cpi & 0xf];
-		cpi++;
-	}
-	*cp = 0;
-
-	if (cur_salt->has_mitm && !bench_running) {
-		static int last;
-		char out[11];
-
-		if (last != hex_hash(Buf)) {
-			last = hex_hash(Buf);
-			cpi = cur_salt->mitm;
-			for (i = 0; i < 5; i++) {
-				out[2 * i + 0] = itoa16[*cpi >> 4];
-				out[2 * i + 1] = itoa16[*cpi & 0xf];
-				cpi++;
-			}
-			out[10] = 0;
-			fprintf(stderr, "MITM key: %s\n", out);
-		}
-	}
-
-	return Buf;
-}
-
 static void set_salt(void *salt)
 {
 	cur_salt = *(custom_salt**)salt;
 
-	HANDLE_CLERROR(clEnqueueWriteBuffer(queue[gpu_id], cl_benchmark, CL_FALSE, 0, sizeof(bench_running), (void*)&bench_running, 0, NULL, NULL), "Failed transferring salt");
+	HANDLE_CLERROR(clEnqueueWriteBuffer(queue[gpu_id], cl_benchmark, CL_FALSE, 0, sizeof(self_test_running), &self_test_running, 0, NULL, NULL), "Failed transferring salt");
 	HANDLE_CLERROR(clEnqueueWriteBuffer(queue[gpu_id], cl_salt, CL_FALSE, 0, sizeof(cs), cur_salt, 0, NULL, NULL), "Failed transferring salt");
+	HANDLE_CLERROR(clFlush(queue[gpu_id]), "clFlush failed in set_salt()");
+}
+
+static int salt_compare(const void *x, const void *y)
+{
+	int c;
+
+	c = memcmp((*(custom_salt**)x)->salt, (*(custom_salt**)y)->salt, 16);
+	if (c)
+		return c;
+	c = dyna_salt_cmp((void*)x, (void*)y, SALT_SIZE);
+	return c;
 }
 
 /* Returns the last output index for which there might be a match (against the
@@ -578,7 +545,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 	BENCH_CLERROR(clEnqueueReadBuffer(queue[gpu_id], cl_salt, CL_TRUE, 0, sizeof(cs), cur_salt, 0, NULL, multi_profilingEvent[3]), "Failed transferring salt");
 
-	if ((any_cracked = cur_salt->cracked)) {
+	if (cur_salt->cracked) {
 		BENCH_CLERROR(clEnqueueReadBuffer(queue[gpu_id], cl_result, CL_TRUE, 0, sizeof(unsigned int) * *pcount, cracked, 0, NULL, NULL), "failed reading results back");
 		return *pcount;
 	}
@@ -588,7 +555,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 static int cmp_all(void *binary, int count)
 {
-	return any_cracked;
+	return cur_salt->cracked;
 }
 
 static int cmp_one(void *binary, int index)
@@ -598,6 +565,20 @@ static int cmp_one(void *binary, int index)
 
 static int cmp_exact(char *source, int index)
 {
+	if (!cur_salt->mitm_reported && cur_salt->type < 4 && !cur_salt->has_extra && !bench_or_test_running) {
+		unsigned char *cp, out[11];
+		int i;
+
+		cp = cur_salt->mitm;
+		for (i = 0; i < 5; i++) {
+			out[2 * i + 0] = itoa16[*cp >> 4];
+			out[2 * i + 1] = itoa16[*cp & 0xf];
+			cp++;
+		}
+		out[10] = 0;
+		log_event("MITM key: %s for %s", out, source);
+		cur_salt->mitm_reported = 1;
+	}
 	return 1;
 }
 
@@ -673,7 +654,7 @@ static char *get_key(int index)
 	ret = utf16_to_enc(u16);
 
 	/* Apply GPU-side mask */
-	if (mask_skip_ranges && mask_int_cand.num_int_cand > 1) {
+	if (len && mask_skip_ranges && mask_int_cand.num_int_cand > 1) {
 		for (i = 0; i < MASK_FMT_INT_PLHDR && mask_skip_ranges[i] != -1; i++)
 			if (mask_gpu_is_static)
 				ret[static_gpu_locations[i]] =
@@ -709,9 +690,9 @@ struct fmt_main FORMAT_STRUCT = {
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_CASE | FMT_8_BIT | FMT_UNICODE | FMT_UTF8 | FMT_SPLIT_UNIFIES_CASE | FMT_DYNA_SALT,
+		FMT_CASE | FMT_8_BIT | FMT_UNICODE | FMT_ENC | FMT_SPLIT_UNIFIES_CASE | FMT_DYNA_SALT | FMT_MASK,
 		{
-			"hash type",
+			"hash type [0-1:MD5+RC4-40 3:SHA1+RC4-40 4:SHA1+RC4-128 5:SHA1+RC4-56]",
 		},
 		{ FORMAT_TAG },
 		oo_tests
@@ -727,12 +708,12 @@ struct fmt_main FORMAT_STRUCT = {
 		{
 			oo_hash_type,
 		},
-		source,
+		fmt_default_source,
 		{
 			fmt_default_binary_hash
 		},
 		fmt_default_dyna_salt_hash,
-		NULL,
+		salt_compare,
 		set_salt,
 		set_key,
 		get_key,

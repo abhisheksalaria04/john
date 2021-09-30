@@ -31,6 +31,7 @@
 #define _CONVERTUTF_H
 
 #include <wchar.h>
+#include <stdint.h>
 #include <stdlib.h>
 
 #include "options.h"
@@ -45,7 +46,8 @@
 /* Arbitrary CP-to-integer mapping, for switches, arrays etc. */
 #define AUTO           -1 /* try to auto-detect UTF-8 */
 #define CP_UNDEF        0
-#define ASCII           1
+#define ASCII           1 /* ASCII + transparent 8-bit - like John proper */
+#define ENC_RAW         ASCII
 #define CP437           2
 #define CP720           3
 #define CP737           4
@@ -83,28 +85,31 @@
 /* Rexgen library header might have defined this (empty) */
 #undef UTF32
 
-typedef ARCH_WORD_32 UTF32;	/* at least 32 bits */
-typedef unsigned short UTF16;	/* at least 16 bits */
-typedef unsigned char UTF8;	/* typically 8 bits */
+typedef uint32_t UTF32;
+typedef uint16_t UTF16;
+typedef uint8_t UTF8;
 
 /* Some fundamental constants */
 #define UNI_REPLACEMENT_CHAR (UTF32)0x0000FFFD
 #define UNI_MAX_BMP (UTF32)0x0000FFFF
-#define UNI_MAX_UTF16 (UTF32)0x0010FFFF
-#define UNI_MAX_UTF32 (UTF32)0x7FFFFFFF
-#define UNI_MAX_LEGAL_UTF32 (UTF32)0x0010FFFF
 
 /* These are used in NT_fmt.c */
 extern const UTF32 offsetsFromUTF8[];
 extern const char opt_trailingBytesUTF8[64];
 
 /*
+ * Convert to UTF-32 from UTF-8.
+ */
+extern int utf8_to_utf32(UTF32 *target, unsigned int len,
+                         const UTF8 *source, unsigned int sourceLen);
+
+/*
  * Convert to UTF-16LE from UTF-8.
  * 'maxtargetlen' is max. number of characters (as opposed to bytes) in output,
- * eg. PLAINTEXT_LENGTH.
+ * e.g. PLAINTEXT_LENGTH.
  * 'sourcelen' can be strlen(source).
  * Returns number of UTF16 characters (as opposed to bytes) of resulting
- * output. If return is negative, eg. -32, it means 32 characters of INPUT were
+ * output. If return is negative, e.g. -32, it means 32 characters of INPUT were
  * used and then we had to truncate. Either because we ran out of maxtargetlen,
  * or because input was not valid after that point (eg. illegal UTF-8 sequence).
  * To get the length of output in that case, use strlen16(target).
@@ -119,10 +124,10 @@ extern int utf8_to_utf16_be(UTF16 *target, unsigned int len, const UTF8 *source,
 /*
  * Convert to UTF-16LE from whatever encoding is used (--encoding aware).
  * 'maxdstlen' is max. number of characters (as opposed to bytes) in output,
- * eg. PLAINTEXT_LENGTH.
+ * e.g. PLAINTEXT_LENGTH.
  * 'srclen' can be strlen(src).
  * Returns number of UTF16 characters (as opposed to bytes) of resulting
- * output. If return is negative, eg. -32, it means 32 characters of INPUT were
+ * output. If return is negative, e.g. -32, it means 32 characters of INPUT were
  * used and then we had to truncate. Either because we ran out of maxdstlen, or
  * because input was not valid after that point (eg. illegal UTF-8 sequence).
  * To get the length of output in that case, use strlen16(dst).
@@ -160,6 +165,12 @@ extern UTF8 *utf16_to_utf8_r(UTF8 *dst, int dst_len, const UTF16* source);
 extern UTF8 *utf16_to_enc(const UTF16* source);
 extern UTF8 *utf16_to_enc_r(UTF8 *dst, int dst_len, const UTF16* source);
 
+/*
+ * Convert back to UTF-8 or codepage (for get_key without a saved_plain)
+ * from UTF-16BE (regardless of host architecture)
+ */
+extern UTF8 *utf16_be_to_enc(const UTF16* source);
+
 /* UTF-32 functions. No endianness problems! */
 extern UTF8 *utf32_to_enc(UTF8 *dst, int dst_len, const UTF32 *source);
 extern int enc_to_utf32(UTF32 *dst, unsigned int maxdstlen, const UTF8 *src,
@@ -170,14 +181,26 @@ extern int enc_to_utf32(UTF32 *dst, unsigned int maxdstlen, const UTF8 *src,
  * we can opt to convert to/from.
  */
 extern char *utf16_to_cp(const UTF16* source);
-extern char *utf8_to_cp_r(char *src, char *dst, int dstlen);
-extern char *cp_to_utf8_r(char *src, char *dst, int dstlen);
+extern char *utf8_to_cp_r(const char *src, char *dst, int dstlen);
+extern char *cp_to_utf8_r(const char *src, char *dst, int dstlen);
+
+/*
+ * Return length (in characters) of a UTF-32 string
+ * Number of octets is the result * sizeof(UTF32)
+ */
+extern unsigned int strlen32(const UTF32* str);
 
 /*
  * Return length (in characters) of a UTF-16 string
  * Number of octets is the result * sizeof(UTF16)
  */
 extern unsigned int strlen16(const UTF16* str);
+
+/*
+ * Return length (in characters) of a string, best-effort. If the string
+ * contains invalid UTF-8, just count bytes from that point.
+ */
+extern size_t strlen_any(const void* str);
 
 /*
  * Return length (in characters) of a UTF-8 string
@@ -228,28 +251,28 @@ extern UTF16 ucs2_downcase[0x10000];
  * to multi UTC2 lookup table to do things 'properly'. NOTE low2up_ansi() does
  * not handle 0xDF to "SS" conversion, since it is 1 to many.
  */
-static inline UTF8 low2up_ansi(UTF8 c)
+inline static UTF8 low2up_ansi(UTF8 c)
 {
 	if ((ucs2_upcase[c] & 0xFFFE) && ucs2_upcase[c] < 0x100)
 		return (UTF8)ucs2_upcase[c];
 	return c;
 }
 
-static inline UTF8 up2low_ansi(UTF8 c)
+inline static UTF8 up2low_ansi(UTF8 c)
 {
 	if ((ucs2_downcase[c] & 0xFFFE) && ucs2_downcase[c] < 0x100)
 		return (UTF8)ucs2_downcase[c];
 	return c;
 }
 
-static inline UTF16 low2up_u16(UTF16 w)
+inline static UTF16 low2up_u16(UTF16 w)
 {
 	if (ucs2_upcase[w] & 0xFFFE)
 		return ucs2_upcase[w];
 	return w;
 }
 
-static inline UTF16 up2low_u16(UTF16 w)
+inline static UTF16 up2low_u16(UTF16 w)
 {
 	if (ucs2_downcase[w] & 0xFFFE)
 		return ucs2_downcase[w];
@@ -285,21 +308,43 @@ extern UTF8 CP_lows[0x100]; /* all lower-case letters */
 
 /* Used by single.c and loader.c */
 extern UTF8 CP_isLetter[0x100];
+extern UTF8 CP_isLower[0x100];
+extern UTF8 CP_isUpper[0x100];
 extern UTF8 CP_isSeparator[0x100];
+extern UTF8 CP_isDigit[0x100];
 
 /* These are encoding-aware but not LC_CTYPE */
-#define enc_islower(c) (options.internal_cp == ASCII ? (c > 'a' && c < 'z') : (strchr((char*)CP_lows, ARCH_INDEX(c)) != NULL))
-#define enc_isupper(c) (options.internal_cp == ASCII ? (c > 'A' && c < 'Z') : ((strchr((char*)CP_ups, ARCH_INDEX(c)) != NULL))
+#define enc_islower(c) (options.internal_cp == ENC_RAW ? (c >= 'a' && c <= 'z') : CP_isLower[ARCH_INDEX(c)])
+#define enc_isupper(c) (options.internal_cp == ENC_RAW ? (c >= 'A' && c <= 'Z') : CP_isUpper[ARCH_INDEX(c)])
+#define enc_isdigit(c) (options.internal_cp == ENC_RAW ? (c >= '0' && c <= '9') : CP_isDigit[ARCH_INDEX(c)])
 #define enc_tolower(c) (char)CP_down[ARCH_INDEX(c)]
 #define enc_toupper(c) (char)CP_up[ARCH_INDEX(c)]
 
 /* Conversion between encoding names and integer id */
-extern int cp_name2id(char *encoding);
+extern int cp_name2id(const char *encoding, int error_exit);
 extern char *cp_id2name(int encoding);
 extern char *cp_id2macro(int encoding);
 
+/* Return true if string has any uppercase character */
+extern int enc_hasupper(char *s);
+
+/* Return true if string has any lowercase character */
+extern int enc_haslower(char *s);
+
+/* Return true if string has any digits */
+extern int enc_hasdigit(char *s);
+
+/* Convert UTF-8-32 to UTF-8 */
+extern UTF8 *utf8_32_to_utf8(UTF8 *dst, UTF32 *src);
+
+/* Convert UTF-8 to UTF-8-32 */
+extern void utf8_to_utf8_32(UTF32 *dst, UTF8 *src);
+
+/* Convert UTF-32 to UTF-8-32, in place */
+extern void utf32_to_utf8_32(UTF32 *in_place_string);
+
 /*
- * NOTE! Please read the comments in formats.h for FMT_UNICODE and FMT_UTF8
+ * NOTE! Please read the comments in formats.h for FMT_UNICODE and FMT_ENC
  */
 
 #endif				/* _CONVERTUTF_H */

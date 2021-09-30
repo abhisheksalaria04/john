@@ -1,5 +1,5 @@
 /*
- * This software is Copyright (c) 2016 Denis Burykin
+ * This software is Copyright (c) 2016-2017 Denis Burykin
  * [denis_burykin yahoo com], [denis-burykin2014 yandex ru]
  * and it is hereby released to the general public under the following terms:
  * Redistribution and use in source and binary forms, with or without
@@ -35,24 +35,31 @@ struct task_result {
 	struct db_password *pw;
 };
 
+struct task_result_list {
+	int count;
+	struct task_result *result_list;
+	struct task_result **index;
+};
+
 struct task {
 	struct task *next;
 	enum task_status status;
-	
+
 	// for now, all tasks have same comparator configuration
 	//int cmp_config_id;
 	// Global cmp_config
 	//struct cmp_config *cmp_config;
-	
+
 	int num_keys;
 	char *keys;
 	unsigned char *range_info; // NULL if no mask
-	
-	struct task_result *result_list;
+
+	struct task_result_list result_list;
 	struct jtr_device *jtr_device;
 	int id; // ID is 16-bit, unique within jtr_device
 
 	struct timeval mtime; // status modification time
+	int num_processed;
 };
 
 struct task_list {
@@ -63,20 +70,12 @@ struct task_list {
 struct jtr_device_list;
 
 
-// Inserts newly created 'struct task_result'
-// into the list pointed to by task->result
+// Adds newly created 'struct task_result' to task_result_list
 // Copies 'key' inside 'struct task_result', if mask was used
 // then it reconstructs plaintext.
 struct task_result *task_result_new(struct task *task,
 		char *key, unsigned char *range_info,
 		unsigned int gen_id, struct db_password *pw);
-
-// returns the number of results for given task
-int task_result_count(struct task *task);
-
-// deletes all results from task
-void task_result_list_delete(struct task *task);
-
 
 // inserts newly created 'struct task' into 'task_list'
 struct task *task_new(struct task_list *task_list,
@@ -94,7 +93,7 @@ void task_assign(struct task *task, struct jtr_device *jtr_device);
 void task_deassign(struct task *task);
 
 // Update status change time
-static inline void task_update_mtime(struct task *task)
+inline static void task_update_mtime(struct task *task)
 {
 	gettimeofday(&task->mtime, NULL);
 }
@@ -106,10 +105,9 @@ void task_delete(struct task *task);
 // equally distribute load among tasks assuming all devices are equal
 // assign tasks to jtr_devices
 struct task_list *task_list_create(int num_keys,
-		char *keys, unsigned char *range_info,
-		struct db_salt *salt);
+		char *keys, unsigned char *range_info);
 
-// find task by ID and jtr_device * 
+// find task by ID and jtr_device *
 struct task *task_find(struct task_list *task_list,
 		struct jtr_device *jtr_device, int id);
 
@@ -143,6 +141,9 @@ int task_list_result_count(struct task_list *task_list);
 // execute given function for each task_result
 void task_result_execute(struct task_list *task_list,
 		void (*func)(struct task_result *result));
+
+// Creates index, required by task_result_by_index()
+void task_list_create_index(struct task_list *task_list);
 
 // Returns task_result at given index (NULL if none)
 struct task_result *task_result_by_index(struct task_list *task_list, int index);

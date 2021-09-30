@@ -14,11 +14,10 @@
 #include <assert.h>
 
 #define BENCHMARK_COMMENT                  ""
-#define BENCHMARK_LENGTH                   -1
-#define FORMAT_NAME		                   ""
+#define BENCHMARK_LENGTH                   0x107
 
 #define PBKDF2_32_BINARY_ALIGN             sizeof(uint32_t)
-#define PBKDF2_32_MAX_SALT_SIZE            115 /* 2 limb md4/md5/sha1/sha256 max when 4 byte loop counter is appended */
+#define PBKDF2_32_MAX_SALT_SIZE            179 /* 3 limb md4/md5/sha1/sha256 max when 4 byte loop counter is appended */
 #define PBKDF2_64_MAX_SALT_SIZE            107 /* 1 limb sha512 max when 4 byte loop counter is appended */
 
 #define PBKDF2_MDx_BINARY_SIZE             16
@@ -53,6 +52,7 @@
 #define PBKDF2_SHA256_MAX_CIPHERTEXT_LENGTH (PBKDF2_SHA256_TAG_LEN + 6 + 1 + (PBKDF2_32_MAX_SALT_SIZE*4+2)/3 + 1 + (PBKDF2_SHA256_MAX_BINARY_SIZE*4+2)/3)
 
 #define PBKDF2_SHA512_BINARY_SIZE           64
+#define PBKDF2_SHA512_BINARY_ALIGN          sizeof(uint64_t)
 #define PBKDF2_SHA512_FORMAT_TAG            "$pbkdf2-hmac-sha512$"
 #define PBKDF2_SHA512_TAG_LEN               (sizeof(PBKDF2_SHA512_FORMAT_TAG) - 1)
 /* other signatures handled within prepare */
@@ -98,4 +98,3 @@ extern char *pbkdf2_hmac_sha512_prepare(char *fields[10], struct fmt_main *self)
 extern char *pbkdf2_hmac_sha512_split(char *ciphertext, int index, struct fmt_main *self);
 extern void *pbkdf2_hmac_sha512_binary(char *ciphertext);
 extern int pbkdf2_hmac_sha512_cmp_exact(char *key, char *source, unsigned char *salt, int salt_len, int iterations);
-

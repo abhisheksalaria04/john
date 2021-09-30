@@ -1,6 +1,6 @@
 /*
  * This file is part of John the Ripper password cracker,
- * Copyright (c) 1996-2003,2006,2010-2013,2015 by Solar Designer
+ * Copyright (c) 1996-2003,2006,2010-2013,2015,2017 by Solar Designer
  *
  * ...with heavy changes in the jumbo patch, by magnum & JimF
  */
@@ -8,6 +8,8 @@
 #define NEED_OS_TIMER
 #include "os.h"
 
+#include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <assert.h>
 #include <signal.h>
@@ -37,7 +39,6 @@
 #endif
 
 #include "misc.h"
-#include "math.h"
 #include "memory.h"
 #include "signals.h"
 #include "idle.h"
@@ -49,6 +50,7 @@
 #include "recovery.h"
 #include "external.h"
 #include "options.h"
+#include "config.h"
 #include "mask_ext.h"
 #include "mask.h"
 #include "unicode.h"
@@ -56,31 +58,25 @@
 #include "john.h"
 #include "fake_salts.h"
 #include "sha.h"
-#ifdef HAVE_MPI
-#include "john-mpi.h"
-#endif
+#include "john_mpi.h"
 #include "path.h"
 #include "jumbo.h"
-#if HAVE_LIBDL && defined(HAVE_CUDA) || defined(HAVE_OPENCL)
-#include "common-gpu.h"
+#include "opencl_common.h"
+#if HAVE_LIBDL && defined(HAVE_OPENCL)
+#include "gpu_common.h"
 #endif
-#include "memdbg.h"
+#include "rules.h"
+#include "tty.h"
 
 #ifdef index
 #undef index
 #endif
 
-#if defined(LOCK_DEBUG) && !defined(POTSYNC_DEBUG)
-#define POTSYNC_DEBUG 1
-#endif
+extern long clk_tck;
 
-#ifdef POTSYNC_DEBUG
-static clock_t salt_time = 0;
-#endif
-
-static fix_state_fp fp_fix_state;
+static int crk_process_key_max_keys;
 static struct db_main *crk_db;
-static struct fmt_params crk_params;
+static struct fmt_params *crk_params;
 static struct fmt_methods crk_methods;
 #if CRK_PREFETCH
 #if 1
@@ -91,14 +87,36 @@ static unsigned int crk_prefetch;
 #endif
 static int crk_key_index, crk_last_key;
 static void *crk_last_salt;
-void (*crk_fix_state)(void);
 static struct db_keys *crk_guesses;
-static int64 *crk_timestamps;
+static uint64_t *crk_timestamps;
 static char crk_stdout_key[PLAINTEXT_BUFFER_SIZE];
+static int kpc_warn, kpc_warn_limit, single_running;
+static fix_state_fp hybrid_fix_state;
+
+int crk_stacked_rule_count = 1;
+rule_stack crk_rule_stack;
+
 int64_t crk_pot_pos;
+
+void (*crk_fix_state)(void);
+int (*crk_process_key)(char *key);
+
+static int process_key(char *key);
+static int process_key_stack_rules(char *key);
+
+/* Expose max_keys_per_crypt to the world (needed in recovery.c) */
+int crk_max_keys_per_crypt(void)
+{
+	return options.force_maxkeys ? options.force_maxkeys : crk_params->max_keys_per_crypt;
+}
 
 static void crk_dummy_set_salt(void *salt)
 {
+	/* Refresh salt every 30 seconds in case it was thrashed */
+	if (event_refresh_salt > 30) {
+		crk_db->format->methods.set_salt(salt);
+		event_refresh_salt = 0;
+	}
 }
 
 static void crk_dummy_fix_state(void)
@@ -116,9 +134,13 @@ static void crk_init_salt(void)
 static void crk_help(void)
 {
 	static int printed = 0;
-	if (!john_main_process || printed ||
-	    ((options.flags & FLG_STDOUT) && isatty(fileno(stdout))))
+
+	if (!john_main_process || printed)
 		return;
+
+	if ((options.flags & FLG_STDOUT) && isatty(fileno(stdout)))
+		return;
+
 #ifdef HAVE_MPI
 	if (mpi_p > 1 || getenv("OMPI_COMM_WORLD_SIZE"))
 #ifdef SIGUSR1
@@ -128,16 +150,16 @@ static void crk_help(void)
 #endif
 	else
 #endif
-	if ((options.flags & FLG_STDIN_CHK) || (options.flags & FLG_PIPE_CHK))
+	if (tty_has_keyboard())
+		fprintf(stderr, "Press 'q' or Ctrl-C to abort, almost any other key for status\n");
+	else
 		fprintf(stderr, "Press Ctrl-C to abort, "
 #ifdef SIGUSR1
 		        "or send SIGUSR1 to john process for status\n");
 #else
 		        "or send SIGHUP to john process for status\n");
 #endif
-	else
-	fprintf(stderr, "Press 'q' or Ctrl-C to abort, "
-	    "almost any other key for status\n");
+
 	printed = 1;
 }
 
@@ -162,19 +184,19 @@ void crk_init(struct db_main *db, void (*fix_state)(void),
 		error();
 	}
 
-#if defined(HAVE_OPENCL) || defined(HAVE_CUDA)
+#if HAVE_OPENCL
 	/* This erases the 'spinning wheel' cursor from self-test */
-	if (john_main_process)
+	if (john_main_process && isatty(fileno(stderr)))
 		fprintf(stderr, " \b");
 #endif
 
 	crk_db = db;
-	memcpy(&crk_params, &db->format->params, sizeof(struct fmt_params));
+	crk_params = &db->format->params;
 	memcpy(&crk_methods, &db->format->methods, sizeof(struct fmt_methods));
 
 #if CRK_PREFETCH && !defined(crk_prefetch)
 	{
-		unsigned int m = crk_params.max_keys_per_crypt;
+		unsigned int m = crk_params->max_keys_per_crypt;
 		if (m > CRK_PREFETCH) {
 			unsigned int n = (m + CRK_PREFETCH - 1) / CRK_PREFETCH;
 			crk_prefetch = (m + n - 1) / n;
@@ -189,6 +211,7 @@ void crk_init(struct db_main *db, void (*fix_state)(void),
 #endif
 
 	if (db->loaded) crk_init_salt();
+	crk_process_key_max_keys = 0; /* use slow path at first */
 	crk_last_key = crk_key_index = 0;
 	crk_last_salt = NULL;
 
@@ -202,10 +225,11 @@ void crk_init(struct db_main *db, void (*fix_state)(void),
 
 	crk_guesses = guesses;
 
+	kpc_warn = crk_params->min_keys_per_crypt;
+
 	if (db->loaded) {
-		size = crk_params.max_keys_per_crypt * sizeof(int64);
-		memset(crk_timestamps = mem_alloc_tiny(size, sizeof(int64)),
-		       -1, size);
+		size = crk_params->max_keys_per_crypt * sizeof(uint64_t);
+		memset(crk_timestamps = mem_alloc(size), -1, size);
 	} else
 		crk_stdout_key[0] = 0;
 
@@ -214,6 +238,26 @@ void crk_init(struct db_main *db, void (*fix_state)(void),
 	crk_help();
 
 	idle_init(db->format);
+
+	if (options.verbosity < VERB_DEFAULT)
+		kpc_warn_limit = 0;
+	else
+	if ((kpc_warn_limit =
+	     cfg_get_int(SECTION_OPTIONS, NULL, "MaxKPCWarnings")) == -1)
+		kpc_warn_limit = CRK_KPC_WARN;
+
+	if (!(options.flags & FLG_SINGLE_CHK))
+		rules_stacked_after = !!(crk_stacked_rule_count = rules_init_stack(options.rule_stack, &crk_rule_stack, db));
+	else
+		crk_stacked_rule_count = 0;
+
+	if (crk_stacked_rule_count == 0)
+		crk_stacked_rule_count = 1;
+
+	if (rules_stacked_after)
+		crk_process_key = process_key_stack_rules;
+	else
+		crk_process_key = process_key;
 }
 
 /*
@@ -236,6 +280,10 @@ static void crk_remove_salt(struct db_salt *salt)
 		int hash = crk_methods.salt_hash(salt->salt);
 
 		if (crk_db->salt_hash[hash] == salt) {
+			if (options.verbosity >= VERB_DEBUG) {
+				fprintf(stderr, "Got rid of %s, %s\n", strncasecmp(crk_params->label, "wpapsk", 6) ? "a salt" : (char*)(salt->salt) + 4, crk_loaded_counts());
+				status_update_counts();
+			}
 			if (salt->next &&
 			    crk_methods.salt_hash(salt->next->salt) == hash)
 				crk_db->salt_hash[hash] = salt->next;
@@ -243,11 +291,7 @@ static void crk_remove_salt(struct db_salt *salt)
 				crk_db->salt_hash[hash] = NULL;
 		}
 	}
-#ifdef POTSYNC_DEBUG
-	if (options.verbosity > 1 && crk_params.binary_size &&
-	    crk_db->salt_count < crk_db->password_count)
-		log_event("- got rid of a salt, %d left", crk_db->salt_count);
-#endif
+
 	dyna_salt_remove(salt->salt);
 }
 
@@ -259,12 +303,17 @@ static void crk_remove_hash(struct db_salt *salt, struct db_password *pw)
 	struct db_password **start, **current;
 	int hash, count;
 
+	assert(salt->count >= 1);
+
 	crk_db->password_count--;
+
+	BLOB_FREE(crk_db->format, pw->binary);
 
 	if (!--salt->count) {
 		salt->list = NULL; /* "single crack" mode might care */
 		crk_remove_salt(salt);
-		return;
+		if (!salt->bitmap)
+			return;
 	}
 
 /*
@@ -320,13 +369,12 @@ static void crk_remove_hash(struct db_salt *salt, struct db_password *pw)
  * Or, if FMT_REMOVE, the format explicitly intends to traverse the list
  * during cracking, and will remove entries at that point.
  */
-	if (crk_guesses || (crk_params.flags & FMT_REMOVE))
+	if (crk_guesses || (crk_params->flags & FMT_REMOVE))
 		pw->binary = NULL;
 }
 
 /* Negative index is not counted/reported (got it from pot sync) */
-static int crk_process_guess(struct db_salt *salt, struct db_password *pw,
-	int index)
+static int crk_process_guess(struct db_salt *salt, struct db_password *pw, int index)
 {
 	char utf8buf_key[PLAINTEXT_BUFFER_SIZE + 1];
 	char utf8login[PLAINTEXT_BUFFER_SIZE + 1];
@@ -334,9 +382,8 @@ static int crk_process_guess(struct db_salt *salt, struct db_password *pw,
 	int dupe;
 	char *key, *utf8key, *repkey, *replogin, *repuid;
 
-	if (index >= 0 && index < crk_params.max_keys_per_crypt) {
-		dupe = !memcmp(&crk_timestamps[index],
-		               &status.crypts, sizeof(int64));
+	if (index >= 0 && index < crk_params->max_keys_per_crypt) {
+		dupe = crk_timestamps[index] == status.crypts;
 		crk_timestamps[index] = status.crypts;
 	} else
 		dupe = 0;
@@ -375,7 +422,7 @@ static int crk_process_guess(struct db_salt *salt, struct db_password *pw,
 		}
 		if (options.report_utf8) {
 			repkey = utf8key;
-			if (options.target_enc != UTF_8)
+			if (options.internal_cp != UTF_8)
 				replogin = cp_to_utf8_r(replogin,
 					      utf8login, PLAINTEXT_BUFFER_SIZE);
 		}
@@ -384,23 +431,25 @@ static int crk_process_guess(struct db_salt *salt, struct db_password *pw,
 	}
 
 	// Ok, FIX the salt  ONLY if -regen-lost-salts=X was used.
-	if (options.regen_lost_salts && (crk_db->format->params.flags & FMT_DYNAMIC) == FMT_DYNAMIC)
+	if (options.regen_lost_salts && (crk_params->flags & FMT_DYNAMIC) == FMT_DYNAMIC)
 		crk_guess_fixup_salt(pw->source, *(char**)(salt->salt));
+
+	if (options.max_run_time < 0) {
+#if OS_TIMER
+		timer_abort = 0 - options.max_run_time;
+#else
+		timer_abort = status_get_time() - options.max_run_time;
+#endif
+	}
+	if (options.max_cands < 0)
+		john_max_cands = status.cands - options.max_cands + crk_params->max_keys_per_crypt;
 
 	/* If we got this crack from a pot sync, don't report or count */
 	if (index >= 0) {
 		const char *ct;
 		char buffer[LINE_BUFFER_SIZE + 1];
 
-		if (options.max_run_time < 0) {
-#if OS_TIMER
-			timer_abort = 0 - options.max_run_time;
-#else
-			timer_abort = status_get_time() - options.max_run_time;
-#endif
-		}
-
-		if (dupe)
+		if (dupe && !(crk_params->flags & FMT_BLOB))
 			ct = NULL;
 		else
 			ct = ldr_pot_source(
@@ -411,7 +460,7 @@ static int crk_process_guess(struct db_salt *salt, struct db_password *pw,
 		          (char*)ct,
 		          repkey, key, crk_db->options->field_sep_char, index);
 
-		if (options.flags & FLG_CRKSTAT)
+		if (options.crack_status)
 			event_pending = event_status = 1;
 
 		crk_db->guess_count++;
@@ -419,14 +468,30 @@ static int crk_process_guess(struct db_salt *salt, struct db_password *pw,
 
 		if (crk_guesses && !dupe) {
 			strnfcpy(crk_guesses->ptr, key,
-			         crk_params.plaintext_length);
-			crk_guesses->ptr += crk_params.plaintext_length;
+			         crk_params->plaintext_length);
+			crk_guesses->ptr += crk_params->plaintext_length;
 			crk_guesses->count++;
 		}
 	}
 
-	if (!(crk_params.flags & FMT_NOT_EXACT))
+	if (!(crk_params->flags & FMT_NOT_EXACT))
 		crk_remove_hash(salt, pw);
+
+	if (options.regen_lost_salts) {
+		/*
+		 * salt->list pointer was copied to all salts so if the first
+		 * entry was removed, we need to fixup all other salts.  If OTOH
+		 * the last hash was removed, we need to drop all salts.
+		 */
+		struct db_salt *s = crk_db->salts;
+
+		do {
+			if (!crk_db->password_count)
+				crk_remove_salt(s);
+			else if (s->list && s->list->binary == NULL)
+				s->list = s->list->next;
+		} while ((s = s->next));
+	}
 
 	if (!crk_db->salts)
 		return 1;
@@ -436,24 +501,9 @@ static int crk_process_guess(struct db_salt *salt, struct db_password *pw,
 	return 0;
 }
 
-static char *crk_loaded_counts(void)
+char *crk_loaded_counts(void)
 {
-	static char s_loaded_counts[80];
-	char nbuf[24];
-
-	if (crk_db->password_count == 0)
-		return "No remaining hashes";
-
-	if (crk_db->password_count == 1)
-		return "Remaining 1 hash";
-
-	sprintf(s_loaded_counts,
-		"Remaining %d hashes with %s different salts",
-		crk_db->password_count,
-		crk_db->salt_count > 1 ?
-		jtr_itoa(crk_db->salt_count, nbuf, 24, 10) : "no");
-
-	return s_loaded_counts;
+	return john_loaded_counts(crk_db, "Remaining");
 }
 
 static int crk_remove_pot_entry(char *ciphertext)
@@ -462,11 +512,6 @@ static int crk_remove_pot_entry(char *ciphertext)
 	struct db_password *pw;
 	char argcopy[LINE_BUFFER_SIZE];
 	void *pot_salt;
-	char *binary = crk_methods.binary(ciphertext);
-#ifdef POTSYNC_DEBUG
-	struct tms buffer;
-	clock_t start = times(&buffer), end;
-#endif
 
 	/*
 	 * If the pot entry is truncated from a huge ciphertext, we have
@@ -492,10 +537,6 @@ static int crk_remove_pot_entry(char *ciphertext)
 			} while ((pw = pw->next));
 		}  while ((salt = salt->next));
 
-#ifdef POTSYNC_DEBUG
-		end = times(&buffer);
-		salt_time += (end - start);
-#endif
 		return 0;
 	}
 
@@ -518,14 +559,10 @@ static int crk_remove_pot_entry(char *ciphertext)
 		salt = crk_db->salts;
 
 	do {
-		if (!dyna_salt_cmp(pot_salt, salt->salt, crk_params.salt_size))
+		if (!dyna_salt_cmp(pot_salt, salt->salt, crk_params->salt_size))
 			break;
 	}  while ((salt = salt->next));
 
-#ifdef POTSYNC_DEBUG
-	end = times(&buffer);
-	salt_time += (end - start);
-#endif
 	dyna_salt_remove(pot_salt);
 	if (!salt)
 		return 0;
@@ -549,8 +586,10 @@ static int crk_remove_pot_entry(char *ciphertext)
 	}
 	else {
 		int hash;
+		char *binary = crk_methods.binary(ciphertext);
 
 		hash = crk_methods.binary_hash[salt->hash_size](binary);
+		BLOB_FREE(crk_db->format, binary);
 		if (!(salt->bitmap[hash / (sizeof(*salt->bitmap) * 8)] &
 		      (1U << (hash % (sizeof(*salt->bitmap) * 8)))))
 			return 0;
@@ -579,25 +618,46 @@ int crk_reload_pot(void)
 {
 	char line[LINE_BUFFER_SIZE];
 	FILE *pot_file;
-	int total = crk_db->password_count, others;
-#ifdef POTSYNC_DEBUG
-	struct tms buffer;
-	clock_t start = times(&buffer), end;
+	int passwords = crk_db->password_count;
+	int salts = crk_db->salt_count;
 
-	salt_time = 0;
-#endif
 	event_reload = 0;
 
-	if (crk_params.flags & FMT_NOT_EXACT)
+	if (event_abort)
+		return 0;
+
+	if (crk_params->flags & FMT_NOT_EXACT)
 		return 0;
 
 	if (!(pot_file = fopen(path_expand(options.activepot), "rb")))
 		pexit("fopen: %s", path_expand(options.activepot));
 
-	if (crk_pot_pos && (jtr_fseek64(pot_file, crk_pot_pos, SEEK_SET) == -1)) {
-		perror("fseek");
-		rewind(pot_file);
-		crk_pot_pos = 0;
+	if (crk_pot_pos) {
+		if (jtr_fseek64(pot_file, 0, SEEK_END) == -1)
+			pexit("fseek to end of pot file");
+		if (crk_pot_pos == jtr_ftell64(pot_file)) {
+			if (fclose(pot_file))
+				pexit("fclose");
+			return 0;
+		}
+		if (crk_pot_pos > jtr_ftell64(pot_file)) {
+			if (john_main_process) {
+				fprintf(stderr,
+				        "Note: pot file shrunk. Recovering.\n");
+			}
+			log_event("Note: pot file shrunk. Recovering.");
+			rewind(pot_file);
+			crk_pot_pos = 0;
+		}
+		if (jtr_fseek64(pot_file, crk_pot_pos, SEEK_SET) == -1) {
+			perror("fseek to sync pos. of pot file");
+			log_event("fseek to sync pos. of pot file: %s",
+			          strerror(errno));
+			crk_pot_pos = 0;
+			if (fclose(pot_file))
+				pexit("fclose");
+			return 0;
+		}
 	}
 
 	ldr_in_pot = 1; /* Mutes some warnings from valid() et al */
@@ -610,6 +670,7 @@ int crk_reload_pot(void)
 			continue;
 		*p = 0;
 
+		fields[0] = "";
 		fields[1] = ciphertext;
 		ciphertext = crk_methods.prepare(fields, crk_db->format);
 		if (ldr_trunc_valid(ciphertext, crk_db->format)) {
@@ -627,27 +688,19 @@ int crk_reload_pot(void)
 	if (fclose(pot_file))
 		pexit("fclose");
 
-	others = total - crk_db->password_count;
+	passwords -= crk_db->password_count;
+	salts -= crk_db->salt_count;
 
-	if (others)
-		log_event("+ pot sync removed %d hashes; %s",
-		          others, crk_loaded_counts());
+	if (john_main_process && passwords) {
+		log_event("+ pot sync removed %d hashes/%d salts; %s",
+		          passwords, salts, crk_loaded_counts());
 
-	if (others && options.verbosity > VERB_LEGACY) {
-		if (options.node_count)
-			fprintf(stderr, "%u: %s\n",
-			        options.node_min, crk_loaded_counts());
-		else
-			fprintf(stderr, "%s\n", crk_loaded_counts());
+		if (salts && cfg_get_bool(SECTION_OPTIONS, NULL,
+		                          "ShowSaltProgress", 0)) {
+			fprintf(stderr, "%s after pot sync\n", crk_loaded_counts());
+			status_update_counts();
+		}
 	}
-
-#ifdef POTSYNC_DEBUG
-	end = times(&buffer);
-#if defined(_SC_CLK_TCK) && !defined(CLK_TCK)
-#define CLK_TCK	sysconf(_SC_CLK_TCK)
-#endif
-	fprintf(stderr, "%s(%u): potsync removed %d hashes in %lu ms (%lu ms finding salts); %s\n", __FUNCTION__, options.node_min, others, 1000UL*(end - start)/CLK_TCK, 1000UL * salt_time / CLK_TCK, crk_loaded_counts());
-#endif
 
 	return (!crk_db->salts);
 }
@@ -681,8 +734,7 @@ static void crk_poll_files(void)
 		log_event("Abort file seen");
 		event_pending = event_abort = 1;
 	}
-	else if (options.pause_file &&
-	         stat(path_expand(options.pause_file), &trigger_stat) == 0) {
+	else if (options.pause_file && stat(path_expand(options.pause_file), &trigger_stat) == 0) {
 #if !HAVE_SYS_TIMES_H
 		clock_t end, start = clock();
 #else
@@ -692,8 +744,7 @@ static void crk_poll_files(void)
 
 		status_print();
 		if (john_main_process)
-			fprintf(stderr, "Pause file seen, going to sleep "
-			        "(session saved)\n");
+			fprintf(stderr, "Pause file seen, going to sleep (session saved)\n");
 		log_event("Pause file seen, going to sleep");
 
 		/* Better save stuff before going to sleep */
@@ -706,12 +757,7 @@ static void crk_poll_files(void)
 				s = sleep(s);
 			} while (s);
 
-		} while (stat(path_expand(options.pause_file),
-		              &trigger_stat) == 0);
-
-		if (john_main_process)
-			fprintf(stderr, "Pause file removed, continuing\n");
-		log_event("Pause file removed, continuing");
+		} while (stat(path_expand(options.pause_file), &trigger_stat) == 0);
 
 		/* Disregard pause time for stats */
 #if !HAVE_SYS_TIMES_H
@@ -719,14 +765,17 @@ static void crk_poll_files(void)
 #else
 		end = times(&buf);
 #endif
-		status.start_time -= (start - end);
+		status.start_time += (end - start);
+
+		int pause_time = (end - start) / clk_tck;
+		log_event("Pause file removed after %d seconds, continuing", pause_time);
+		if (john_main_process)
+			fprintf(stderr, "Pause file removed after %d seconds, continuing\n", pause_time);
 	}
 }
 
 static int crk_process_event(void)
 {
-	event_pending = 0;
-
 #ifdef HAVE_MPI
 	if (event_mpiprobe) {
 		event_mpiprobe = 0;
@@ -751,20 +800,26 @@ static int crk_process_event(void)
 
 	if (event_poll_files) {
 		event_poll_files = 0;
-#if HAVE_LIBDL && defined(HAVE_CUDA) || defined(HAVE_OPENCL)
+#if HAVE_LIBDL && defined(HAVE_OPENCL)
 		gpu_check_temp();
 #endif
 		crk_poll_files();
 	}
+
+	event_pending = event_reload;
 
 	return event_abort;
 }
 
 void crk_set_hybrid_fix_state_func_ptr(fix_state_fp fp)
 {
-	fp_fix_state = fp;
+	hybrid_fix_state = fp;
 }
 
+/*
+ * Called from crk_salt_loop for every salt or, when in Single mode, from
+ * crk_process_salt with just a specific salt.
+ */
 static int crk_password_loop(struct db_salt *salt)
 {
 	int count;
@@ -782,18 +837,65 @@ static int crk_password_loop(struct db_salt *salt)
 	if (event_pending && crk_process_event())
 		return -1;
 
-	if (fp_fix_state)
-		fp_fix_state();
+	/*
+	 * magnum, December 2020:
+	 * I can't fathom how/why this would be the correct place for this, but
+	 * it seems to work and just moving it to the others does break resume
+	 * for hybrid external so here it stays, until further research.
+	 */
+	if (hybrid_fix_state)
+		hybrid_fix_state();
+
+	if (kpc_warn_limit && crk_key_index < kpc_warn) {
+		static int last_warn_kpc, initial_value;
+		int s;
+		uint64_t ps = status.cands;
+
+		if ((s = status_get_time()))
+			ps /= s;
+
+		if (single_running && crk_db->salt_count)
+			ps /= crk_db->salt_count;
+
+		if (!initial_value)
+			initial_value = kpc_warn_limit;
+
+		if (kpc_warn > crk_params->min_keys_per_crypt)
+			kpc_warn = crk_params->min_keys_per_crypt;
+
+		if (crk_key_index < kpc_warn &&
+		    ps <= (kpc_warn - crk_key_index) &&
+		    last_warn_kpc != crk_key_index) {
+
+			last_warn_kpc = crk_key_index;
+			if (options.node_count)
+				fprintf(stderr, "%u: ", NODE);
+			fprintf(stderr, "Warning: Only %d%s candidate%s %s, "
+			        "minimum %d needed for performance.\n",
+			        crk_key_index,
+			        mask_int_cand.num_int_cand > 1 ? " base" : "",
+			        crk_key_index > 1 ? "s" : "",
+			        single_running ? "buffered for the current salt" :
+			        mask_increments_len ? "buffered" : "left",
+			        crk_params->min_keys_per_crypt);
+
+			if (!--kpc_warn_limit) {
+				if (options.node_count)
+					fprintf(stderr, "%u: ", NODE);
+				fprintf(stderr,
+				        "Further messages of this type will be suppressed.\n");
+				log_event(
+"- Saw %d calls to crypt_all() with sub-optimal batch size (stopped counting)",
+				          initial_value);
+			}
+		}
+	}
 
 	count = crk_key_index;
 	match = crk_methods.crypt_all(&count, salt);
 	crk_last_key = count;
 
-	{
-		int64 effective_count;
-		mul32by32(&effective_count, salt->count, count);
-		status_update_crypts(&effective_count, count);
-	}
+	status_update_crypts((uint64_t)salt->count * count, count);
 
 	if (!match)
 		return 0;
@@ -804,12 +906,11 @@ static int crk_password_loop(struct db_salt *salt)
 			if (crk_methods.cmp_all(pw->binary, match))
 			for (index = 0; index < match; index++)
 			if (crk_methods.cmp_one(pw->binary, index))
-			if (crk_methods.cmp_exact(crk_methods.source(
-			    pw->source, pw->binary), index)) {
+			if (crk_methods.cmp_exact(crk_methods.source(pw->source, pw->binary), index)) {
 				if (crk_process_guess(salt, pw, index))
 					return 1;
 				else {
-					if (!(crk_params.flags & FMT_NOT_EXACT))
+					if (!(crk_params->flags & FMT_NOT_EXACT))
 						break;
 				}
 			}
@@ -922,10 +1023,17 @@ static int crk_password_loop(struct db_salt *salt)
 	return 0;
 }
 
+/*
+ * When crk_process_key() has a complete batch, it calls this function
+ * to run the batch with all salts.
+ */
 static int crk_salt_loop(void)
 {
+	int sc = crk_db->salt_count;
 	int done;
 	struct db_salt *salt;
+
+	single_running = 0;
 
 	if (event_reload && crk_reload_pot())
 		return 1;
@@ -936,11 +1044,12 @@ static int crk_salt_loop(void)
 	if (status.resume_salt) {
 		struct db_salt *s = salt;
 
-		status.resume_salt = 0;	/* only resume the first time */
-		while (s) {
+		/* clear resume so it only works the first time */
+		status.resume_salt = 0;
+		while (s)
+		{
 			if (s->salt_md5[0] == status.resume_salt_md5[0] &&
-			    !memcmp(s->salt_md5, status.resume_salt_md5, 16))
-			{
+			    !memcmp(s->salt_md5, status.resume_salt_md5, 16)) {
 				/* found it!! */
 				salt = s;
 				break;
@@ -948,6 +1057,8 @@ static int crk_salt_loop(void)
 			s = s->next;
 		}
 	}
+
+	/* Normal loop over all salts */
 	do {
 		crk_methods.set_salt(salt->salt);
 		status.resume_salt_md5 = (crk_db->salt_count > 1) ?
@@ -955,31 +1066,39 @@ static int crk_salt_loop(void)
 		if ((done = crk_password_loop(salt)))
 			break;
 	} while ((salt = salt->next));
+
+	if (event_delayed_status || (crk_db->salt_count < sc && john_main_process &&
+	                             cfg_get_bool(SECTION_OPTIONS, NULL, "ShowSaltProgress", 0))) {
+		event_delayed_status = 0;
+		event_status = event_pending = 1;
+	}
+
 	if (!salt || crk_db->salt_count < 2)
 		status.resume_salt_md5 = NULL;
 
-	if (done >= 0) {
-#if !HAVE_OPENCL
-		/* Assumes we'll never overrun 32-bit in one crypt */
-		add32to64(&status.cands, crk_key_index *
-		          mask_int_cand.num_int_cand);
-#else
-		/* Safe for > 4G crypts per call */
-		int64 totcand;
-		mul32by32(&totcand, crk_key_index, mask_int_cand.num_int_cand);
-		add64to64(&status.cands, &totcand);
-#endif
+	if (done >= 0)
+		status.cands +=
+			(uint64_t)crk_key_index * mask_int_cand.num_int_cand;
+
+	if (john_max_cands && !event_abort) {
+		if (status.cands >= john_max_cands)
+			event_abort = event_pending = 1;
 	}
 
 	if (salt)
 		return 1;
 
+	crk_process_key_max_keys = 0; /* use slow path next time */
 	crk_key_index = 0;
 	crk_last_salt = NULL;
-	if (options.flags & FLG_MASK_STACKED)
-		mask_fix_state();
-	else
-	crk_fix_state();
+
+	if (event_fix_state) {
+		if (options.flags & FLG_MASK_STACKED)
+			mask_fix_state();
+		else
+			crk_fix_state();
+		event_fix_state = 0;
+	}
 
 	if (ext_abort)
 		event_abort = 1;
@@ -993,18 +1112,64 @@ static int crk_salt_loop(void)
 	return ext_abort;
 }
 
-int crk_process_key(char *key)
+/*
+ * Process an incomplete batch; This is used by mask mode before
+ * resetting the format with a changed internal mask.
+ */
+int crk_process_buffer(void)
 {
+	if (crk_db->loaded && crk_key_index)
+		return crk_salt_loop();
+
+	if (event_pending && crk_process_event())
+		return 1;
+
+	if (ext_abort)
+		event_abort = 1;
+
+	if (ext_status && !event_abort) {
+		ext_status = 0;
+		event_status = 0;
+		status_print();
+	}
+
+	return ext_abort;
+}
+
+/*
+ * All modes but Single call this function (as crk_process_key)
+ * for each candidate.
+ */
+static int process_key(char *key)
+{
+	if (crk_key_index < crk_process_key_max_keys) {
+		crk_methods.set_key(key, crk_key_index++);
+
+		if (crk_key_index >= crk_process_key_max_keys)
+			return crk_salt_loop();
+
+		return 0;
+	}
+
 	if (crk_db->loaded) {
+		int max_keys = crk_params->max_keys_per_crypt;
+
+		if (options.force_maxkeys | status.resume_salt) { /* bitwise OR */
+			if (options.force_maxkeys && max_keys > options.force_maxkeys)
+				max_keys = options.force_maxkeys;
+			if (status.resume_salt && max_keys > status.resume_salt)
+				max_keys = status.resume_salt;
+		}
+
 		if (crk_key_index == 0)
 			crk_methods.clear_keys();
 
 		crk_methods.set_key(key, crk_key_index++);
 
-		if (crk_key_index >= crk_params.max_keys_per_crypt ||
-		    (options.force_maxkeys &&
-		     crk_key_index >= options.force_maxkeys))
+		if (crk_key_index >= max_keys)
 			return crk_salt_loop();
+
+		crk_process_key_max_keys = max_keys; /* use fast path next time */
 
 		return 0;
 	}
@@ -1013,19 +1178,27 @@ int crk_process_key(char *key)
 	sig_timer_emu_tick();
 #endif
 
-	if (event_pending)
-	if (crk_process_event()) return 1;
+	if (event_pending && crk_process_event())
+		return 1;
 
-	strnzcpy(crk_stdout_key, key, crk_params.plaintext_length + 1);
+	strnzcpy(crk_stdout_key, key, crk_params->plaintext_length + 1);
 	if (options.verbosity > 1)
 		puts(crk_stdout_key);
 
 	status_update_cands(1);
 
-	if (options.flags & FLG_MASK_STACKED)
-		mask_fix_state();
-	else
-	crk_fix_state();
+	if (john_max_cands && !event_abort) {
+		if (status.cands >= john_max_cands)
+			event_abort = event_pending = 1;
+	}
+
+	if (event_fix_state) {
+		if (options.flags & FLG_MASK_STACKED)
+			mask_fix_state();
+		else
+			crk_fix_state();
+		event_fix_state = 0;
+	}
 
 	if (ext_abort)
 		event_abort = 1;
@@ -1039,12 +1212,26 @@ int crk_process_key(char *key)
 	return ext_abort;
 }
 
+static int process_key_stack_rules(char *key)
+{
+	int ret = 0;
+	char *word;
+
+	while ((word = rules_process_stack_all(key, &crk_rule_stack)))
+		if ((ret = process_key(word)))
+			break;
+
+	return ret;
+}
+
 /* This function is used by single.c only */
 int crk_process_salt(struct db_salt *salt)
 {
 	char *ptr;
 	char key[PLAINTEXT_BUFFER_SIZE];
 	int count, count_from_guesses, index;
+
+	single_running = 1;
 
 	if (crk_guesses) {
 		crk_guesses->count = 0;
@@ -1059,14 +1246,15 @@ int crk_process_salt(struct db_salt *salt)
 	count_from_guesses = salt->keys->count_from_guesses;
 	index = 0;
 
-	crk_methods.clear_keys();
-
 	while (count--) {
-		strnzcpy(key, ptr, crk_params.plaintext_length + 1);
-		ptr += crk_params.plaintext_length;
+		strnzcpy(key, ptr, options.eff_maxlength + 1);
+		ptr += options.eff_maxlength;
+
+		if (index == 0)
+			crk_methods.clear_keys();
 
 		crk_methods.set_key(key, index++);
-		if (index >= crk_params.max_keys_per_crypt || !count ||
+		if (index >= crk_params->max_keys_per_crypt || !count ||
 		    (options.force_maxkeys && index >= options.force_maxkeys)) {
 			int done;
 			crk_key_index = index;
@@ -1082,11 +1270,14 @@ int crk_process_salt(struct db_salt *salt)
 				int not_from_guesses =
 				    index - count_from_guesses;
 				if (not_from_guesses > 0) {
-					add32to64(&status.cands,
-					    not_from_guesses);
+					status.cands += not_from_guesses;
 					count_from_guesses = 0;
-				} else
+					if (john_max_cands && !event_abort &&
+					    status.cands >= john_max_cands)
+						event_abort = event_pending = 1;
+				} else {
 					count_from_guesses -= index;
+				}
 			}
 			if (done)
 				return 1;
@@ -1129,6 +1320,8 @@ void crk_done(void)
 	if (crk_db->loaded) {
 		if (crk_key_index && crk_db->salts && !event_abort)
 			crk_salt_loop();
+
+		MEM_FREE(crk_timestamps);
 	}
 	c_cleanup();
 }

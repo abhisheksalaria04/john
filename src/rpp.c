@@ -12,11 +12,12 @@
 #include "logger.h"
 #include "common.h" /* for atoi16 */
 #include "misc.h"   /* for strtokm */
-#include "memdbg.h"
+#include "options.h"
+#include "unicode.h"
 
 int rpp_real_run = 0;
 
-int rpp_init(struct rpp_context *ctx, char *subsection)
+int rpp_init(struct rpp_context *ctx, const char *subsection)
 {
 	struct cfg_list *list;
 
@@ -57,8 +58,10 @@ int rpp_init(struct rpp_context *ctx, char *subsection)
 		cp = strtokm(buf, ",");
 		while (cp) {
 			struct cfg_line *lp;
-			if ((list = cfg_get_list(SECTION_RULES, cp))==NULL)
+			if ((list = cfg_get_list(SECTION_RULES, cp)) == NULL) {
+				fprintf(stderr, "\"%s\" not found; ", cp);
 				return 1;
+			}
 			lp = list->head;
 			while (lp) {
 				if (!first) {
@@ -115,6 +118,30 @@ static void rpp_process_rule(struct rpp_context *ctx)
 	end = output + RULE_BUFFER_SIZE - 1;
 	flag_p = flag_r = 0;
 	ctx->count = ctx->refs_count = 0;
+
+	if (options.internal_cp != UTF_8 && options.internal_cp != ENC_RAW) {
+		/*
+		 * Rules encoded as UTF-8 and guarded with -U reject flag will be converted
+		 * in-place to current internal codepage, if possible.
+		 * If this fails, we need to reject all rules rendered from this PP rule, so
+		 * we change -U to -- which is later parsed as "always reject".
+		 */
+		if (input[0] == '-' && input[1] == 'U' && valid_utf8(input) > 1) {
+			char conv[RULE_BUFFER_SIZE];
+
+			utf8_to_cp_r(ctx->input->data, conv, RULE_BUFFER_SIZE);
+
+			if (strlen(conv) == strlen8(input))
+				strcpy(ctx->input->data, conv); /* Always shorter than original */
+			else {
+				static int warned;
+
+				if (!warned++)
+					log_event("- Rule preprocessor: Rejected rule(s) not fitting current internal codepage");
+				input[1] = '-';
+			}
+		}
+	}
 
 	while (*input && output < end)
 	switch (*input) {
@@ -309,7 +336,7 @@ char *rpp_next(struct rpp_context *ctx)
 			len = strlen(cp)-1;
 			if (!strncmp(ctx->output, ".log both ", 10) ||
 			    !strncmp(ctx->output, ".log screen ", 11))
-				fprintf (stderr, "%*.*s\n", len,len, cp);
+				fprintf(stderr, "%*.*s\n", len,len, cp);
 			if (strncmp(ctx->output, ".log screen ", 11))
 				log_event ("%*.*s\n", len, len, cp);
 			return rpp_next(ctx);

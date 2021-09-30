@@ -15,18 +15,12 @@ john_register_one(&fmt_tcpmd5);
 #else
 
 #include <string.h>
+
 #ifdef _OPENMP
 #include <omp.h>
-#ifdef __MIC__
-#ifndef OMP_SCALE
-#define OMP_SCALE 8192
 #endif
-#else
-#ifndef OMP_SCALE
-#define OMP_SCALE 32768  // scaled K8-dual HT
-#endif
-#endif
-#endif
+
+#define OMP_SCALE               16  // MKPC and OMP_SCALE tuned on Core i5-6500
 
 #include "arch.h"
 #include "md5.h"
@@ -35,26 +29,24 @@ john_register_one(&fmt_tcpmd5);
 #include "formats.h"
 #include "params.h"
 #include "options.h"
-#include "memdbg.h"
 
 #define FORMAT_LABEL            "tcp-md5"
-#define FORMAT_NAME             "TCP MD5 Signatures, BGP"
+#define FORMAT_NAME             "TCP MD5 Signatures, BGP, MSDP"
 #define FORMAT_TAG              "$tcpmd5$"
 #define TAG_LENGTH              (sizeof(FORMAT_TAG) - 1)
 #define ALGORITHM_NAME          "MD5 32/" ARCH_BITS_STR
 #define BENCHMARK_COMMENT       ""
-#define BENCHMARK_LENGTH        0
+#define BENCHMARK_LENGTH        7
 
 // Linux Kernel says "#define TCP_MD5SIG_MAXKEYLEN 80"
 #define PLAINTEXT_LENGTH        80
-
 #define BINARY_SIZE             16
-#define BINARY_ALIGN            sizeof(ARCH_WORD_32)
+#define BINARY_ALIGN            sizeof(uint32_t)
 #define SALT_SIZE               sizeof(struct custom_salt)
 #define SALT_ALIGN              sizeof(int)
-#define MIN_KEYS_PER_CRYPT      1
-#define MAX_KEYS_PER_CRYPT      1
 #define MAX_SALT                1500
+#define MIN_KEYS_PER_CRYPT      1
+#define MAX_KEYS_PER_CRYPT      128
 
 static struct fmt_tests tests[] = {
 	/* BGP TCP_MD5SIG hashes */
@@ -65,7 +57,7 @@ static struct fmt_tests tests[] = {
 
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
 static int *saved_len;
-static ARCH_WORD_32 (*crypt_out)[BINARY_SIZE / sizeof(ARCH_WORD_32)];
+static uint32_t (*crypt_out)[BINARY_SIZE / sizeof(uint32_t)];
 
 static struct custom_salt {
 	int length;
@@ -74,13 +66,8 @@ static struct custom_salt {
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	int omp_t = omp_get_num_threads();
+	omp_autotune(self, OMP_SCALE);
 
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
 	saved_key = mem_calloc(self->params.max_keys_per_crypt,
 	                       sizeof(*saved_key));
 	saved_len = mem_calloc(self->params.max_keys_per_crypt,
@@ -170,12 +157,12 @@ static void set_salt(void *salt)
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
 	const int count = *pcount;
-	int index = 0;
+	int index;
+
 #ifdef _OPENMP
 #pragma omp parallel for
-	for (index = 0; index < count; index++)
 #endif
-	{
+	for (index = 0; index < count; index++) {
 		MD5_CTX ctx;
 
 		MD5_Init(&ctx);
@@ -184,16 +171,16 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 		MD5_Update(&ctx, saved_key[index], saved_len[index]);
 		MD5_Final((unsigned char*)crypt_out[index], &ctx);
 	}
+
 	return count;
 }
 
 static int cmp_all(void *binary, int count)
 {
-	int index = 0;
-#ifdef _OPENMP
-	for (; index < count; index++)
-#endif
-		if (((ARCH_WORD_32*)binary)[0] == crypt_out[index][0])
+	int index;
+
+	for (index = 0; index < count; index++)
+		if (((uint32_t*)binary)[0] == crypt_out[index][0])
 			return 1;
 	return 0;
 }
@@ -236,7 +223,7 @@ struct fmt_main fmt_tcpmd5 = {
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_CASE | FMT_8_BIT | FMT_OMP,
+		FMT_CASE | FMT_8_BIT | FMT_OMP | FMT_HUGE_INPUT,
 		{ NULL },
 		{ FORMAT_TAG },
 		tests
@@ -252,7 +239,7 @@ struct fmt_main fmt_tcpmd5 = {
 		{ NULL },
 		fmt_default_source,
 		{
-			fmt_default_binary_hash /* Not usable with $SOURCE_HASH$ */
+			fmt_default_binary_hash
 		},
 		fmt_default_salt_hash,
 		NULL,
@@ -262,7 +249,7 @@ struct fmt_main fmt_tcpmd5 = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			fmt_default_get_hash /* Not usable with $SOURCE_HASH$ */
+			fmt_default_get_hash
 		},
 		cmp_all,
 		cmp_one,

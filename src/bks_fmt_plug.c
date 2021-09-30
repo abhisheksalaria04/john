@@ -12,6 +12,11 @@ john_register_one(&fmt_bks);
 #else
 
 #include <string.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "arch.h"
 #include "misc.h"
 #include "memory.h"
@@ -19,36 +24,34 @@ john_register_one(&fmt_bks);
 #include "formats.h"
 #include "johnswap.h"
 #include "hmac_sha.h"
-#ifdef _OPENMP
-#include <omp.h>
-#ifndef OMP_SCALE
-#define OMP_SCALE               1
-#endif
-#endif
 #include "twofish.h"
 #include "sha.h"
 #include "loader.h"
 #include "simd-intrinsics.h"
 #include "pkcs12.h"
-#include "memdbg.h"
 
 #define FORMAT_LABEL		"BKS"
-#define FORMAT_NAME		""
-#define ALGORITHM_NAME		"PKCS12 PBE " SHA1_ALGORITHM_NAME
+#define FORMAT_NAME		"BouncyCastle"
+#define ALGORITHM_NAME		"PKCS#12 PBE (SHA1) " SHA1_ALGORITHM_NAME
 #define PLAINTEXT_LENGTH	31
 #define SALT_SIZE		sizeof(struct custom_salt)
-#define SALT_ALIGN		sizeof(ARCH_WORD_32)
+#define SALT_ALIGN		sizeof(uint32_t)
 #define BINARY_SIZE		0
 #define BINARY_ALIGN		1
 #define BENCHMARK_COMMENT	""
-#define BENCHMARK_LENGTH	-1
+#define BENCHMARK_LENGTH	0x507 // FIXME: format lacks cost
 #if !defined(SIMD_COEF_32)
 #define MIN_KEYS_PER_CRYPT	1
-#define MAX_KEYS_PER_CRYPT	1
+#define MAX_KEYS_PER_CRYPT	4
 #else
 #define MIN_KEYS_PER_CRYPT	SSE_GROUP_SZ_SHA1
-#define MAX_KEYS_PER_CRYPT	SSE_GROUP_SZ_SHA1
+#define MAX_KEYS_PER_CRYPT	(SSE_GROUP_SZ_SHA1 * 4)
 #endif
+
+#ifndef OMP_SCALE
+#define OMP_SCALE               16 // Tuned w/ MKPC for core i7
+#endif
+
 #define FORMAT_TAG		"$bks$"
 #define FORMAT_TAG_LENGTH	(sizeof(FORMAT_TAG) - 1)
 
@@ -88,13 +91,8 @@ static int *cracked, any_cracked;  // "cracked array" approach is required for U
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	static int omp_t = 1;
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
+	omp_autotune(self, OMP_SCALE);
+
 	saved_key = mem_calloc(self->params.max_keys_per_crypt,
 			sizeof(*saved_key));
 	saved_len = mem_calloc(self->params.max_keys_per_crypt,
@@ -205,17 +203,23 @@ static void *get_salt(char *ciphertext)
 	p = strtokm(NULL, "$");
 	cs.saltlen = atoi(p);
 	p = strtokm(NULL, "$");
-	for(i = 0; i < cs.saltlen; i++)
+	for (i = 0; i < cs.saltlen; i++)
 		cs.salt[i] = (atoi16[ARCH_INDEX(p[2*i])] << 4) | atoi16[ARCH_INDEX(p[2*i+1])];
 	p = strtokm(NULL, "$");
 	cs.store_data_length = hexlenl(p, 0) / 2;
-	for(i = 0; i < cs.store_data_length; i++)
+	for (i = 0; i < cs.store_data_length; i++)
 		cs.store_data[i] = (atoi16[ARCH_INDEX(p[2*i])] << 4) | atoi16[ARCH_INDEX(p[2*i+1])];
 	p = strtokm(NULL, "$");
 	if (cs.format == 0) { // BKS keystore
-		for(i = 0; i < 20; i++)
+		for (i = 0; i < 20; i++)
 			cs.store_hmac[i] = (atoi16[ARCH_INDEX(p[2*i])] << 4) | atoi16[ARCH_INDEX(p[2*i+1])];
+#if !ARCH_LITTLE_ENDIAN && !defined(SIMD_COEF_32)
+		alter_endianity(cs.store_hmac, 20);
+#endif
 	}
+#if !ARCH_LITTLE_ENDIAN && !defined(SIMD_COEF_32)
+	alter_endianity(cs.store_hmac, 20);
+#endif
 	MEM_FREE(keeptr);
 
 	return (void *)&cs;
@@ -239,10 +243,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-#if defined(_OPENMP) || MAX_KEYS_PER_CRYPT > 1
-#endif
-	for (index = 0; index < count; index += MAX_KEYS_PER_CRYPT)
-	{
+	for (index = 0; index < count; index += MIN_KEYS_PER_CRYPT) {
 #if !defined(SIMD_COEF_32)
 		if (cur_salt->format == 0) {
 			unsigned char mackey[20];
@@ -440,7 +441,7 @@ struct fmt_main fmt_bks = {
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_CASE | FMT_8_BIT | FMT_OMP,
+		FMT_CASE | FMT_8_BIT | FMT_UNICODE | FMT_ENC | FMT_OMP | FMT_HUGE_INPUT,
 		{ NULL },
 		{ FORMAT_TAG },
 		tests
@@ -456,7 +457,7 @@ struct fmt_main fmt_bks = {
 		{ NULL },
 		fmt_default_source,
 		{
-			fmt_default_binary_hash /* Not usable with $SOURCE_HASH$ */
+			fmt_default_binary_hash
 		},
 		fmt_default_salt_hash,
 		NULL,
@@ -466,7 +467,7 @@ struct fmt_main fmt_bks = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			fmt_default_get_hash /* Not usable with $SOURCE_HASH$ */
+			fmt_default_get_hash
 		},
 		cmp_all,
 		cmp_one,

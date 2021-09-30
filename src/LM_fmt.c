@@ -1,6 +1,6 @@
 /*
  * This file is part of John the Ripper password cracker,
- * Copyright (c) 1996-2001,2005,2010-2012 by Solar Designer
+ * Copyright (c) 1996-2001,2005,2010-2012,2017 by Solar Designer
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted.
@@ -8,6 +8,7 @@
  * There's ABSOLUTELY NO WARRANTY, express or implied.
  */
 
+#include <stdint.h>
 #include <string.h>
 
 #include "arch.h"
@@ -16,7 +17,6 @@
 #include "DES_bs.h"
 #include "common.h"
 #include "formats.h"
-#include "memdbg.h"
 
 #define FORMAT_LABEL			"LM"
 #define FORMAT_NAME			""
@@ -24,7 +24,7 @@
 #define FORMAT_TAG_LEN			(sizeof(FORMAT_TAG)-1)
 
 #define BENCHMARK_COMMENT		""
-#define BENCHMARK_LENGTH		-1
+#define BENCHMARK_LENGTH		7
 
 #define PLAINTEXT_LENGTH		7
 #define CIPHERTEXT_LENGTH		32
@@ -48,8 +48,8 @@ static struct fmt_tests tests[] = {
 
 #define ALGORITHM_NAME			DES_BS_ALGORITHM_NAME
 
-#define BINARY_SIZE			(sizeof(ARCH_WORD_32) * 2)
-#define BINARY_ALIGN			sizeof(ARCH_WORD_32)
+#define BINARY_SIZE			(sizeof(uint32_t) * 2)
+#define BINARY_ALIGN			sizeof(uint32_t)
 #define SALT_SIZE			0
 #define SALT_ALIGN			1
 
@@ -71,7 +71,7 @@ static void init(struct fmt_main *self)
 
 static char *prepare(char *fields[10], struct fmt_main *self)
 {
-	if (fields[2] && strlen(fields[2]) == 32)
+	if (fields[1][0] != '$' && fields[2] && strlen(fields[2]) == 32)
 		return fields[2];
 	return fields[1];
 }
@@ -111,13 +111,11 @@ static char *split(char *ciphertext, int index, struct fmt_main *self)
 	memcpy(out, FORMAT_TAG, FORMAT_TAG_LEN);
 
 	if (index)
-		memcpy(&out[FORMAT_TAG_LEN], &ciphertext[16], 16);
+		memcpylwr(&out[FORMAT_TAG_LEN], &ciphertext[16], 16);
 	else
-		memcpy(&out[FORMAT_TAG_LEN], ciphertext, 16);
+		memcpylwr(&out[FORMAT_TAG_LEN], ciphertext, 16);
 
 	out[20] = 0;
-
-	strlwr(&out[FORMAT_TAG_LEN]);
 
 	return out;
 }
@@ -134,42 +132,42 @@ static char *source(char *source, void *binary)
 
 static int binary_hash_0(void *binary)
 {
-	return *(ARCH_WORD_32 *)binary & PH_MASK_0;
+	return *(uint32_t *)binary & PH_MASK_0;
 }
 
 static int binary_hash_1(void *binary)
 {
-	return *(ARCH_WORD_32 *)binary & PH_MASK_1;
+	return *(uint32_t *)binary & PH_MASK_1;
 }
 
 static int binary_hash_2(void *binary)
 {
-	return *(ARCH_WORD_32 *)binary & PH_MASK_2;
+	return *(uint32_t *)binary & PH_MASK_2;
 }
 
 static int binary_hash_3(void *binary)
 {
-	return *(ARCH_WORD_32 *)binary & PH_MASK_3;
+	return *(uint32_t *)binary & PH_MASK_3;
 }
 
 static int binary_hash_4(void *binary)
 {
-	return *(ARCH_WORD_32 *)binary & PH_MASK_4;
+	return *(uint32_t *)binary & PH_MASK_4;
 }
 
 static int binary_hash_5(void *binary)
 {
-	return *(ARCH_WORD_32 *)binary & PH_MASK_5;
+	return *(uint32_t *)binary & PH_MASK_5;
 }
 
 static int binary_hash_6(void *binary)
 {
-	return *(ARCH_WORD_32 *)binary & PH_MASK_6;
+	return *(uint32_t *)binary & PH_MASK_6;
 }
 
 static int cmp_one(void *binary, int index)
 {
-	return DES_bs_cmp_one((ARCH_WORD_32 *)binary, 64, index);
+	return DES_bs_cmp_one((uint32_t *)binary, 64, index);
 }
 
 static int cmp_exact(char *source, int index)

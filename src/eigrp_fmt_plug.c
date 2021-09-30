@@ -18,26 +18,9 @@ john_register_one(&fmt_eigrp);
 #else
 
 #include <string.h>
+
 #ifdef _OPENMP
 #include <omp.h>
-// OMP_SCALE on Intel core i7
-// 2048 - 12030k/11596k
-// 4096 - 12575k/13114k
-// 8192 - 13316k/13921k
-// 16k  - 13547k/14458k
-// 32k  - 16106k/14700k
-// 64k  - 16106k/14700k
-// 64k  - 16674k/14674k
-// 128k - 17795k/14663k  --test=0 has a tiny delay, but not bad.
-#ifdef __MIC__
-#ifndef OMP_SCALE
-#define OMP_SCALE 8192
-#endif
-#else
-#ifndef OMP_SCALE
-#define OMP_SCALE 131072
-#endif
-#endif
 #endif
 
 #include "arch.h"
@@ -47,25 +30,34 @@ john_register_one(&fmt_eigrp);
 #include "formats.h"
 #include "params.h"
 #include "options.h"
-#include "memdbg.h"
-#include "escrypt/sha256.h"
+#include "yescrypt/sha256.h"
 
 #define FORMAT_LABEL            "eigrp"
 #define FORMAT_NAME             "EIGRP MD5 / HMAC-SHA-256 authentication"
 #define FORMAT_TAG              "$eigrp$"
 #define TAG_LENGTH              (sizeof(FORMAT_TAG) - 1)
-#define ALGORITHM_NAME          "MD5 32/" ARCH_BITS_STR
+#define ALGORITHM_NAME          "MD5/SHA-256 32/" ARCH_BITS_STR
 #define BENCHMARK_COMMENT       ""
-#define BENCHMARK_LENGTH        0
+#define BENCHMARK_LENGTH        7
 #define PLAINTEXT_LENGTH        81 // IOU accepts larger strings but doesn't use them fully, passwords are zero padded to a minimum length of 16 (for MD5 hashes only)!
 #define BINARY_SIZE             16 // MD5 hash or first 16 bytes of HMAC-SHA-256
-#define BINARY_ALIGN            sizeof(ARCH_WORD_32)
+#define BINARY_ALIGN            sizeof(uint32_t)
 #define SALT_SIZE               sizeof(struct custom_salt)
 #define SALT_ALIGN              sizeof(int)
 #define MAX_SALT_SIZE           1024
-#define MIN_KEYS_PER_CRYPT      1
-#define MAX_KEYS_PER_CRYPT      1
 #define HEXCHARS                "0123456789abcdef"
+#define MIN_KEYS_PER_CRYPT      1
+#define MAX_KEYS_PER_CRYPT      64
+
+#ifdef __MIC__
+#ifndef OMP_SCALE
+#define OMP_SCALE               128
+#endif
+#else
+#ifndef OMP_SCALE
+#define OMP_SCALE               8 // Tuned w/ MKPC for core i7
+#endif
+#endif
 
 static struct fmt_tests tests[] = {
 	{"$eigrp$2$020500000000000000000000000000000000002a000200280002001000000001000000000000000000000000$0$x$1a42aaf8ebe2f766100ea1fa05a5fa55", "password12345"},
@@ -79,7 +71,7 @@ static struct fmt_tests tests[] = {
 
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
 static int *saved_len;
-static ARCH_WORD_32 (*crypt_out)[BINARY_SIZE / sizeof(ARCH_WORD_32)];
+static uint32_t (*crypt_out)[BINARY_SIZE / sizeof(uint32_t)];
 
 static struct custom_salt {
 	int length;
@@ -95,13 +87,8 @@ static struct custom_salt {
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	int omp_t = omp_get_num_threads();
+	omp_autotune(self, OMP_SCALE);
 
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
 	saved_key = mem_calloc(self->params.max_keys_per_crypt,
 	                       sizeof(*saved_key));
 	saved_len = mem_calloc(self->params.max_keys_per_crypt,
@@ -190,8 +177,8 @@ static void *get_salt(char *ciphertext)
 	static struct custom_salt cs;
 	int i, len;
 	char *p, *q;
-	memset(&cs, 0, SALT_SIZE);
 
+	memset(&cs, 0, SALT_SIZE);
 	if (!strncmp(ciphertext, FORMAT_TAG, TAG_LENGTH))
 		ciphertext += TAG_LENGTH;
 
@@ -248,6 +235,7 @@ static void *get_binary(char *ciphertext)
 	unsigned char *out = buf.c;
 	char *p;
 	int i;
+
 	p = strrchr(ciphertext, '$') + 1;
 	for (i = 0; i < BINARY_SIZE; i++) {
 		out[i] =
@@ -269,12 +257,12 @@ static unsigned char zeropad[16] = {0};
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
 	const int count = *pcount;
-	int index = 0;
+	int index;
+
 #ifdef _OPENMP
 #pragma omp parallel for
-	for (index = 0; index < count; index++)
 #endif
-	{
+	for (index = 0; index < count; index++) {
 		MD5_CTX ctx;
 
 		if (cur_salt->algo_type == 2) {
@@ -295,9 +283,9 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 			buffer[0] = '\n'; // WTF?
 			memcpy(buffer + 1, saved_key[index], saved_len[index]);
 			memcpy(buffer + 1 + saved_len[index], cur_salt->ip, cur_salt->ip_length);
-			HMAC__SHA256_Init(hctx, buffer, 1 + saved_len[index] + cur_salt->ip_length);
-			HMAC__SHA256_Update(hctx, cur_salt->salt, cur_salt->length);
-			HMAC__SHA256_Final(output, hctx);
+			HMAC_SHA256_Init(hctx, buffer, 1 + saved_len[index] + cur_salt->ip_length);
+			HMAC_SHA256_Update(hctx, cur_salt->salt, cur_salt->length);
+			HMAC_SHA256_Final(output, hctx);
 			memcpy((unsigned char*)crypt_out[index], output, BINARY_SIZE);
 		}
 
@@ -307,11 +295,10 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 static int cmp_all(void *binary, int count)
 {
-	int index = 0;
-#ifdef _OPENMP
-	for (; index < count; index++)
-#endif
-		if (((ARCH_WORD_32*)binary)[0] == crypt_out[index][0])
+	int index;
+
+	for (index = 0; index < count; index++)
+		if (((uint32_t*)binary)[0] == crypt_out[index][0])
 			return 1;
 	return 0;
 }
@@ -357,7 +344,7 @@ struct fmt_main fmt_eigrp = {
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_CASE | FMT_8_BIT | FMT_OMP,
+		FMT_CASE | FMT_8_BIT | FMT_OMP | FMT_HUGE_INPUT,
 		{
 			"algorithm [2:MD5 3:HMAC-SHA-256]",
 		},
@@ -377,7 +364,7 @@ struct fmt_main fmt_eigrp = {
 		},
 		fmt_default_source,
 		{
-			fmt_default_binary_hash /* Not usable with $SOURCE_HASH$ */
+			fmt_default_binary_hash
 		},
 		fmt_default_salt_hash,
 		NULL,
@@ -387,7 +374,7 @@ struct fmt_main fmt_eigrp = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			fmt_default_get_hash /* Not usable with $SOURCE_HASH$ */
+			fmt_default_get_hash
 		},
 		cmp_all,
 		cmp_one,

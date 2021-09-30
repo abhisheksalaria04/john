@@ -11,7 +11,6 @@
 #include "base64_convert.h"
 #include "johnswap.h"
 #include "rawSHA1_common.h"
-#include "memdbg.h"
 
 struct fmt_tests rawsha1_common_tests[] = {
 	{"c3e337f070b64a50e9d31ac3f9eda35120e29d6c", "digipalmw221u"},
@@ -24,8 +23,7 @@ struct fmt_tests rawsha1_common_tests[] = {
 	{"1813c12f25e64931f3833b26e999e26e81f9ad24", "azertyuiop3"},
 	{"095bec1163897ac86e393fa16d6ae2c2fce21602", "7850"},
 	{"dd3fbb0ba9e133c4fd84ed31ac2e5bc597d61774", "7858"},
-	// The next is too long for raw-sha1-ng unless AVX2 or better build.
-	//{"{SHA}MtEMe4z5ZXDKBM438qGdhCQNOok=", "abcdefghijklmnopqrstuvwxyz"},
+	{"{SHA}MtEMe4z5ZXDKBM438qGdhCQNOok=", "abcdefghijklmnopqrstuvwxyz"},
 	{"{SHA}cMiB1KJphN3OeV9vcYF8nPRIDnk=", "aaaa"},
 	{"{SHA}iu0TIuVFC62weOH7YKgXod8loso=", "bbbb"},
 	{"{SHA}0ijZPTcJXMa+t2XnEbEwSOkvQu0=", "ccccccccc"},
@@ -98,6 +96,17 @@ int rawsha1_common_valid(char *ciphertext, struct fmt_main *self)
 	return 0;
 }
 
+int rawsha1_axcrypt_valid(char *ciphertext, struct fmt_main *self)
+{
+	char out[41];
+	int extra;
+
+	if (hexlen(ciphertext, &extra) != 32 || extra)
+		return rawsha1_common_valid(ciphertext, self);
+	sprintf(out, "%s00000000", ciphertext);
+	return rawsha1_common_valid(out, self);
+}
+
 char *rawsha1_common_split(char *ciphertext, int index, struct fmt_main *self)
 {
 	static char out[CIPHERTEXT_LENGTH + 1];
@@ -114,22 +123,9 @@ char *rawsha1_common_split(char *ciphertext, int index, struct fmt_main *self)
 		ciphertext += TAG_LENGTH;
 
 	strncpy(out, FORMAT_TAG, sizeof(out));
-	strnzcpy(&out[TAG_LENGTH], ciphertext, HASH_LENGTH + 1);
-	strlwr(out);
+	strnzcpylwr(&out[TAG_LENGTH], ciphertext, HASH_LENGTH + 1);
 
 	return out;
-}
-
-char *rawsha1_axcrypt_prepare(char *split_fields[10], struct fmt_main *self)
-{
-	static char out[41];
-	int extra;
-
-	if (hexlen(split_fields[1], &extra) != 32 || extra)
-		return rawsha1_common_prepare(split_fields, self);
-	sprintf(out, "%s00000000", split_fields[1]);
-	split_fields[1] = out;
-	return rawsha1_common_prepare(split_fields, self);
 }
 
 char *rawsha1_axcrypt_split(char *ciphertext, int index, struct fmt_main *self)
@@ -145,7 +141,7 @@ char *rawsha1_axcrypt_split(char *ciphertext, int index, struct fmt_main *self)
 
 void *rawsha1_common_get_binary(char *ciphertext)
 {
-	static ARCH_WORD_32 out[DIGEST_SIZE / 4];
+	static uint32_t out[DIGEST_SIZE / 4];
 	unsigned char *realcipher = (unsigned char*)out;
 
 	ciphertext += TAG_LENGTH;

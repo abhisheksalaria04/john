@@ -21,59 +21,45 @@ extern struct fmt_main fmt_drupal7;
 john_register_one(&fmt_drupal7);
 #else
 
-#include "sha2.h"
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
+#include "sha2.h"
 #include "arch.h"
 #include "misc.h"
 #include "common.h"
 #include "formats.h"
 #include "johnswap.h"
 #include "simd-intrinsics.h"
-
-#ifdef _OPENMP
-#include <omp.h>
-#ifndef OMP_SCALE
-#define OMP_SCALE			8
-#endif
-#endif
-#include "memdbg.h"
+#include "drupal7_common.h"
 
 #define FORMAT_LABEL			"Drupal7"
-#define FORMAT_NAME			"$S$"
-#define FORMAT_TAG			"$S$"
-#define FORMAT_TAG_LEN		(sizeof(FORMAT_TAG)-1)
-
 #define ALGORITHM_NAME			"SHA512 " SHA512_ALGORITHM_NAME
 
-
-#define BENCHMARK_COMMENT		" (x16385)"
-#define BENCHMARK_LENGTH		-1
-
 #define PLAINTEXT_LENGTH		47
-#define CIPHERTEXT_LENGTH		55
 
 #define DIGEST_SIZE			(512/8)
 
 #define BINARY_SIZE			(258/8) // ((258+7)/8)
 #define BINARY_ALIGN			4
-#define SALT_SIZE			8
-#define SALT_ALIGN			4
+
+#ifndef OMP_SCALE
+#define OMP_SCALE			1
+#endif
 
 #ifdef SIMD_COEF_64
 #define MIN_KEYS_PER_CRYPT      (SIMD_COEF_64*SIMD_PARA_SHA512)
 #define MAX_KEYS_PER_CRYPT      (SIMD_COEF_64*SIMD_PARA_SHA512)
+#if ARCH_LITTLE_ENDIAN
 #define GETPOS(i, index)        ( (index&(SIMD_COEF_64-1))*8 + ((i)&(0xffffffff-7))*SIMD_COEF_64 + (7-((i)&7)) + (unsigned int)index/SIMD_COEF_64*SHA_BUF_SIZ*SIMD_COEF_64*8 )
 #else
-#define MIN_KEYS_PER_CRYPT		1
-#define MAX_KEYS_PER_CRYPT		1
+#define GETPOS(i, index)        ( (index&(SIMD_COEF_64-1))*8 + ((i)&(0xffffffff-7))*SIMD_COEF_64 + ((i)&7) + (unsigned int)index/SIMD_COEF_64*SHA_BUF_SIZ*SIMD_COEF_64*8 )
 #endif
-
-static struct fmt_tests tests[] = {
-	{"$S$CwkjgAKeSx2imSiN3SyBEg8e0sgE2QOx4a/VIfCHN0BZUNAWCr1X", "virtualabc"},
-	{"$S$CFURCPa.k6FAEbJPgejaW4nijv7rYgGc4dUJtChQtV4KLJTPTC/u", "password"},
-	{"$S$C6x2r.aW5Nkg7st6/u.IKWjTerHXscjPtu4spwhCVZlP89UKcbb/", "NEW_TEMP_PASSWORD"},
-	{NULL}
-};
+#else
+#define MIN_KEYS_PER_CRYPT		1
+#define MAX_KEYS_PER_CRYPT		2
+#endif
 
 /*
  * NOTE, due to the 0x4000 iteration count, I am not wasting time pre-loading
@@ -91,14 +77,8 @@ static char (*crypt_key)[DIGEST_SIZE];
 
 static void init(struct fmt_main *self)
 {
-#if defined (_OPENMP)
-	int omp_t;
+	omp_autotune(self, OMP_SCALE);
 
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
 	EncKey    = mem_calloc(self->params.max_keys_per_crypt,
 	                       sizeof(*EncKey));
 	EncKeyLen = mem_calloc(self->params.max_keys_per_crypt,
@@ -114,26 +94,6 @@ static void done(void)
 	MEM_FREE(EncKey);
 }
 
-static int valid(char *ciphertext, struct fmt_main *self)
-{
-	int i;
-	unsigned count_log2;
-
-	if (strlen(ciphertext) != CIPHERTEXT_LENGTH)
-		return 0;
-	if (strncmp(ciphertext, FORMAT_TAG, FORMAT_TAG_LEN) != 0)
-		return 0;
-	for (i = FORMAT_TAG_LEN; i < CIPHERTEXT_LENGTH; ++i)
-		if (atoi64[ARCH_INDEX(ciphertext[i])] == 0x7F)
-			return 0;
-
-	count_log2 = atoi64[ARCH_INDEX(ciphertext[3])];
-	if (count_log2 < 7 || count_log2 > 31)
-		return 0;
-
-	return 1;
-}
-
 static void set_salt(void *salt)
 {
 	loopCnt = (1 << (atoi64[ARCH_INDEX(((char*)salt)[8])]));
@@ -142,11 +102,7 @@ static void set_salt(void *salt)
 
 static void set_key(char *key, int index)
 {
-	int len;
-
-	len = strlen(key);
-	EncKeyLen[index] = len;
-	memcpy(((char*)EncKey[index]), key, len + 1);
+	EncKeyLen[index] = strnzcpyn((char*)EncKey[index], key, sizeof(*EncKey));
 }
 
 static char *get_key(int index)
@@ -158,7 +114,7 @@ static int cmp_all(void *binary, int count)
 {
 	int index;
 
-	for(index = 0; index < count; index++)
+	for (index = 0; index < count; index++)
 		if (!memcmp(binary, crypt_key[index], ARCH_SIZE))
 			return 1;
 	return 0;
@@ -177,21 +133,21 @@ static int cmp_exact(char *source, int index)
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
 	const int count = *pcount;
-	int index = 0;
+	int index;
+
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-	for (index = 0; index < count; index+=MAX_KEYS_PER_CRYPT)
-	{
+	for (index = 0; index < count; index+=MIN_KEYS_PER_CRYPT) {
 #ifdef SIMD_COEF_64
-		unsigned char _IBuf[128*MAX_KEYS_PER_CRYPT+MEM_ALIGN_CACHE], *keys;
-		ARCH_WORD_64 *keys64;
+		unsigned char _IBuf[128*MIN_KEYS_PER_CRYPT+MEM_ALIGN_CACHE], *keys;
+		uint64_t *keys64;
 		unsigned i, j, len, Lcount = loopCnt;
 
 		keys = (unsigned char*)mem_align(_IBuf, MEM_ALIGN_CACHE);
-		keys64 = (ARCH_WORD_64*)keys;
-		memset(keys, 0, 128*MAX_KEYS_PER_CRYPT);
-		for (i = 0; i < MAX_KEYS_PER_CRYPT; ++i) {
+		keys64 = (uint64_t*)keys;
+		memset(keys, 0, 128*MIN_KEYS_PER_CRYPT);
+		for (i = 0; i < MIN_KEYS_PER_CRYPT; ++i) {
 			len = EncKeyLen[index+i];
 			for (j = 0; j < 8; ++j)
 				keys[GETPOS(j, i)] = cursalt[j];
@@ -201,7 +157,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 			keys64[15*SIMD_COEF_64+(i&(SIMD_COEF_64-1))+i/SIMD_COEF_64*SHA_BUF_SIZ*SIMD_COEF_64] = (len+8) << 3;
 		}
 		SIMDSHA512body(keys, keys64, NULL, SSEi_MIXED_IN|SSEi_OUTPUT_AS_INP_FMT);
-		for (i = 0; i < MAX_KEYS_PER_CRYPT; ++i) {
+		for (i = 0; i < MIN_KEYS_PER_CRYPT; ++i) {
 			len = EncKeyLen[index+i];
 			for (j = 0; j < len; ++j)
 				keys[GETPOS(j+64, i)] = EncKey[index+i][j];
@@ -212,7 +168,7 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 			SIMDSHA512body(keys, keys64, NULL, SSEi_MIXED_IN|SSEi_OUTPUT_AS_INP_FMT);
 
 		// Last one with FLAT_OUT
-		SIMDSHA512body(keys, (ARCH_WORD_64*)crypt_key[index], NULL, SSEi_MIXED_IN|SSEi_OUTPUT_AS_INP_FMT|SSEi_FLAT_OUT);
+		SIMDSHA512body(keys, (uint64_t*)crypt_key[index], NULL, SSEi_MIXED_IN|SSEi_OUTPUT_AS_INP_FMT|SSEi_FLAT_OUT);
 #else
 		SHA512_CTX ctx;
 		unsigned char tmp[DIGEST_SIZE + PLAINTEXT_LENGTH];
@@ -239,73 +195,9 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 	return count;
 }
 
-static void * get_binary(char *ciphertext)
-{
-	int i;
-	unsigned sixbits;
-	static union {
-		unsigned char u8[BINARY_SIZE + 1];
-		ARCH_WORD_32 u32;
-	} out;
-	int bidx=0;
-	char *pos;
+#define COMMON_GET_HASH_VAR crypt_key
+#include "common-get-hash.h"
 
-	pos = &ciphertext[FORMAT_TAG_LEN + 1 + 8];
-	for (i = 0; i < 10; ++i) {
-		sixbits = atoi64[ARCH_INDEX(*pos++)];
-		out.u8[bidx] = sixbits;
-		sixbits = atoi64[ARCH_INDEX(*pos++)];
-		out.u8[bidx++] |= (sixbits<<6);
-		sixbits >>= 2;
-		out.u8[bidx] = sixbits;
-		sixbits = atoi64[ARCH_INDEX(*pos++)];
-		out.u8[bidx++] |= (sixbits<<4);
-		sixbits >>= 4;
-		out.u8[bidx] = sixbits;
-		sixbits = atoi64[ARCH_INDEX(*pos++)];
-		out.u8[bidx++] |= (sixbits<<2);
-	}
-	sixbits = atoi64[ARCH_INDEX(*pos++)];
-	out.u8[bidx] = sixbits;
-	sixbits = atoi64[ARCH_INDEX(*pos++)];
-	out.u8[bidx++] |= (sixbits<<6);
-	sixbits >>= 2;
-	out.u8[bidx] = sixbits;
-	sixbits = atoi64[ARCH_INDEX(*pos++)];
-	out.u8[bidx++] |= (sixbits<<4);
-	return out.u8;
-}
-
-static void * get_salt(char *ciphertext)
-{
-	static union {
-		unsigned char u8[SALT_SIZE + 1];
-		ARCH_WORD_32 u32;
-	} salt;
-	// store off the 'real' 8 bytes of salt
-	memcpy(salt.u8, &ciphertext[FORMAT_TAG_LEN+1], 8);
-	// append the 1 byte of loop count information.
-	salt.u8[8] = ciphertext[FORMAT_TAG_LEN];
-	return salt.u8;
-}
-
-static int get_hash_0(int index) { return *((ARCH_WORD_32 *)&crypt_key[index]) & PH_MASK_0; }
-static int get_hash_1(int index) { return *((ARCH_WORD_32 *)&crypt_key[index]) & PH_MASK_1; }
-static int get_hash_2(int index) { return *((ARCH_WORD_32 *)&crypt_key[index]) & PH_MASK_2; }
-static int get_hash_3(int index) { return *((ARCH_WORD_32 *)&crypt_key[index]) & PH_MASK_3; }
-static int get_hash_4(int index) { return *((ARCH_WORD_32 *)&crypt_key[index]) & PH_MASK_4; }
-static int get_hash_5(int index) { return *((ARCH_WORD_32 *)&crypt_key[index]) & PH_MASK_5; }
-static int get_hash_6(int index) { return *((ARCH_WORD_32 *)&crypt_key[index]) & PH_MASK_6; }
-
-static int salt_hash(void *salt)
-{
-	return *((ARCH_WORD_32 *)salt) & 0x3FF;
-}
-
-static unsigned int iteration_count(void *salt)
-{
-	return (unsigned int) 1 << (atoi64[ARCH_INDEX(((char*)salt)[8])]);
-}
 struct fmt_main fmt_drupal7 = {
 	{
 		FORMAT_LABEL,
@@ -358,13 +250,8 @@ struct fmt_main fmt_drupal7 = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,

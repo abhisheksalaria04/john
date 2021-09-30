@@ -27,48 +27,44 @@ john_register_one(&fmt_DOMINOSEC);
 
 #include <ctype.h>
 #include <string.h>
-
-//#define DOMINOSEC_32BIT
-
 #ifdef DOMINOSEC_32BIT
-#include "stdint.h"
+#include <stdint.h>
+#endif
+#ifdef _OPENMP
+#include <omp.h>
 #endif
 
 #include "misc.h"
 #include "formats.h"
 #include "common.h"
-#ifdef _OPENMP
-static int omp_t = 1;
-#include <omp.h>
+
 #ifndef OMP_SCALE
-#define OMP_SCALE               128
+#define OMP_SCALE           4	// MKPC and OMP_SCALE tuned for core i7
 #endif
-#endif
-#include "memdbg.h"
 
 #define FORMAT_LABEL		"dominosec"
 #define FORMAT_NAME		"Lotus Notes/Domino 6 More Secure Internet Password"
 #define ALGORITHM_NAME		"8/" ARCH_BITS_STR
 
 #define BENCHMARK_COMMENT	""
-#define BENCHMARK_LENGTH	0
+#define BENCHMARK_LENGTH	7
 
 #define PLAINTEXT_LENGTH	64
 #define CIPHERTEXT_LENGTH	22
 #define BINARY_SIZE		9 /* oh, well :P */
-#define BINARY_ALIGN		sizeof(ARCH_WORD_32)
+#define BINARY_ALIGN		sizeof(uint32_t)
 #define SALT_SIZE		5
-#define SALT_ALIGN		sizeof(ARCH_WORD_32)
+#define SALT_ALIGN		sizeof(uint32_t)
 
 #define DIGEST_SIZE		16
 #define BINARY_BUFFER_SIZE	(DIGEST_SIZE-SALT_SIZE)
 #define ASCII_DIGEST_LENGTH	(DIGEST_SIZE*2)
 #define MIN_KEYS_PER_CRYPT	3
-#define MAX_KEYS_PER_CRYPT	6
+#define MAX_KEYS_PER_CRYPT	24
 
 static unsigned char (*digest34)[34];
 static char (*saved_key)[PLAINTEXT_LENGTH+1];
-static ARCH_WORD_32 (*crypt_out)[(DIGEST_SIZE + 3) / sizeof(ARCH_WORD_32)];
+static uint32_t (*crypt_out)[(DIGEST_SIZE + 3) / sizeof(uint32_t)];
 static unsigned char saved_salt[SALT_SIZE];
 static int keys_changed, salt_changed;
 
@@ -163,12 +159,8 @@ static struct fmt_tests tests[] = {
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
+	omp_autotune(self, OMP_SCALE);
+
 	saved_key = mem_calloc(self->params.max_keys_per_crypt,
 	                       sizeof(*saved_key));
 	crypt_out = mem_calloc(self->params.max_keys_per_crypt,
@@ -515,7 +507,7 @@ static int valid(char *ciphertext, struct fmt_main *self)
 	unsigned int i;
 	unsigned char ch;
 
-	if (strlen(ciphertext) != CIPHERTEXT_LENGTH)
+	if (strnlen(ciphertext, CIPHERTEXT_LENGTH + 1) != CIPHERTEXT_LENGTH)
 		return 0;
 
 	if (ciphertext[0] != '(' ||
@@ -569,7 +561,7 @@ static void decode(unsigned char *ascii_cipher, unsigned char *binary)
 								if (ch == '/')
 									out += '?';
 								else
-									; /* shit happens */
+								{ ; } /* shit happens */
 							else
 								out += '>';
 						else
@@ -595,7 +587,7 @@ static void decode(unsigned char *ascii_cipher, unsigned char *binary)
 
 static void *get_binary(char *ciphertext)
 {
-	static ARCH_WORD_32 out[BINARY_SIZE / sizeof(ARCH_WORD_32) + 1];
+	static uint32_t out[BINARY_SIZE / sizeof(uint32_t) + 1];
 
 	decode((unsigned char*)ciphertext, (unsigned char*)&cipher_binary_struct);
 	memcpy(out, cipher_binary_struct.hash, BINARY_SIZE);
@@ -604,7 +596,7 @@ static void *get_binary(char *ciphertext)
 
 static void *get_salt(char *ciphertext)
 {
-	static ARCH_WORD_32 out[SALT_SIZE / sizeof(ARCH_WORD_32) + 1];
+	static uint32_t out[SALT_SIZE / sizeof(uint32_t) + 1];
 
 	decode((unsigned char*)ciphertext, (unsigned char*)&cipher_binary_struct);
 	memcpy(out, cipher_binary_struct.salt, SALT_SIZE);
@@ -702,8 +694,9 @@ static int cmp_all(void *binary, int count)
 	 * 48 bits are left alone.
 	 * Funny that.
 	 */
-	int index = 0;
-	for (; index < count; index++)
+	int index;
+
+	for (index = 0; index < count; index++)
 		if (!memcmp(binary, crypt_out[index], ARCH_SIZE))
 			return 1;
 	return 0;
@@ -719,18 +712,13 @@ static int cmp_exact(char *source, int index)
 	return 1;
 }
 
-static int get_hash_0(int index) { return *(ARCH_WORD_32*)&crypt_out[index] & PH_MASK_0; }
-static int get_hash_1(int index) { return *(ARCH_WORD_32*)&crypt_out[index] & PH_MASK_1; }
-static int get_hash_2(int index) { return *(ARCH_WORD_32*)&crypt_out[index] & PH_MASK_2; }
-static int get_hash_3(int index) { return *(ARCH_WORD_32*)&crypt_out[index] & PH_MASK_3; }
-static int get_hash_4(int index) { return *(ARCH_WORD_32*)&crypt_out[index] & PH_MASK_4; }
-static int get_hash_5(int index) { return *(ARCH_WORD_32*)&crypt_out[index] & PH_MASK_5; }
-static int get_hash_6(int index) { return *(ARCH_WORD_32*)&crypt_out[index] & PH_MASK_6; }
+#define COMMON_GET_HASH_VAR crypt_out
+#include "common-get-hash.h"
 
 static int salt_hash(void *salt)
 {
-	//printf("salt %08x hash %03x\n", *(ARCH_WORD_32*)salt, *(ARCH_WORD_32*)salt & (SALT_HASH_SIZE - 1));
-	return *(ARCH_WORD_32*)salt & (SALT_HASH_SIZE - 1);
+	//printf("salt %08x hash %03x\n", *(uint32_t*)salt, *(uint32_t*)salt & (SALT_HASH_SIZE - 1));
+	return *(uint32_t*)salt & (SALT_HASH_SIZE - 1);
 }
 
 struct fmt_main fmt_DOMINOSEC = {
@@ -781,13 +769,8 @@ struct fmt_main fmt_DOMINOSEC = {
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,
